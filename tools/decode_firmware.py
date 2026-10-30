@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Decode the PocketGo S30 (Zkswe A33) SPI-NOR dump into clean, inspectable images.
 
-Usage: python decode_firmware.py <S30-info dir> <output dir>
+Usage: python decode_firmware.py <dump dir> <output dir>
 
 Scrambling found in the stock firmware:
   p0 (boot0 + u-boot): boot0 (0x0000-0x5fff) is plaintext. The sunxi u-boot

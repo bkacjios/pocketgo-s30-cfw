@@ -74,7 +74,9 @@ launcher/                 Launcher (filebrowser.c) and joystick calibration
 utils/                    s30-fel (reboot into FEL), s30-volumed (volume keys)
 ```
 
-Regenerate decoded firmware: `python3 tools/decode_firmware.py S30-info firmware-decoded`
+Regenerate decoded firmware: `python3 tools/decode_firmware.py S30-info/dump firmware-decoded`
+(S30-info also carries the decoded images, the decoders and a README with
+the hardware and stock firmware findings).
 
 ## Hardware (from script.fex + stock kernel)
 
