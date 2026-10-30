@@ -71,7 +71,9 @@ build/
                           0003 exFAT on 32-bit ARM, 0004 AXP PEK restart bit
 retroarch/patches/        0001 gl2 screen rotation, 0002 NEON asm syntax (clang)
 launcher/                 Launcher (filebrowser.c) and joystick calibration
-utils/                    s30-fel (reboot into FEL), s30-volumed (volume keys)
+utils/                    s30-fel (reboot into FEL), s30-volumed (volume keys,
+                          jack), s30-display (DRM lease broker + OSD) with its
+                          preload libs30lease.so
 ```
 
 Regenerate decoded firmware: `python3 tools/decode_firmware.py S30-info/dump firmware-decoded`
@@ -296,8 +298,33 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   (gpio-keys, polled, no autorepeat: the daemon repeats while held) step
   "Headphone Playback Volume" (0-63, step 3; drives speaker and headphones)
   for every app; level saved to `~/.config/volume` 2 s after the last change
-  and restored at boot. RetroArch's volume hotkeys are unbound (`nul`). No
-  on-screen indicator (apps own KMS; a compositor would be needed).
+  and restored at boot. RetroArch's volume hotkeys are unbound (`nul`).
+  Also watches the codec's jack input device (`...-jack`, SW_HEADPHONE_INSERT)
+  and sends `osd ICON PERCENT` to s30-display on volume and jack changes.
+- `s30-display` (utils/s30-display.c, respawned by init before the
+  frontend): display broker + OSD, no GPU compositing. It finds the KMS card
+  (card1; card0 is lima) and hands each app a DRM lease (connector, CRTC,
+  primary plane) over `/run/s30-display.sock`; `libs30lease.so`
+  (utils/s30-lease.c, LD_PRELOAD set by the frontend for the launcher and
+  everything it starts) turns `open("/dev/dri/cardN")` into `lease PATH` and
+  falls back to a plain open if the daemon refuses (not the KMS card, a lease
+  already out) or is absent. The daemon is master only while a lease is out
+  (a lessor must be master); the lessee goes when it closes the fd (polled
+  with drmModeListLessees). The OSD is overlay plane 47 (topmost ARGB plane;
+  the A33 backend has 3 overlays), a 220x40 box at the top drawn
+  panel-rotated (landscape (x, y) -> panel (y, 479 - x)). The plane is
+  enabled once per lease and stays on (transparent when idle): commits on
+  the app's CRTC can make its page flip fail with EBUSY. Frames are drawn in
+  RAM and memcpy'd into the scanned-out buffer right after a vblank (the
+  daemon runs SCHED_FIFO 1 via the raw syscall: musl's
+  sched_setscheduler() is an ENOSYS stub); drawing in place tore. Bar eases,
+  box fades (~100 ms). It also shows external power plugged in/out
+  (power_supply netlink uevents; the charger is `axp22x-ac`, not
+  `axp20x-usb`) with the battery level, never "full" or a permanent battery.
+  Restarting the daemon revokes the running app's lease (black screen):
+  restart the launcher with it.
+- Launcher header battery: icon filled to the level (green > 50 %, yellow
+  > 20 %, red), percentage inside, white bolt while `status` is Charging.
 - `s30-fel` (utils/s30-fel.c): `reboot(RESTART2, "fel")`; the DT's
   nvmem-reboot-mode writes 0x5aa5a55a to RTC GP register 2 (an nvmem cell
   of the RTC), which boot0 checks once.

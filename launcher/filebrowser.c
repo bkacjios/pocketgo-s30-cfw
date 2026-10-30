@@ -152,7 +152,8 @@ static void pad_flush(void) {
     ui_pad_axes(sPadFd, &x, &sAxisY);
 }
 
-/* Battery percentage from the AXP fuel gauge, -1 if none; *charging set */
+/* Battery percentage from the AXP fuel gauge, -1 if none; *charging set
+   (charger connected and still charging; "Full" counts as not charging) */
 static int battery(bool* charging) {
     glob_t g;
     int pct = -1;
@@ -172,13 +173,52 @@ static int battery(bool* charging) {
         f = fopen(path, "r");
         if (f != NULL) {
             if (fscanf(f, "%31s", status) == 1) {
-                *charging = strcmp(status, "Charging") == 0 || strcmp(status, "Full") == 0;
+                *charging = strcmp(status, "Charging") == 0;
             }
             fclose(f);
         }
         globfree(&g);
     }
     return pct;
+}
+
+/* Battery icon at (x, y), 45x20: filled to the level in green, yellow or
+   red, the percentage inside; a lightning bolt to its left while charging */
+static void draw_battery(int x, int y, int pct, bool charging) {
+    const int w = 42, h = 20;
+    SDL_Rect body = { x, y, w, h }, nub = { x + w, y + 6, 3, h - 12 };
+    SDL_Rect fill = { x + 2, y + 2, (w - 4) * (pct > 100 ? 100 : pct) / 100, h - 4 };
+    SDL_Color c = pct > 50 ? (SDL_Color){ 70, 200, 90, 255 }
+                  : pct > 20 ? (SDL_Color){ 235, 190, 40, 255 }
+                             : (SDL_Color){ 225, 60, 50, 255 };
+    const SDL_Color shadow = { 0, 0, 0, 255 };
+    char text[8];
+    int tw = 0, th = 0;
+
+    SDL_SetRenderDrawColor(gUiRenderer, 30, 30, 30, 255);
+    SDL_RenderFillRect(gUiRenderer, &body);
+    SDL_SetRenderDrawColor(gUiRenderer, c.r, c.g, c.b, 255);
+    SDL_RenderFillRect(gUiRenderer, &fill);
+    SDL_SetRenderDrawColor(gUiRenderer, 200, 200, 200, 255);
+    SDL_RenderDrawRect(gUiRenderer, &body);
+    SDL_RenderFillRect(gUiRenderer, &nub);
+
+    snprintf(text, sizeof(text), "%d%%", pct);
+    TTF_SizeUTF8(gUiFontSmall, text, &tw, &th);
+    ui_text(gUiFontSmall, text, shadow, x + (w - tw) / 2 + 1, y + (h - th) / 2 + 1, w);
+    ui_text(gUiFontSmall, text, UI_TEXT, x + (w - tw) / 2, y + (h - th) / 2, w);
+
+    if (charging) {
+        // Bolt: two triangles, 10x18
+        const SDL_Color bolt = { 255, 255, 255, 255 };
+        const float bx = x - 14, by = y + 1;
+        SDL_Vertex v[6] = {
+            { { bx + 7, by + 0 }, bolt, { 0, 0 } },  { { bx + 0, by + 10 }, bolt, { 0, 0 } },
+            { { bx + 6, by + 10 }, bolt, { 0, 0 } }, { { bx + 4, by + 8 }, bolt, { 0, 0 } },
+            { { bx + 10, by + 8 }, bolt, { 0, 0 } }, { { bx + 3, by + 18 }, bolt, { 0, 0 } },
+        };
+        SDL_RenderGeometry(gUiRenderer, NULL, v, 6, NULL, 0);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -228,7 +268,6 @@ static void menu_select(void) {
 }
 
 static void render(void) {
-    char bat[32];
     bool charging;
     int pct = battery(&charging);
     int i;
@@ -238,8 +277,7 @@ static void render(void) {
     // Header: current folder, battery
     ui_text(gUiFontBold, sDir.path, UI_ACCENT, 10, 6, SCRW - 90);
     if (pct >= 0) {
-        snprintf(bat, sizeof(bat), "%s%d%%", charging ? "+" : "", pct);
-        ui_text(gUiFontBold, bat, charging ? UI_ACCENT : UI_TEXT, SCRW - 60, 6, 56);
+        draw_battery(SCRW - 53, 6, pct, charging);
     }
     SDL_SetRenderDrawColor(gUiRenderer, 60, 60, 60, 255);
     SDL_RenderDrawLine(gUiRenderer, 8, LIST_Y - 6, SCRW - 8, LIST_Y - 6);

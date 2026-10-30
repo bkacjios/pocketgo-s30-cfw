@@ -4,6 +4,8 @@
  * drives both the headphones and the speaker amp, so it applies to every app.
  * The level is restored at start and saved to the file given as argument.
  * Holding a key repeats (gpio-keys-polled has no autorepeat).
+ * Volume changes and headphones being plugged in or out are shown by
+ * s30-display's OSD (output icon and volume bar).
  *
  * Usage: s30-volumed STATE_FILE
  */
@@ -16,6 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #define CONTROL "Headphone Playback Volume"
@@ -29,7 +33,10 @@ static snd_ctl_t *sCtl;
 static snd_ctl_elem_value_t *sVal;
 static long sMax;
 
-static int open_input(void) {
+#define OSD_SOCKET "/run/s30-display.sock"
+
+/* Input device whose name is `name`, or ends with it when `suffix` */
+static int open_input(const char *want, int suffix) {
 	DIR *dir = opendir("/dev/input");
 	struct dirent *de;
 	int fd = -1;
@@ -42,8 +49,11 @@ static int open_input(void) {
 		}
 		snprintf(path, sizeof(path), "/dev/input/%s", de->d_name);
 		fd = open(path, O_RDONLY | O_CLOEXEC);
-		if (fd >= 0 && ioctl(fd, EVIOCGNAME(sizeof(name)), name) >= 0 && strcmp(name, "gpio-keys") == 0) {
-			break;
+		if (fd >= 0 && ioctl(fd, EVIOCGNAME(sizeof(name)), name) >= 0) {
+			size_t n = strlen(name), w = strlen(want);
+			if (suffix ? n >= w && strcmp(name + n - w, want) == 0 : strcmp(name, want) == 0) {
+				break;
+			}
 		}
 		if (fd >= 0) {
 			close(fd);
@@ -92,6 +102,36 @@ static void set_level(long level) {
 	}
 }
 
+/* Headphones plugged in, from the codec's jack input device */
+static int headphones(int jackFd) {
+	unsigned long sw[(SW_MAX + 8 * sizeof(long)) / (8 * sizeof(long))] = { 0 };
+
+	if (jackFd < 0 || ioctl(jackFd, EVIOCGSW(sizeof(sw)), sw) < 0) {
+		return 0;
+	}
+	return (sw[SW_HEADPHONE_INSERT / (8 * sizeof(long))] >> (SW_HEADPHONE_INSERT % (8 * sizeof(long)))) & 1;
+}
+
+/* Show the output and the volume on s30-display's OSD (if it runs) */
+static void show_osd(int jackFd) {
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	long level = get_level();
+	char msg[48];
+	int s = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+
+	if (s < 0) {
+		return;
+	}
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", OSD_SOCKET);
+	snprintf(msg, sizeof(msg), "osd %s %ld",
+	         headphones(jackFd) ? "headphones" : level <= 0 ? "mute" : "speaker",
+	         sMax > 0 ? level * 100 / sMax : 0);
+	if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+		send(s, msg, strlen(msg), MSG_NOSIGNAL);
+	}
+	close(s);
+}
+
 static long load_level(const char *path) {
 	FILE *f = fopen(path, "r");
 	long level = DEFAULT_LEVEL;
@@ -121,7 +161,8 @@ static void save_level(const char *path, long level) {
 }
 
 int main(int argc, char **argv) {
-	struct pollfd pfd = { .events = POLLIN };
+	struct pollfd fds[2] = { { .events = POLLIN }, { .fd = -1, .events = POLLIN } };
+	struct pollfd *pfd = &fds[0], *jack = &fds[1];
 	int held = 0; // +1 / -1 while a key is down
 	int timeout, saveIn = -1;
 
@@ -130,18 +171,19 @@ int main(int argc, char **argv) {
 		return 2;
 	}
 	// The sound card and the keys may still be probing at boot
-	while ((pfd.fd = open_input()) < 0 || open_mixer() < 0) {
-		if (pfd.fd >= 0) {
-			close(pfd.fd);
+	while ((pfd->fd = open_input("gpio-keys", 0)) < 0 || open_mixer() < 0) {
+		if (pfd->fd >= 0) {
+			close(pfd->fd);
 		}
 		sleep(1);
 	}
 	set_level(load_level(argv[1]));
+	jack->fd = open_input("-jack", 1); // optional: no OSD on plug-in without it
 
 	timeout = -1;
 	for (;;) {
 		int wait = held ? timeout : saveIn;
-		int n = poll(&pfd, 1, wait);
+		int n = poll(fds, 2, wait);
 
 		if (n < 0) {
 			if (errno == EINTR) {
@@ -153,6 +195,7 @@ int main(int argc, char **argv) {
 			if (held) {
 				// Key still down: repeat
 				set_level(get_level() + held * STEP);
+				show_osd(jack->fd);
 				timeout = REPEAT_MS;
 				saveIn = SAVE_DELAY_MS;
 			} else if (saveIn >= 0) {
@@ -163,7 +206,20 @@ int main(int argc, char **argv) {
 		}
 
 		struct input_event ev[16];
-		ssize_t len = read(pfd.fd, ev, sizeof(ev));
+		ssize_t len;
+
+		if (jack->revents & POLLIN) {
+			len = read(jack->fd, ev, sizeof(ev));
+			for (size_t i = 0; len > 0 && i < len / sizeof(ev[0]); i++) {
+				if (ev[i].type == EV_SW && ev[i].code == SW_HEADPHONE_INSERT) {
+					show_osd(jack->fd);
+				}
+			}
+		}
+		if (!(pfd->revents & POLLIN)) {
+			continue;
+		}
+		len = read(pfd->fd, ev, sizeof(ev));
 
 		if (len <= 0) {
 			return 1;
@@ -181,6 +237,7 @@ int main(int argc, char **argv) {
 			if (ev[i].value == 1) {
 				held = dir;
 				set_level(get_level() + dir * STEP);
+				show_osd(jack->fd);
 				timeout = REPEAT_DELAY_MS;
 			} else if (ev[i].value == 0 && held == dir) {
 				held = 0;

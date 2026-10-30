@@ -17,6 +17,7 @@ const SDL_Color UI_DIM = { 175, 175, 175, 255 };
 SDL_Renderer* gUiRenderer;
 TTF_Font* gUiFontBold;
 TTF_Font* gUiFontRegular;
+TTF_Font* gUiFontSmall;
 
 static SDL_Window* sWindow;
 static SDL_Texture* sCanvas;
@@ -28,7 +29,8 @@ bool ui_init(void) {
     }
     gUiFontBold = TTF_OpenFont(FONT_DIR "/bold.ttf", 16);
     gUiFontRegular = TTF_OpenFont(FONT_DIR "/regular.ttf", 16);
-    if (gUiFontBold == NULL || gUiFontRegular == NULL) {
+    gUiFontSmall = TTF_OpenFont(FONT_DIR "/bold.ttf", 12);
+    if (gUiFontBold == NULL || gUiFontRegular == NULL || gUiFontSmall == NULL) {
         fprintf(stderr, "ui: fonts in %s: %s\n", FONT_DIR, TTF_GetError());
         return false;
     }

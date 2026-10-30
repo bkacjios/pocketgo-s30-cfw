@@ -14,6 +14,7 @@
 extern SDL_Renderer* gUiRenderer;
 extern TTF_Font* gUiFontBold;
 extern TTF_Font* gUiFontRegular;
+extern TTF_Font* gUiFontSmall; // bold, 12 px
 
 extern const SDL_Color UI_ACCENT;
 extern const SDL_Color UI_TEXT;

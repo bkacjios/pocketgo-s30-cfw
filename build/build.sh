@@ -233,7 +233,8 @@ ensure_sysroot() {
 # Device programs. Launcher apps (launcher/): filebrowser.c, the boot UI that
 # starts RetroArch, OoT and other apps, and joycal.c, the joystick
 # calibration; ui.c is shared. SDL2 (KMS) + SDL2_ttf. Utilities (utils/):
-# s30-fel, s30-volumed, s30-splash, s30-keyheld. Output: $WORK/{launcher,joycal,s30-*}.bin
+# s30-fel, s30-volumed, s30-splash, s30-keyheld, s30-display and its preload
+# libs30lease.so. Output: $WORK/{launcher,joycal,s30-*}.bin, $WORK/libs30lease.so
 step_launcher() {
 	local app
 	ensure_sysroot
@@ -250,8 +251,11 @@ step_launcher() {
 		"$PROJECT/utils/s30-volumed.c" -lasound
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-splash.bin" "$PROJECT/utils/s30-splash.c"
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-keyheld.bin" "$PROJECT/utils/s30-keyheld.c"
+	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-display.bin" "$PROJECT/utils/s30-display.c" \
+		-I"$WORK/sysroot/usr/include/libdrm" -ldrm
+	"$WORK/bin/armv7-clang" -O2 -Wall -fPIC -shared -o "$WORK/libs30lease.so" "$PROJECT/utils/s30-lease.c"
 	llvm-strip "$WORK/s30-fel.bin" "$WORK/s30-volumed.bin" "$WORK/s30-splash.bin" \
-		"$WORK/s30-keyheld.bin"
+		"$WORK/s30-keyheld.bin" "$WORK/s30-display.bin" "$WORK/libs30lease.so"
 }
 
 # RetroArch, cross-compiled with clang for armv7 musl against an Alpine
@@ -316,6 +320,10 @@ step_initramfs() {
 		install -m 0755 "$WORK/s30-volumed.bin" "$root/usr/bin/s30-volumed"
 	[ -f "$WORK/s30-splash.bin" ] &&
 		install -m 0755 "$WORK/s30-splash.bin" "$root/usr/bin/s30-splash"
+	[ -f "$WORK/s30-display.bin" ] &&
+		install -m 0755 "$WORK/s30-display.bin" "$root/usr/bin/s30-display"
+	[ -f "$WORK/libs30lease.so" ] &&
+		install -D -m 0755 "$WORK/libs30lease.so" "$root/usr/lib/s30/libs30lease.so"
 	# Boot splash: the same image U-Boot shows
 	install -D -m 0644 "$HERE/splash/logo.bmp" "$root/usr/share/s30/splash.bmp"
 	rm -f "$WORK/rootfs.sqfs"
