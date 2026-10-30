@@ -24,6 +24,15 @@
  * needs a master lessor), so an app that opens the card directly still
  * works when the daemon is not involved.
  *
+ * System menu: the power key (grabbed, so apps never see it) opens a menu
+ * over whoever holds the lease: Resume / Exit game over an app, Reboot /
+ * Shut down / Cancel over the launcher. That process is frozen (SIGSTOP) and
+ * the gamepad grabbed while the menu is open; Exit sends SIGTERM, then
+ * SIGKILL if it hasn't gone after EXIT_GRACE_MS. The
+ * menu uses the same overlay plane (the display engine blends only one
+ * alpha plane), resized: those commits happen while the app is frozen, so
+ * they can't collide with its page flips.
+ *
  * Socket messages (SOCK_SEQPACKET, /run/s30-display.sock):
  *   "lease PATH"             PATH being opened; for the display card reply "ok"
  *                            with the lease fd attached, else "fail"
@@ -32,20 +41,24 @@
  *
  * Usage: s30-display
  */
+#define _GNU_SOURCE // struct ucred
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <dirent.h>
+#include <linux/input.h>
 #include <linux/netlink.h>
 #include <time.h>
 #include <unistd.h>
@@ -53,38 +66,58 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#include "osd_font.h"
+
 #define SOCKET_PATH "/run/s30-display.sock"
 #define OSD_MS 1500       // OSD visible after the last message
 #define FADE_STEP 0.17f   // alpha per frame: about 100 ms fades
 #define EASE 0.3f         // fraction of the remaining bar distance per frame
 #define LEASE_POLL_MS 250 // check whether the lessee has gone
+#define EXIT_GRACE_MS 2000 // after SIGTERM, before SIGKILL
 
 /* The panel is 320x480 portrait, held landscape with its +x pointing down:
    landscape (x right, y down; 480x320) to panel is px = y, py = 479 - x */
 #define PANEL_W 320
 #define PANEL_H 480
 
+/* The overlay buffer, landscape BUF_W x BUF_H: the OSD box uses its top
+   BOX_H rows, the menu all of it */
+#define BUF_W 220
+#define BUF_H 124
+
 /* OSD box in landscape coordinates: centred near the top */
-#define BOX_W 220
+#define BOX_W BUF_W
 #define BOX_H 40
 #define BOX_X ((PANEL_H - BOX_W) / 2)
 #define BOX_Y 12
+
+/* Menu box: centred */
+#define MENU_W BUF_W
+#define MENU_H BUF_H
+#define MENU_X ((PANEL_H - MENU_W) / 2)
+#define MENU_Y ((PANEL_W - MENU_H) / 2)
 
 static int sFd = -1;
 static char sCard[32]; // the display (KMS) card
 static uint32_t sConnector, sCrtc, sPrimary, sOverlay;
 static uint32_t sLessee;     // 0: no lease
 static int sMaster;
-static uint32_t sFb;         // OSD buffer, panel orientation (BOX_H x BOX_W)
+static uint32_t sFb;         // overlay buffer, panel orientation (BUF_H x BUF_W)
 static uint32_t* sPixels;    // the plane's buffer (scanned out)
 static uint32_t sPitch;      // in pixels
-static uint32_t sBack[BOX_W * BOX_H]; // frame being drawn, panel layout, pitch BOX_H
+static uint32_t sBack[BUF_W * BUF_H]; // frame being drawn, panel layout, pitch BUF_H
 static int sPlaneOn;          // overlay plane enabled (for the current lease)
 static char sIcon[16] = "speaker";
 static float sTarget, sShown; // bar percent: requested, drawn
 static float sAlpha;          // box opacity drawn
 static int sDirty;            // needs a redraw
 static uint64_t sOsdUntil, sNextLeaseCheck;
+static pid_t sAppPid;         // process holding the lease
+static int sMenu, sMenuSel;   // system menu open, selected item
+static int sMenuLauncher;     // the menu is over the launcher (power menu)
+static int sPadFd = -1;       // gamepad, grabbed while the menu is open
+static pid_t sKillPid;        // exiting app: SIGKILL at sKillAt if still there
+static uint64_t sKillAt;
 
 static uint64_t now_ms(void) {
 	struct timespec t;
@@ -156,7 +189,7 @@ static int find_objects(void) {
 }
 
 static int create_osd_buffer(void) {
-	struct drm_mode_create_dumb create = { .width = BOX_H, .height = BOX_W, .bpp = 32 };
+	struct drm_mode_create_dumb create = { .width = BUF_H, .height = BUF_W, .bpp = 32 };
 	struct drm_mode_map_dumb map = { 0 };
 	uint32_t handles[4] = { 0 }, pitches[4] = { 0 }, offsets[4] = { 0 };
 
@@ -166,7 +199,7 @@ static int create_osd_buffer(void) {
 	sPitch = create.pitch / 4;
 	handles[0] = create.handle;
 	pitches[0] = create.pitch;
-	if (drmModeAddFB2(sFd, BOX_H, BOX_W, DRM_FORMAT_ARGB8888, handles, pitches, offsets, &sFb, 0) != 0) {
+	if (drmModeAddFB2(sFd, BUF_H, BUF_W, DRM_FORMAT_ARGB8888, handles, pitches, offsets, &sFb, 0) != 0) {
 		return -1;
 	}
 	map.handle = create.handle;
@@ -178,13 +211,13 @@ static int create_osd_buffer(void) {
 }
 
 /* ---------------------------------------------------------------------------
- * Drawing, in box-local landscape coordinates (BOX_W x BOX_H)
+ * Drawing, in buffer-local landscape coordinates (BUF_W x BUF_H)
  * ------------------------------------------------------------------------- */
 
 static void put(int x, int y, uint32_t argb) {
-	if (x >= 0 && x < BOX_W && y >= 0 && y < BOX_H) {
-		// landscape (x, y) -> panel (y, 479 - x), relative to the box
-		sBack[(BOX_W - 1 - x) * BOX_H + y] = argb;
+	if (x >= 0 && x < BUF_W && y >= 0 && y < BUF_H) {
+		// landscape (x, y) -> panel (y, 479 - x), relative to the buffer
+		sBack[(BUF_W - 1 - x) * BUF_H + y] = argb;
 	}
 }
 
@@ -247,26 +280,50 @@ static void draw_icon(const char* const* icon, int x0, int y0, uint32_t argb) {
 	}
 }
 
+/* Dark rounded box over (0, 0, w, h) */
+static void draw_box(int w, int h, float alpha) {
+	const int corner[4] = { 3, 2, 1, 1 };
+	int i;
+
+	fill(0, 0, w, h, argb(0x101018, alpha));
+	for (i = 0; i < 4; i++) {
+		fill(0, i, corner[i], 1, 0);
+		fill(w - corner[i], i, corner[i], 1, 0);
+		fill(0, h - 1 - i, corner[i], 1, 0);
+		fill(w - corner[i], h - 1 - i, corner[i], 1, 0);
+	}
+}
+
+/* ASCII text in the 8x16 font, `scale` pixels per font pixel */
+static void draw_text(const char* text, int x0, int y0, int scale, uint32_t argb) {
+	int gx, gy;
+
+	for (; *text != '\0'; text++, x0 += 8 * scale) {
+		const unsigned char* g = kOsdFont[(*text < 0x20 || *text > 0x7e ? '?' : *text) - 0x20];
+		for (gy = 0; gy < 16; gy++) {
+			for (gx = 0; gx < 8; gx++) {
+				if (g[gy] & (0x80 >> gx)) {
+					fill(x0 + gx * scale, y0 + gy * scale, scale, scale, argb);
+				}
+			}
+		}
+	}
+}
+
 /* The box at opacity `alpha`, bar at `percent` (fractional: the bar's end
    pixel is blended, so it moves smoothly) */
 static void draw_osd(const char* icon, float percent, float alpha) {
 	const int barX = 52, barW = BOX_W - barX - 14, barY = (BOX_H - 8) / 2;
 	const uint32_t track = 0x404048, bar = 0x8060e0;
-	int corner[4] = { 3, 2, 1, 1 }, i, full;
+	int full;
 	float end, frac;
 
 	if (alpha <= 0.0f) {
-		fill(0, 0, BOX_W, BOX_H, 0);
+		fill(0, 0, BUF_W, BUF_H, 0);
 		return;
 	}
 	percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
-	fill(0, 0, BOX_W, BOX_H, argb(0x101018, 0.75f * alpha));
-	for (i = 0; i < 4; i++) { // rounded corners
-		fill(0, i, corner[i], 1, 0);
-		fill(BOX_W - corner[i], i, corner[i], 1, 0);
-		fill(0, BOX_H - 1 - i, corner[i], 1, 0);
-		fill(BOX_W - corner[i], BOX_H - 1 - i, corner[i], 1, 0);
-	}
+	draw_box(BOX_W, BOX_H, 0.75f * alpha);
 	draw_icon(strcmp(icon, "headphones") == 0 ? kHeadphones
 	          : strcmp(icon, "mute") == 0     ? kMute
 	          : strcmp(icon, "charging") == 0 ? kCharging
@@ -287,6 +344,31 @@ static void draw_osd(const char* icon, float percent, float alpha) {
 	}
 }
 
+enum { APP_RESUME, APP_EXIT };
+static const char* const kAppItems[] = { "Resume", "Exit game" };
+enum { SYS_REBOOT, SYS_POWEROFF, SYS_CANCEL };
+static const char* const kSysItems[] = { "Reboot", "Shut down", "Cancel" };
+
+static int menu_count(void) {
+	return sMenuLauncher ? 3 : 2;
+}
+
+static void draw_menu(void) {
+	const char* const* items = sMenuLauncher ? kSysItems : kAppItems;
+	const int rowH = 36, count = menu_count(), top = (MENU_H - count * rowH) / 2;
+	int i;
+
+	draw_box(MENU_W, MENU_H, 0.92f);
+	for (i = 0; i < count; i++) {
+		int y = top + i * rowH, len = (int)strlen(items[i]);
+
+		if (i == sMenuSel) {
+			fill(10, y + 1, MENU_W - 20, rowH - 2, argb(0x8060e0, 1.0f));
+		}
+		draw_text(items[i], (MENU_W - len * 16) / 2, y + (rowH - 32) / 2, 2, argb(0xffffff, 1.0f));
+	}
+}
+
 /* ---------------------------------------------------------------------------
  * Master, lease and plane
  * ------------------------------------------------------------------------- */
@@ -301,9 +383,28 @@ static void set_master(int on) {
 static void present(void) {
 	int row;
 
-	for (row = 0; row < BOX_W; row++) {
-		memcpy(&sPixels[row * sPitch], &sBack[row * BOX_H], BOX_H * sizeof(uint32_t));
+	for (row = 0; row < BUF_W; row++) {
+		memcpy(&sPixels[row * sPitch], &sBack[row * BUF_H], BUF_H * sizeof(uint32_t));
 	}
+}
+
+/* Show the top `lh` landscape rows of the buffer as a lw x lh box at
+   landscape (lx, ly). Panel rectangle: x = ly, y = 479 - (lx + lw - 1). */
+static int set_plane(int lx, int ly, int lw, int lh) {
+	if (drmModeSetPlane(sFd, sOverlay, sCrtc, sFb, 0, ly, PANEL_H - lx - lw, lh, lw, 0, 0, lh << 16, lw << 16) != 0) {
+		fprintf(stderr, "s30-display: overlay: %s\n", strerror(errno));
+		return -1;
+	}
+	sPlaneOn = 1;
+	return 0;
+}
+
+/* Draw now, after the next vblank (no tearing) */
+static void present_synced(void) {
+	drmVBlank vbl = { .request = { .type = DRM_VBLANK_RELATIVE, .sequence = 1 } };
+
+	drmWaitVBlank(sFd, &vbl);
+	present();
 }
 
 static void plane_off(void) {
@@ -315,8 +416,8 @@ static void plane_off(void) {
 }
 
 static void osd_show(const char* icon, int percent) {
-	if (!sMaster || sLessee == 0) {
-		return; // nobody on screen through a lease: the display isn't ours
+	if (!sMaster || sLessee == 0 || sMenu) {
+		return; // nobody on screen through a lease (the display isn't ours), or the menu is up
 	}
 	snprintf(sIcon, sizeof(sIcon), "%s", icon);
 	sTarget = percent;
@@ -328,13 +429,7 @@ static void osd_show(const char* icon, int percent) {
 	if (!sPlaneOn) {
 		draw_osd(sIcon, sShown, 0.0f); // starts transparent, fades in
 		present();
-		// Panel rectangle of the landscape box: x = BOX_Y, y = 479 - (BOX_X + BOX_W - 1)
-		if (drmModeSetPlane(sFd, sOverlay, sCrtc, sFb, 0, BOX_Y, PANEL_H - BOX_X - BOX_W, BOX_H, BOX_W, 0, 0,
-		                    BOX_H << 16, BOX_W << 16) == 0) {
-			sPlaneOn = 1;
-		} else {
-			fprintf(stderr, "s30-display: overlay: %s\n", strerror(errno));
-		}
+		set_plane(BOX_X, BOX_Y, BOX_W, BOX_H);
 	}
 }
 
@@ -342,9 +437,8 @@ static void osd_show(const char* icon, int percent) {
    Returns whether more frames are needed. */
 static int osd_frame(void) {
 	float want = now_ms() < sOsdUntil ? 1.0f : 0.0f;
-	drmVBlank vbl = { .request = { .type = DRM_VBLANK_RELATIVE, .sequence = 1 } };
 
-	if (!sPlaneOn || (!sDirty && sAlpha == want && sShown == sTarget)) {
+	if (!sPlaneOn || sMenu || (!sDirty && sAlpha == want && sShown == sTarget)) {
 		return 0;
 	}
 	if (sAlpha != want) {
@@ -356,10 +450,165 @@ static int osd_frame(void) {
 		sShown = sTarget;
 	}
 	draw_osd(sIcon, sShown, sAlpha);
-	drmWaitVBlank(sFd, &vbl);
-	present();
+	present_synced();
 	sDirty = 0;
 	return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * System menu
+ * ------------------------------------------------------------------------- */
+
+/* Input device named `name`, or -1 */
+static int open_input(const char* name) {
+	char path[32], n[64];
+	int i, fd;
+
+	for (i = 0; i < 16; i++) {
+		snprintf(path, sizeof(path), "/dev/input/event%d", i);
+		fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+		if (fd < 0) {
+			continue;
+		}
+		if (ioctl(fd, EVIOCGNAME(sizeof(n)), n) >= 0 && strcmp(n, name) == 0) {
+			return fd;
+		}
+		close(fd);
+	}
+	return -1;
+}
+
+static int is_launcher(pid_t pid) {
+	char path[32], comm[32] = "";
+	FILE* f;
+
+	snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
+	f = fopen(path, "r");
+	if (f != NULL) {
+		if (fgets(comm, sizeof(comm), f) == NULL) {
+			comm[0] = '\0';
+		}
+		fclose(f);
+	}
+	return strncmp(comm, "s30-launcher", 12) == 0;
+}
+
+static void menu_open(void) {
+	if (!sMaster || sLessee == 0 || sAppPid <= 0) {
+		return;
+	}
+	sMenuLauncher = is_launcher(sAppPid);
+	sPadFd = open_input("PocketGo S30 Gamepad");
+	if (sPadFd >= 0) {
+		ioctl(sPadFd, EVIOCGRAB, 1); // the app stops getting input
+	}
+	kill(sAppPid, SIGSTOP);
+	sMenu = 1;
+	sMenuSel = sMenuLauncher ? SYS_CANCEL : APP_RESUME;
+	sAlpha = 0.0f;
+	sOsdUntil = 0;
+	// Move the plane only while it is transparent, then draw the menu: the
+	// plane still sits where the OSD box was until the move takes effect
+	fill(0, 0, BUF_W, BUF_H, 0);
+	present_synced();
+	set_plane(MENU_X, MENU_Y, MENU_W, MENU_H);
+	draw_menu();
+	present_synced();
+}
+
+/* Close the menu; `exitApp`: end the app instead of resuming it */
+static void menu_close(int exitApp) {
+	if (!sMenu) {
+		return;
+	}
+	sMenu = 0;
+	if (sLessee != 0) {
+		// Back to the (transparent) OSD box before the app runs again
+		fill(0, 0, BUF_W, BUF_H, 0);
+		present_synced();
+		set_plane(BOX_X, BOX_Y, BOX_W, BOX_H);
+	}
+	if (sPadFd >= 0) {
+		ioctl(sPadFd, EVIOCGRAB, 0);
+		close(sPadFd);
+		sPadFd = -1;
+	}
+	if (sAppPid > 0) {
+		kill(sAppPid, SIGCONT);
+		if (exitApp) {
+			kill(sAppPid, SIGTERM);
+			sKillPid = sAppPid;
+			sKillAt = now_ms() + EXIT_GRACE_MS;
+		}
+	}
+}
+
+/* Reboot or power off through init (which stops everything and syncs) */
+static void run_system(const char* cmd) {
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		execlp(cmd, cmd, (char*)NULL);
+		_exit(127);
+	}
+}
+
+static void menu_confirm(void) {
+	if (!sMenuLauncher) {
+		menu_close(sMenuSel == APP_EXIT);
+		return;
+	}
+	menu_close(0);
+	if (sMenuSel != SYS_CANCEL) {
+		run_system(sMenuSel == SYS_REBOOT ? "reboot" : "poweroff");
+	}
+}
+
+/* Gamepad events while the menu is open */
+static void menu_input(void) {
+	struct input_event ev[16];
+	ssize_t n = read(sPadFd, ev, sizeof(ev));
+	int i, redraw = 0;
+
+	for (i = 0; n > 0 && i < (int)(n / sizeof(ev[0])); i++) {
+		if (ev[i].type != EV_KEY || ev[i].value != 1) {
+			continue;
+		}
+		switch (ev[i].code) {
+			case BTN_DPAD_UP:
+			case BTN_DPAD_DOWN:
+				sMenuSel = (sMenuSel + (ev[i].code == BTN_DPAD_UP ? menu_count() - 1 : 1)) % menu_count();
+				redraw = 1;
+				break;
+			case BTN_EAST: // A: confirm
+				menu_confirm();
+				return;
+			case BTN_SOUTH: // B: back
+				menu_close(0);
+				return;
+		}
+	}
+	if (redraw) {
+		draw_menu();
+		present_synced();
+	}
+}
+
+/* Power key: open or close the menu */
+static void power_key(int fd) {
+	struct input_event ev[16];
+	ssize_t n = read(fd, ev, sizeof(ev));
+	int i;
+
+	for (i = 0; n > 0 && i < (int)(n / sizeof(ev[0])); i++) {
+		if (ev[i].type == EV_KEY && ev[i].code == KEY_POWER && ev[i].value == 1) {
+			if (sMenu) {
+				menu_close(0);
+			} else {
+				menu_open();
+			}
+		}
+	}
 }
 
 /* Forget the lease once its lessee has closed it; drop master when idle */
@@ -377,8 +626,10 @@ static void check_lease(void) {
 	}
 	drmFree(list);
 	if (!alive) {
+		menu_close(0);
 		plane_off();
 		sLessee = 0;
+		sAppPid = 0;
 		set_master(0);
 	}
 }
@@ -514,6 +765,8 @@ static void reply(int c, const char* msg, int fd) {
 }
 
 static void handle_client(int c) {
+	struct ucred cred;
+	socklen_t len = sizeof(cred);
 	char msg[64], icon[16];
 	ssize_t n = recv(c, msg, sizeof(msg) - 1, 0);
 	int percent;
@@ -524,6 +777,9 @@ static void handle_client(int c) {
 	msg[n] = '\0';
 	if (strncmp(msg, "lease ", 6) == 0) {
 		int fd = strcmp(msg + 6, sCard) == 0 ? make_lease() : -1;
+		if (fd >= 0 && getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
+			sAppPid = cred.pid; // the app (the shim runs in it)
+		}
 		reply(c, fd >= 0 ? "ok" : "fail", fd);
 		if (fd >= 0) {
 			close(fd); // the client has its own copy now
@@ -535,7 +791,7 @@ static void handle_client(int c) {
 
 int main(void) {
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
-	int srv, nl, i;
+	int srv, nl, power, i;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	{
@@ -572,11 +828,15 @@ int main(void) {
 	}
 	chmod(SOCKET_PATH, 0666);
 	nl = open_uevents();
+	power = open_input("axp20x-pek");
+	if (power >= 0) {
+		ioctl(power, EVIOCGRAB, 1); // the power key is the system menu's alone
+	}
 	printf("s30-display: %s connector %u crtc %u primary %u overlay %u\n", sCard, sConnector, sCrtc, sPrimary,
 	       sOverlay);
 
 	for (;;) {
-		struct pollfd p[2] = { { srv, POLLIN, 0 }, { nl, POLLIN, 0 } };
+		struct pollfd p[4] = { { srv, POLLIN, 0 }, { nl, POLLIN, 0 }, { power, POLLIN, 0 }, { sPadFd, POLLIN, 0 } };
 		uint64_t t = now_ms();
 		int animating = osd_frame(); // waits for a vblank when drawing
 
@@ -584,9 +844,21 @@ int main(void) {
 			check_lease();
 			sNextLeaseCheck = t + LEASE_POLL_MS;
 		}
-		if (poll(p, nl >= 0 ? 2 : 1, animating ? 0 : (int)(sOsdUntil > t && sPlaneOn ? sOsdUntil - t : LEASE_POLL_MS)) <=
-		    0) {
+		if (sKillAt != 0 && t >= sKillAt) {
+			if (sKillPid == sAppPid && kill(sKillPid, 0) == 0) {
+				kill(sKillPid, SIGKILL); // didn't exit on SIGTERM
+			}
+			sKillAt = 0;
+		}
+		// poll() ignores entries with a negative fd
+		if (poll(p, 4, animating ? 0 : (int)(sOsdUntil > t && sPlaneOn ? sOsdUntil - t : LEASE_POLL_MS)) <= 0) {
 			continue;
+		}
+		if (power >= 0 && (p[2].revents & POLLIN)) {
+			power_key(power);
+		}
+		if (sMenu && sPadFd >= 0 && (p[3].revents & POLLIN)) {
+			menu_input();
 		}
 		if (nl >= 0 && (p[1].revents & POLLIN)) {
 			power_changed(nl);

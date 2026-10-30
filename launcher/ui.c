@@ -10,7 +10,8 @@
 #define FONT_DIR "/usr/share/libretro/assets/ozone"
 #define GAMEPAD_NAME "PocketGo S30 Gamepad"
 
-const SDL_Color UI_ACCENT = { 2, 255, 202, 255 };
+// Purple of s30-display's overlays (0x8060e0), lightened for text on black
+const SDL_Color UI_ACCENT = { 150, 120, 240, 255 };
 const SDL_Color UI_TEXT = { 255, 255, 255, 255 };
 const SDL_Color UI_DIM = { 175, 175, 175, 255 };
 

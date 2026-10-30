@@ -137,8 +137,8 @@ static void dir_parent(void) {
  * Gamepad and display (ui.c)
  * ------------------------------------------------------------------------- */
 
-enum { IN_UP, IN_DOWN, IN_A, IN_B, IN_SELECT, IN_COUNT };
-static const int sPadCodes[IN_COUNT] = { BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_EAST, BTN_SOUTH, BTN_SELECT };
+enum { IN_UP, IN_DOWN, IN_A, IN_B, IN_COUNT };
+static const int sPadCodes[IN_COUNT] = { BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_EAST, BTN_SOUTH };
 static int sPadFd = -1;
 static bool sHeld[IN_COUNT];
 static int sAxisY, sAxisYCentre;
@@ -221,52 +221,6 @@ static void draw_battery(int x, int y, int pct, bool charging) {
     }
 }
 
-/* ---------------------------------------------------------------------------
- * System menu (Select): reboot / shut down
- * ------------------------------------------------------------------------- */
-
-static const char* const sMenuItems[] = { "Reboot", "Shut down", "Cancel" };
-#define MENU_COUNT (int)(sizeof(sMenuItems) / sizeof(sMenuItems[0]))
-static bool sMenuOpen;
-static int sMenuSel;
-
-static void render_menu(void) {
-    const int w = 200, h = 24 + MENU_COUNT * ROW_H, x = (SCRW - w) / 2, y = (UI_H - h) / 2;
-    SDL_Rect box = { x, y, w, h };
-    int i;
-
-    SDL_SetRenderDrawColor(gUiRenderer, 20, 20, 20, 255);
-    SDL_RenderFillRect(gUiRenderer, &box);
-    SDL_SetRenderDrawColor(gUiRenderer, 60, 60, 60, 255);
-    SDL_RenderDrawRect(gUiRenderer, &box);
-    for (i = 0; i < MENU_COUNT; i++) {
-        int iy = y + 12 + i * ROW_H;
-
-        if (i == sMenuSel) {
-            SDL_Rect bar = { x + 6, iy - 1, w - 12, ROW_H };
-            SDL_SetRenderDrawColor(gUiRenderer, 30, 60, 55, 255);
-            SDL_RenderFillRect(gUiRenderer, &bar);
-        }
-        ui_text(gUiFontRegular, sMenuItems[i], i == sMenuSel ? UI_ACCENT : UI_TEXT, x + 16, iy, w - 32);
-    }
-}
-
-/* Reboot / power off through init, which stops everything and syncs */
-static void menu_select(void) {
-    const char* cmd = sMenuSel == 0 ? "reboot" : sMenuSel == 1 ? "poweroff" : NULL;
-
-    sMenuOpen = false;
-    if (cmd != NULL) {
-        printf("launcher: %s\n", cmd);
-        ui_video_close();
-        execlp(cmd, cmd, (char*)NULL);
-        fprintf(stderr, "launcher: %s: %s\n", cmd, strerror(errno));
-        if (!ui_video_open()) {
-            exit(1);
-        }
-    }
-}
-
 static void render(void) {
     bool charging;
     int pct = battery(&charging);
@@ -297,17 +251,13 @@ static void render(void) {
 
         if (i == sDir.selected) {
             SDL_Rect bar = { 8, y - 1, SCRW - 16, ROW_H };
-            SDL_SetRenderDrawColor(gUiRenderer, 30, 60, 55, 255);
+            SDL_SetRenderDrawColor(gUiRenderer, 0x80, 0x60, 0xe0, 255); // as the overlay menus
             SDL_RenderFillRect(gUiRenderer, &bar);
         }
         snprintf(label, sizeof(label), "%s%s", sDir.entries[i].name, sDir.entries[i].isDir ? "/" : "");
-        ui_text(gUiFontRegular, label, i == sDir.selected ? UI_ACCENT : sDir.entries[i].isDir ? UI_DIM : UI_TEXT,
+        ui_text(gUiFontRegular, label, i == sDir.selected ? UI_TEXT : sDir.entries[i].isDir ? UI_DIM : UI_TEXT,
                 18, y, SCRW - 36);
     }
-    if (sMenuOpen) {
-        render_menu();
-    }
-
     ui_present();
 }
 
@@ -373,7 +323,7 @@ static void run(const char* path) {
 int main(int argc, char** argv) {
     Uint32 nextRepeat = 0, lastRender = 0;
     int moveDir = 0;
-    bool dirty = true, prevA = false, prevB = false, prevSelect = false;
+    bool dirty = true, prevA = false, prevB = false;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (!ui_init()) {
@@ -390,7 +340,7 @@ int main(int argc, char** argv) {
     for (;;) {
         Uint32 now = SDL_GetTicks();
         int dir;
-        bool a, b, select;
+        bool a, b;
 
         {
             int x = 0, y = sAxisY;
@@ -406,42 +356,6 @@ int main(int argc, char** argv) {
         dir = sHeld[IN_UP] || sAxisY < sAxisYCentre - 50 ? -1 : sHeld[IN_DOWN] || sAxisY > sAxisYCentre + 50 ? 1 : 0;
         a = sHeld[IN_A];
         b = sHeld[IN_B];
-        select = sHeld[IN_SELECT];
-        if (sMenuOpen) {
-            if (dir != moveDir && dir != 0) {
-                sMenuSel = (sMenuSel + dir + MENU_COUNT) % MENU_COUNT;
-                dirty = true;
-            }
-            moveDir = dir;
-            if (a && !prevA) {
-                menu_select();
-                dirty = true;
-            } else if ((b && !prevB) || (select && !prevSelect)) {
-                sMenuOpen = false;
-                dirty = true;
-            }
-            prevA = a;
-            prevB = b;
-            prevSelect = select;
-            if (dirty) {
-                render();
-                lastRender = now;
-                dirty = false;
-            }
-            SDL_Delay(16);
-            continue;
-        }
-        if (select && !prevSelect) {
-            sMenuOpen = true;
-            sMenuSel = MENU_COUNT - 1; // Cancel
-            prevSelect = select;
-            prevA = a;
-            prevB = b;
-            render();
-            lastRender = now;
-            continue;
-        }
-        prevSelect = select;
         if (dir != moveDir) {
             moveDir = dir;
             if (dir != 0 && sDir.count > 0) {

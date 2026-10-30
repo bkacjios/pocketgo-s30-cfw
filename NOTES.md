@@ -12,7 +12,7 @@ leaving the stock firmware in SPI flash untouched (remove the card = stock).
 - Boots standalone from SD (verified on a FAT32 card): U-Boot splash (stock
   PocketGo logo) -> kernel logo -> splash with progress bar -> launcher
   (s30-launcher: RetroArch, Ocarina of Time, Super Mario 64, joystick
-  calibration; Select = Reboot / Shut down menu). See "Standalone SD card
+  calibration; power key = system menu). See "Standalone SD card
   boot" and "Linux system".
 - Since 2026-10-29: BusyBox init (rootfs-overlay), kernel-owned headphone
   jack, system volume daemon, boot splash, quieter amp pops, OoT audio fixed
@@ -291,8 +291,9 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
 - `HOME=/mnt/sd/home`, `XDG_RUNTIME_DIR=/run/user/0` from
   `/etc/profile.d/s30.sh` (login shells, rc, frontend; `ssh host cmd` is not
   a login shell and keeps HOME=/root).
-- Launcher: Select opens a system menu (Reboot / Shut down / Cancel) that
-  runs `reboot` / `poweroff` through init. The PMIC node has
+- System menu (s30-display, power key): Reboot / Shut down / Cancel over
+  the launcher (`reboot` / `poweroff` through init), Resume / Exit game over
+  an app. The PMIC node has
   `x-powers,system-power-controller`, so poweroff cuts power via the AXP.
 - `s30-volumed` (utils/s30-volumed.c, respawned by init): volume keys
   (gpio-keys, polled, no autorepeat: the daemon repeats while held) step
@@ -323,6 +324,15 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   `axp20x-usb`) with the battery level, never "full" or a permanent battery.
   Restarting the daemon revokes the running app's lease (black screen):
   restart the launcher with it.
+  System menu (power key, `axp20x-pek` grabbed): the plane is resized to a
+  centred box (only one alpha plane can blend, so it reuses the OSD plane;
+  the resize commits happen while the lessee is SIGSTOPped, so they can't
+  collide with its flips; the plane is cleared and moved before the menu is
+  drawn, else the old position flashes it). Lessee pid from SO_PEERCRED at
+  lease time; gamepad grabbed while open. Over an app: Resume / Exit game
+  (SIGTERM, SIGKILL after 2 s); over the launcher: Reboot / Shut down /
+  Cancel. Text: kernel VGA 8x16 font (utils/osd_font.h from
+  tools/make_osd_font.py).
 - Launcher header battery: icon filled to the level (green > 50 %, yellow
   > 20 %, red), percentage inside, white bolt while `status` is Charging.
 - `s30-fel` (utils/s30-fel.c): `reboot(RESTART2, "fel")`; the DT's
@@ -354,8 +364,9 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
 - Config highlights (`build/rootfs-overlay/etc/retroarch.cfg`): RGUI with
   3:2 aspect (`rgui_aspect_ratio = "7"` in the 1.22 enum, the old 1.9
   config's "5" is 21:9 now), lock fit, linear filter, full-width layout;
-  `menu_swap_ok_cancel_buttons = "false"` (1.22 defaults to OK on B); power
-  key = menu toggle, volume keys = volume, Start+Select = menu; clock off (no
+  `menu_swap_ok_cancel_buttons = "false"` (1.22 defaults to OK on B);
+  L1+R1+Start+Select = menu (the power key is the system menu's), volume keys
+  = system volume; clock off (no
   RTC battery); `config_save_on_exit = "true"`; dirs under
   `~/.config/retroarch`, ROM browser `~/roms`.
 - Gamepad autoconfig: udev joypad numbers buttons in code order from
@@ -378,9 +389,10 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   battery still charges while off; no charging screen (a Linux charging mode
   in s30-loader was considered and rejected). Written to the SD card
   2026-10-30 (over ssh, `dd of=/dev/mmcblk0 bs=1k seek=8`), untested.
-- In Linux the key is `axp20x-pek` (KEY_POWER), mapped to the RetroArch menu.
-  Clean power-off: the launcher's Select menu (Shut down = `poweroff`, AXP
-  system-power-controller). Not verified by the user yet.
+- In Linux the key is `axp20x-pek` (KEY_POWER), grabbed by s30-display for
+  the system menu (RetroArch's menu: L1+R1+Start+Select). Clean power-off: the
+  system menu over the launcher (Shut down = `poweroff`, AXP
+  system-power-controller).
 - Sleep (planned, not started): short press = s2idle (`echo freeze >
   /sys/power/state`), press again = wake (AXP PEK IRQ), long press = AXP
   hardware off as now. One button daemon would take over from s30-volumed
