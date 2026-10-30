@@ -28,7 +28,7 @@ mkdir -p "$WORK" "$OUT"
 # worktree at the pinned commit (fetched on first use).
 upstream_tree() {
 	local name="$1" src="$WORK/$1" sub="$PROJECT/external/$1" pinned
-	[ -e "$sub/.git" ] || git -C "$PROJECT" submodule update --init "external/$name"
+	[ -e "$sub/.git" ] || git -C "$PROJECT" submodule update --init --depth 1 "external/$name"
 	pinned="$(git -C "$sub" rev-parse HEAD)"
 	if [ ! -e "$src/.git" ]; then
 		git -C "$sub" worktree prune

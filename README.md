@@ -8,12 +8,14 @@ No ROMs, BIOS files or stock firmware are included.
 
 ## Build
 
-Needs an Arch or Debian/Ubuntu host. Clone with the pinned upstream sources
-(shallow submodules: Linux, U-Boot, RetroArch):
+Needs an Arch or Debian/Ubuntu host. The pinned upstream sources (Linux,
+U-Boot, RetroArch) are submodules; fetch them without history (`build.sh`
+also does this on first use):
 
 ```
-git clone --recurse-submodules https://github.com/bkacjios/pocketgo-s30-cfw
+git clone https://github.com/bkacjios/pocketgo-s30-cfw
 cd pocketgo-s30-cfw
+git submodule update --init --depth 1
 bash build/build.sh deps            # host packages (pacman or apt)
 for s in linux uboot rootfs retroarch initramfs; do bash build/build.sh $s; done
 sudo bash build/build.sh sdcard /dev/sdX          # refresh U-Boot and /boot
