@@ -1,0 +1,12 @@
+# BusyBox init. /etc/s30/rc sets the system up; the frontend (launcher) and
+# shells on the serial console and the USB serial gadget are respawned.
+
+::sysinit:/etc/s30/rc
+
+::respawn:/usr/libexec/s30/frontend
+::respawn:/usr/bin/s30-volumed /mnt/sd/home/.config/volume
+ttyS0::respawn:-/bin/sh
+ttyGS0::respawn:-/bin/sh
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/sync

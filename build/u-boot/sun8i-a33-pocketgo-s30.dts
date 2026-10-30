@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Minimal PocketGo S30 device tree for U-Boot: console and SD card only.
+ * Pin muxing is done by U-Boot itself, so no pinctrl references are needed.
+ */
+
+/dts-v1/;
+#include "sun8i-a33.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	model = "PocketGo S30";
+	compatible = "pocketgo,s30", "allwinner,sun8i-a33";
+
+	aliases {
+		mmc0 = &mmc0;
+		serial0 = &uart1;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+};
+
+&mmc0 {
+	bus-width = <4>;
+	cd-gpios = <&pio 1 1 GPIO_ACTIVE_LOW>; /* PB1 */
+	status = "okay";
+};
+
+&uart1 {
+	status = "okay";
+};

@@ -1,0 +1,344 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * PocketGo S30 (Zkswe A33 handheld).
+ *
+ * Hardware details come from the stock script.fex and the stock 3.4 kernel.
+ */
+
+/dts-v1/;
+#include "sun8i-a33.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/pwm/pwm.h>
+
+/ {
+	model = "PocketGo S30";
+	compatible = "pocketgo,s30", "allwinner,sun8i-a33";
+
+	aliases {
+		serial0 = &uart1;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	/*
+	 * Speaker amp, fed from the codec's headphone outputs like on stock
+	 * (fex headphone_direct_used, pa_single; stock mixer: "External
+	 * Speaker Switch" on, lineout volume 0). fex audio_pa_ctrl = PH9,
+	 * high while stock plays.
+	 */
+	speaker_amp: audio-amplifier {
+		compatible = "simple-audio-amplifier";
+		enable-gpios = <&pio 7 9 GPIO_ACTIVE_HIGH>;
+		sound-name-prefix = "Speaker Amp";
+	};
+
+	/*
+	 * Blue status LED on PL10 (stock firmware drives it low while running;
+	 * not in the fex). Switched on by userspace once boot has finished.
+	 */
+	/*
+	 * "reboot fel" (s30-fel): boot0 enters FEL once when RTC general-purpose
+	 * register 2 holds this magic (stock firmware's FEL flag).
+	 */
+	reboot-mode {
+		compatible = "nvmem-reboot-mode";
+		nvmem-cells = <&fel_flag>;
+		nvmem-cell-names = "reboot-mode";
+		mode-fel = <0x5aa5a55a>;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led-status {
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_BLUE>;
+			gpios = <&r_pio 0 10 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+	};
+
+	/* fex [pwm0_para] + lcd_pwm_freq 50000 (20000 ns), lcd_pwm_pol 0 */
+	backlight: backlight {
+		compatible = "pwm-backlight";
+		pwms = <&pwm 0 20000 0>;
+		brightness-levels = <0 4 8 16 32 64 128 255>;
+		default-brightness-level = <5>;
+	};
+
+	/*
+	 * fex [gpkey_para] keys, active low. Mapped by probing the pins on stock
+	 * firmware (Nintendo layout: A right, B bottom). Gamepad buttons are in
+	 * the gamepad node on &i2c0; fex gpkey18-21 (PB5, PB4, PB3, PB2) read as
+	 * pressed at rest on stock and match no button, so they are left out.
+	 */
+	gpio-keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <20>;
+
+		key-volume-up { label = "volume-up"; gpios = <&pio 6 1 GPIO_ACTIVE_LOW>; linux,code = <KEY_VOLUMEUP>; }; /* PG1 */
+		key-volume-down { label = "volume-down"; gpios = <&pio 6 0 GPIO_ACTIVE_LOW>; linux,code = <KEY_VOLUMEDOWN>; }; /* PG0 */
+	};
+};
+
+&codec {
+	status = "okay";
+};
+
+/*
+ * The jack detect contact (PL5, fex audio_linein_detect; low with a plug in)
+ * only reads high while the HP amp is on. The codec owns the jack: the mono
+ * speaker amp is bridged across HPL/HPR, and the jack has L/R swapped.
+ */
+&codec_analog {
+	allwinner,headphone-amp-always-on;
+	allwinner,bridged-mono-speaker;
+	allwinner,headphone-lr-swapped;
+	hp-det-gpios = <&r_pio 0 5 GPIO_ACTIVE_LOW>;
+};
+
+&dai {
+	status = "okay";
+};
+
+&de {
+	status = "okay";
+};
+
+&tcon0 {
+	/*
+	 * DSI needs tcon0 clocked from PLL-MIPI. From pll-video at the same rate
+	 * LP commands work but HS video never starts (found in U-Boot bring-up).
+	 */
+	assigned-clocks = <&ccu CLK_LCD_CH0>;
+	assigned-clock-parents = <&ccu CLK_PLL_MIPI>;
+	status = "okay";
+};
+
+&dphy {
+	status = "okay";
+};
+
+&dsi {
+	vcc-dsi-supply = <&reg_dcdc1>;
+	status = "okay";
+
+	panel@0 {
+		compatible = "ilitek,ili9488-dsi";
+		reg = <0>;
+		/* fex lcd_power = axp22_dc1sw; stock panel driver also enables dldo1 @ 3.3 V */
+		power-supply = <&reg_dc1sw>;
+		iovcc-supply = <&reg_dldo1>;
+		/* fex lcd_gpio_0 = PD26 */
+		reset-gpios = <&pio 3 26 GPIO_ACTIVE_LOW>;
+		backlight = <&backlight>;
+		/* Native 320x480 portrait panel mounted landscape; flip to 90 if upside down */
+		rotation = <270>;
+	};
+};
+
+/* fex [twi0] on PH2/PH3 */
+&i2c0 {
+	status = "okay";
+
+	/*
+	 * Analog stick MCU (stock driver "mcu_ts"; a 4 byte read returns X, ~X,
+	 * Y, ~Y), reported together with the gamepad buttons as one device.
+	 */
+	gamepad@60 {
+		compatible = "pocketgo,s30-gamepad";
+		reg = <0x60>;
+		poll-interval = <10>;
+
+		button-up { label = "up"; gpios = <&pio 6 9 GPIO_ACTIVE_LOW>; linux,code = <BTN_DPAD_UP>; }; /* PG9 */
+		button-down { label = "down"; gpios = <&pio 6 8 GPIO_ACTIVE_LOW>; linux,code = <BTN_DPAD_DOWN>; }; /* PG8 */
+		button-left { label = "left"; gpios = <&r_pio 0 8 GPIO_ACTIVE_LOW>; linux,code = <BTN_DPAD_LEFT>; }; /* PL8 */
+		button-right { label = "right"; gpios = <&r_pio 0 9 GPIO_ACTIVE_LOW>; linux,code = <BTN_DPAD_RIGHT>; }; /* PL9 */
+		button-b { label = "b"; gpios = <&pio 6 10 GPIO_ACTIVE_LOW>; linux,code = <BTN_SOUTH>; }; /* PG10 */
+		button-y { label = "y"; gpios = <&pio 6 11 GPIO_ACTIVE_LOW>; linux,code = <BTN_WEST>; }; /* PG11 */
+		button-a { label = "a"; gpios = <&pio 6 12 GPIO_ACTIVE_LOW>; linux,code = <BTN_EAST>; }; /* PG12 */
+		button-x { label = "x"; gpios = <&pio 6 13 GPIO_ACTIVE_LOW>; linux,code = <BTN_NORTH>; }; /* PG13 */
+		button-select { label = "select"; gpios = <&r_pio 0 11 GPIO_ACTIVE_LOW>; linux,code = <BTN_SELECT>; }; /* PL11 */
+		button-start { label = "start"; gpios = <&pio 6 4 GPIO_ACTIVE_LOW>; linux,code = <BTN_START>; }; /* PG4 */
+		button-thumbl { label = "thumbl"; gpios = <&pio 6 5 GPIO_ACTIVE_LOW>; linux,code = <BTN_THUMBL>; }; /* PG5, probably stick click; no response on the test unit (neither GPIO nor MCU) */
+		button-l2 { label = "l2"; gpios = <&pio 1 7 GPIO_ACTIVE_LOW>; linux,code = <BTN_TL2>; }; /* PB7 */
+		button-r1 { label = "r1"; gpios = <&pio 6 3 GPIO_ACTIVE_LOW>; linux,code = <BTN_TR>; }; /* PG3 */
+		button-l1 { label = "l1"; gpios = <&pio 1 6 GPIO_ACTIVE_LOW>; linux,code = <BTN_TL>; }; /* PB6 */
+		button-r2 { label = "r2"; gpios = <&pio 6 2 GPIO_ACTIVE_LOW>; linux,code = <BTN_TR2>; }; /* PG2 */
+	};
+};
+
+&mmc0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&mmc0_pins>;
+	vmmc-supply = <&reg_dcdc1>;
+	bus-width = <4>;
+	/* fex sdc_det = PB1 */
+	cd-gpios = <&pio 1 1 GPIO_ACTIVE_LOW>;
+	status = "okay";
+};
+
+&pwm {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pwm0_pin>;
+	status = "okay";
+};
+
+&r_rsb {
+	status = "okay";
+
+	axp22x: pmic@3a3 {
+		compatible = "x-powers,axp223";
+		reg = <0x3a3>;
+		interrupt-parent = <&r_intc>;
+		interrupts = <GIC_SPI 32 IRQ_TYPE_LEVEL_LOW>;
+		eldoin-supply = <&reg_dcdc1>;
+		/* poweroff powers the device off through the AXP */
+		x-powers,system-power-controller;
+	};
+};
+
+#include "axp223.dtsi"
+
+&battery_power_supply {
+	status = "okay";
+};
+
+&ac_power_supply {
+	status = "okay";
+};
+
+&usb_power_supply {
+	status = "okay";
+};
+
+/* Peripheral only for now: USB serial gadget shell for bring-up */
+&usb_otg {
+	dr_mode = "peripheral";
+	status = "okay";
+};
+
+&usbphy {
+	/*
+	 * No usb0_vbus_power-supply: with it the PHY reported no VBUS (the
+	 * AXP USB supply's "present" read 0) and the gadget never attached.
+	 * Without it the PHY assumes VBUS is present.
+	 */
+	status = "okay";
+};
+
+/* Voltages from fex [power_sply] */
+&reg_aldo1 {
+	regulator-always-on;
+	regulator-min-microvolt = <3000000>;
+	regulator-max-microvolt = <3000000>;
+	regulator-name = "vcc-io";
+};
+
+&reg_aldo2 {
+	regulator-always-on;
+	regulator-min-microvolt = <2500000>;
+	regulator-max-microvolt = <2500000>;
+	regulator-name = "vdd-dll";
+};
+
+&reg_aldo3 {
+	regulator-always-on;
+	regulator-min-microvolt = <3000000>;
+	regulator-max-microvolt = <3000000>;
+	regulator-name = "vcc-pll-avcc";
+};
+
+&reg_dc1sw {
+	regulator-name = "vcc-lcd";
+};
+
+&reg_dc5ldo {
+	regulator-always-on;
+	regulator-min-microvolt = <900000>;
+	regulator-max-microvolt = <1400000>;
+	regulator-name = "vdd-cpus";
+};
+
+&reg_dcdc1 {
+	regulator-always-on;
+	regulator-min-microvolt = <3000000>;
+	regulator-max-microvolt = <3000000>;
+	regulator-name = "vcc-3v0";
+};
+
+&reg_dcdc2 {
+	regulator-always-on;
+	regulator-min-microvolt = <900000>;
+	regulator-max-microvolt = <1400000>;
+	regulator-name = "vdd-sys";
+};
+
+&reg_dcdc3 {
+	regulator-always-on;
+	regulator-min-microvolt = <900000>;
+	regulator-max-microvolt = <1400000>;
+	regulator-name = "vdd-cpu";
+};
+
+&reg_dcdc5 {
+	regulator-always-on;
+	regulator-min-microvolt = <1500000>;
+	regulator-max-microvolt = <1500000>;
+	regulator-name = "vcc-dram";
+};
+
+&reg_dldo1 {
+	regulator-min-microvolt = <3300000>;
+	regulator-max-microvolt = <3300000>;
+	regulator-name = "vcc-lcd-io";
+};
+
+&reg_rtc_ldo {
+	regulator-name = "vcc-rtc";
+};
+
+/* fex uart_debug_port = 1 on PG6/PG7 */
+&sound {
+	simple-audio-card,aux-devs = <&codec_analog>, <&speaker_amp>;
+	/* simple-audio-card names the headphone jack pin "Headphones" */
+	simple-audio-card,widgets = "Headphone", "Headphones",
+				    "Speaker", "Speaker";
+	simple-audio-card,routing =
+		"Left DAC", "DACL",
+		"Right DAC", "DACR",
+		/* Capless outputs: HP is referenced to HPCOM (stock: HPCOM on) */
+		"Headphones", "HP",
+		"Headphones", "HPCOM",
+		"Speaker Amp INL", "HP",
+		"Speaker Amp INR", "HP",
+		"Speaker Amp INL", "HPCOM",
+		"Speaker", "Speaker Amp OUTL",
+		"Speaker", "Speaker Amp OUTR";
+	simple-audio-card,pin-switches = "Speaker";
+	status = "okay";
+};
+
+&uart1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart1_pg_pins>;
+	status = "okay";
+};
+
+&rtc {
+	nvmem-layout {
+		compatible = "fixed-layout";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/* General-purpose data register 2 (0x01f00108) */
+		fel_flag: fel-flag@8 {
+			reg = <0x8 0x4>;
+		};
+	};
+};

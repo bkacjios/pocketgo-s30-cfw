@@ -1,0 +1,77 @@
+diff --git a/memory/neon/memcpy-neon.S b/memory/neon/memcpy-neon.S
+index 894639a..033ea91 100644
+--- a/memory/neon/memcpy-neon.S
++++ b/memory/neon/memcpy-neon.S
+@@ -37,18 +37,18 @@ memcpy_neon:
+ 		tst	r0, #0xF
+ 		beq	2f
+ 		tst	r0, #1
+-		ldrneb	r3, [r1], #1
+-		strneb	r3, [ip], #1
++		ldrbne	r3, [r1], #1
++		strbne	r3, [ip], #1
+ 		subne	r2, r2, #1
+ 		tst	ip, #2
+ #ifdef ENABLE_UNALIGNED_MEM_ACCESSES
+-		ldrneh	r3, [r1], #2
+-		strneh	r3, [ip], #2
++		ldrhne	r3, [r1], #2
++		strhne	r3, [ip], #2
+ #else
+-		ldrneb	r3, [r1], #1
+-		strneb	r3, [ip], #1
+-		ldrneb	r3, [r1], #1
+-		strneb	r3, [ip], #1
++		ldrbne	r3, [r1], #1
++		strbne	r3, [ip], #1
++		ldrbne	r3, [r1], #1
++		strbne	r3, [ip], #1
+ #endif
+ 		subne	r2, r2, #2
+ 
+@@ -110,31 +110,31 @@ memcpy_neon:
+ 		ldrmi	r3, [r1], #4
+ 		strmi	r3, [ip], #4
+ 		movs	r2, r2, lsl #31
+-		ldrcsh	r3, [r1], #2
+-		strcsh	r3, [ip], #2
+-		ldrmib	r3, [r1], #1
+-		strmib	r3, [ip], #1
++		ldrhcs	r3, [r1], #2
++		strhcs	r3, [ip], #2
++		ldrbmi	r3, [r1], #1
++		strbmi	r3, [ip], #1
+ #else
+ 		movs	r3, r2, lsl #29
+ 		bcc	1f
+ 	.rept	8
+-		ldrcsb	r3, [r1], #1
+-		strcsb	r3, [ip], #1
++		ldrbcs	r3, [r1], #1
++		strbcs	r3, [ip], #1
+ 	.endr
+ 1:
+ 		bpl	1f
+ 	.rept	4
+-		ldrmib	r3, [r1], #1
+-		strmib	r3, [ip], #1
++		ldrbmi	r3, [r1], #1
++		strbmi	r3, [ip], #1
+ 	.endr
+ 1:
+ 		movs	r2, r2, lsl #31
+-		ldrcsb	r3, [r1], #1
+-		strcsb	r3, [ip], #1
+-		ldrcsb	r3, [r1], #1
+-		strcsb	r3, [ip], #1
+-		ldrmib	r3, [r1], #1
+-		strmib	r3, [ip], #1
++		ldrbcs	r3, [r1], #1
++		strbcs	r3, [ip], #1
++		ldrbcs	r3, [r1], #1
++		strbcs	r3, [ip], #1
++		ldrbmi	r3, [r1], #1
++		strbmi	r3, [ip], #1
+ #endif
+ 		bx	lr
+ 	.fnend

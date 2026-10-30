@@ -1,0 +1,254 @@
+diff --git a/gfx/common/gl2_common.h b/gfx/common/gl2_common.h
+index 44b32fc..422aec8 100644
+--- a/gfx/common/gl2_common.h
++++ b/gfx/common/gl2_common.h
+@@ -249,6 +249,14 @@ struct gl2
+    struct video_viewport vp;                          /* int alignment */
+    math_matrix_4x4 mvp, mvp_no_rot;
+    struct video_coords coords;                        /* ptr alignment */
++   /* Whole-screen rotation (screen_orientation, quarter turns): with a
++    * rotation set, everything renders into screen_rot_fbo at the rotated
++    * size, and gl2_screen_rot_present() draws it rotated to the screen. */
++   GLuint screen_rot_fbo;
++   GLuint screen_rot_tex;
++   unsigned screen_rot;
++   unsigned screen_rot_width;
++   unsigned screen_rot_height;
+    struct scaler_ctx scaler;
+    video_info_t video_info;
+    struct video_tex_info tex_info;                    /* unsigned int alignment */
+diff --git a/gfx/drivers/gl2.c b/gfx/drivers/gl2.c
+index d39eb15..6c9e3f2 100644
+--- a/gfx/drivers/gl2.c
++++ b/gfx/drivers/gl2.c
+@@ -328,9 +328,129 @@ static void gl2_set_viewport(gl2_t *gl,
+ void glkitview_bind_fbo(void);
+ #define gl2_renderchain_bind_backbuffer() glkitview_bind_fbo()
+ #else
+-#define gl2_renderchain_bind_backbuffer() gl2_bind_fb(0)
++/* screen_rot_fbo is 0 (the default framebuffer) without screen rotation */
++#define gl2_renderchain_bind_backbuffer() gl2_bind_fb(gl->screen_rot_fbo)
+ #endif
+ 
++/* Screen size as seen by everything above the context: for odd quarter
++ * turns of screen_orientation, width and height swap. */
++static void gl2_screen_rot_size(const gl2_t *gl,
++      unsigned *width, unsigned *height)
++{
++   if (gl->screen_rot & 1)
++   {
++      unsigned tmp = *width;
++      *width       = *height;
++      *height      = tmp;
++   }
++}
++
++/* (Re)create the screen rotation target at the rotated (logical) size. */
++static void gl2_screen_rot_init(gl2_t *gl, unsigned width, unsigned height)
++{
++   if (!gl->screen_rot || !width || !height)
++      return;
++   if (     gl->screen_rot_fbo
++         && gl->screen_rot_width  == width
++         && gl->screen_rot_height == height)
++      return;
++
++   if (!gl->screen_rot_tex)
++      glGenTextures(1, &gl->screen_rot_tex);
++   glBindTexture(GL_TEXTURE_2D, gl->screen_rot_tex);
++   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
++         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++   glBindTexture(GL_TEXTURE_2D, 0);
++
++   if (!gl->screen_rot_fbo)
++      gl2_gen_fb(1, &gl->screen_rot_fbo);
++   gl2_bind_fb(gl->screen_rot_fbo);
++   gl2_fb_texture_2d(RARCH_GL_FRAMEBUFFER, RARCH_GL_COLOR_ATTACHMENT0,
++         GL_TEXTURE_2D, gl->screen_rot_tex, 0);
++   if (gl2_check_fb_status(RARCH_GL_FRAMEBUFFER)
++         != RARCH_GL_FRAMEBUFFER_COMPLETE)
++   {
++      RARCH_ERR("[GL] Screen rotation framebuffer incomplete.\n");
++      gl2_bind_fb(0);
++      gl2_delete_fb(1, &gl->screen_rot_fbo);
++      glDeleteTextures(1, &gl->screen_rot_tex);
++      gl->screen_rot_fbo = 0;
++      gl->screen_rot_tex = 0;
++      gl->screen_rot     = 0;
++      return;
++   }
++
++   gl->screen_rot_width  = width;
++   gl->screen_rot_height = height;
++   RARCH_LOG("[GL] Screen rotation %u degrees, rendering at %ux%u.\n",
++         gl->screen_rot * 90, width, height);
++}
++
++static void gl2_screen_rot_free(gl2_t *gl)
++{
++   if (gl->screen_rot_fbo)
++      gl2_delete_fb(1, &gl->screen_rot_fbo);
++   if (gl->screen_rot_tex)
++      glDeleteTextures(1, &gl->screen_rot_tex);
++   gl->screen_rot_fbo = 0;
++   gl->screen_rot_tex = 0;
++}
++
++/* Draw the finished frame from screen_rot_fbo to the real framebuffer,
++ * rotated. Called right before every buffer swap. */
++static void gl2_screen_rot_present(gl2_t *gl)
++{
++   /* Texture coordinates per corner (vertex order as in vertexes[]: bottom
++    * left, bottom right, top left, top right) for 0/90/180/270 degrees
++    * counter-clockwise. */
++   static const GLfloat rot_tex_coords[4][8] = {
++      { 0, 0,  1, 0,  0, 1,  1, 1 },
++      { 1, 0,  1, 1,  0, 0,  0, 1 },
++      { 1, 1,  0, 1,  1, 0,  0, 0 },
++      { 0, 1,  0, 0,  1, 1,  1, 0 },
++   };
++   math_matrix_4x4 mvp;
++   unsigned width  = gl->screen_rot_width;
++   unsigned height = gl->screen_rot_height;
++
++   if (!gl->screen_rot_fbo)
++      return;
++
++   /* Physical screen size */
++   gl2_screen_rot_size(gl, &width, &height);
++
++   gl2_bind_fb(0);
++   glViewport(0, 0, width, height);
++   glDisable(GL_BLEND);
++   glDisable(GL_SCISSOR_TEST);
++
++   matrix_4x4_ortho(mvp, 0, 1, 0, 1, -1, 1);
++   gl->coords.vertex    = vertexes;
++   gl->coords.tex_coord = rot_tex_coords[gl->screen_rot & 3];
++   gl->coords.color     = white_color;
++   gl->coords.vertices  = 4;
++
++   glBindTexture(GL_TEXTURE_2D, gl->screen_rot_tex);
++   gl->shader->use(gl, gl->shader_data, VIDEO_SHADER_STOCK_BLEND, true);
++   gl->shader->set_coords(gl->shader_data, &gl->coords);
++   gl->shader->set_mvp(gl->shader_data, &mvp);
++   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++
++   gl->coords.vertex    = gl->vertex_ptr;
++   gl->coords.tex_coord = gl->tex_info.coord;
++   gl->coords.color     = gl->white_color_ptr;
++   glBindTexture(GL_TEXTURE_2D, 0);
++
++   /* Back to the rotation target for the next frame */
++   gl2_bind_fb(gl->screen_rot_fbo);
++   glViewport(gl->vp.x, gl->vp.y, gl->vp.width, gl->vp.height);
++}
++
++
+ /**
+  * DISPLAY DRIVER
+  */
+@@ -2972,6 +3092,8 @@ static void gl2_set_video_mode(void *data, unsigned width, unsigned height,
+       bool fullscreen)
+ {
+    gl2_t               *gl = (gl2_t*)data;
++   /* The context deals in physical size */
++   gl2_screen_rot_size(gl, &width, &height);
+    if (gl->ctx_driver->set_video_mode)
+       gl->ctx_driver->set_video_mode(gl->ctx_data,
+             width, height, fullscreen);
+@@ -3431,10 +3553,14 @@ static bool gl2_frame(void *data, const void *frame,
+ 
+    if (gl->flags & GL2_FLAG_SHOULD_RESIZE)
+    {
++      unsigned phys_width  = width;
++      unsigned phys_height = height;
++      gl2_screen_rot_size(gl, &phys_width, &phys_height);
+       if (gl->ctx_driver->set_resize)
+          gl->ctx_driver->set_resize(gl->ctx_data,
+-            width, height);
++            phys_width, phys_height);
+       gl->flags &= ~GL2_FLAG_SHOULD_RESIZE;
++      gl2_screen_rot_init(gl, width, height);
+ 
+       if (gl->flags & GL2_FLAG_FBO_INITED)
+       {
+@@ -3659,6 +3785,7 @@ static bool gl2_frame(void *data, const void *frame,
+ #endif
+             gl2_pbo_async_readback(gl);
+ 
++   gl2_screen_rot_present(gl);
+     if (gl->ctx_driver->swap_buffers)
+         gl->ctx_driver->swap_buffers(gl->ctx_data);
+ 
+@@ -3707,6 +3834,7 @@ static bool gl2_frame(void *data, const void *frame,
+             glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+             glClear(GL_COLOR_BUFFER_BIT);
+ 
++            gl2_screen_rot_present(gl);
+             if (gl->ctx_driver->swap_buffers)
+                gl->ctx_driver->swap_buffers(gl->ctx_data);
+          }
+@@ -3776,6 +3904,7 @@ static void gl2_free(void *data)
+ 
+    font_driver_free_osd();
+ 
++   gl2_screen_rot_free(gl);
+    gl->shader->deinit(gl->shader_data);
+ 
+    glDeleteTextures(gl->textures, gl->texture);
+@@ -4240,9 +4369,12 @@ static void *gl2_init(const video_info_t *video,
+ 
+    RARCH_LOG("[GL] Found GL context: \"%s\".\n", ctx_driver->ident);
+ 
++   gl->screen_rot = config_get_ptr()->uints.screen_orientation & 3;
++
+    if (gl->ctx_driver->get_video_size)
+       gl->ctx_driver->get_video_size(gl->ctx_data,
+                &mode_width, &mode_height);
++   gl2_screen_rot_size(gl, &mode_width, &mode_height);
+ 
+    if (!video->fullscreen && !gl->ctx_driver->has_windowed)
+    {
+@@ -4288,6 +4420,8 @@ static void *gl2_init(const video_info_t *video,
+       win_height = settings->uints.video_fullscreen_y;
+    }
+ 
++   /* The context deals in physical size */
++   gl2_screen_rot_size(gl, &win_width, &win_height);
+    if (     !gl->ctx_driver->set_video_mode
+          || !gl->ctx_driver->set_video_mode(gl->ctx_data,
+             win_width, win_height, (video->fullscreen || force_fullscreen)))
+@@ -4431,6 +4565,7 @@ static void *gl2_init(const video_info_t *video,
+    if (gl->ctx_driver->get_video_size)
+       gl->ctx_driver->get_video_size(gl->ctx_data,
+             &mode_width, &mode_height);
++   gl2_screen_rot_size(gl, &mode_width, &mode_height);
+ 
+ #if defined(DINGUX)
+    mode_width     = 320;
+@@ -4450,6 +4585,8 @@ static void *gl2_init(const video_info_t *video,
+ 
+    RARCH_LOG("[GL] Using resolution %ux%u.\n", temp_width, temp_height);
+ 
++   gl2_screen_rot_init(gl, temp_width, temp_height);
++
+    gl->vertex_ptr        = hwr->bottom_left_origin
+       ? vertexes : vertexes_flipped;
+ 
+@@ -4637,8 +4774,11 @@ static bool gl2_alive(void *data)
+    unsigned temp_width  = gl->video_width;
+    unsigned temp_height = gl->video_height;
+ 
++   /* The context deals in physical size */
++   gl2_screen_rot_size(gl, &temp_width, &temp_height);
+    gl->ctx_driver->check_window(gl->ctx_data,
+          &quit, &resize, &temp_width, &temp_height);
++   gl2_screen_rot_size(gl, &temp_width, &temp_height);
+ 
+ #ifdef __WINRT__
+    if (is_running_on_xbox())

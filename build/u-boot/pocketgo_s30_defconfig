@@ -1,0 +1,47 @@
+CONFIG_ARM=y
+CONFIG_ARCH_SUNXI=y
+CONFIG_DEFAULT_DEVICE_TREE="sun8i-a33-pocketgo-s30"
+CONFIG_SPL=y
+CONFIG_MACH_SUN8I_A33=y
+# fex [dram_para]: DDR3, dram_clk 552, dram_zq 0x3bfb, dram_odt_en 1
+CONFIG_DRAM_CLK=552
+CONFIG_DRAM_ZQ=15355
+CONFIG_DRAM_ODT_EN=y
+# fex [uart_para]: debug UART1 on PG6/PG7
+CONFIG_CONS_INDEX=2
+# fex [mmc0_para]: sdc_det PB1
+CONFIG_MMC0_CD_PIN="PB1"
+# Stock panel driver sets dldo1 to 3.3 V
+CONFIG_AXP_DLDO1_VOLT=3300
+CONFIG_AXP_DCDC1_VOLT=3000
+CONFIG_AXP_ALDO2_VOLT=2500
+CONFIG_AXP_ALDO3_VOLT=3000
+CONFIG_BOOTDELAY=1
+# ILI9488 320x480 on MIPI DSI, 1 lane (see NOTES.md "Display"). Timings from
+# fex: hbp 28 + hspw 12 + hfp 22, vbp 18 + vspw 4 + vfp 22.
+CONFIG_VIDEO_LCD_PANEL_DSI_ILI9488=y
+CONFIG_VIDEO_LCD_MODE="x:320,y:480,depth:24,pclk_khz:12000,le:28,ri:22,up:18,lo:22,hs:12,vs:4,sync:3,vmode:0"
+# fex lcd_gpio_0
+CONFIG_VIDEO_LCD_RESET="PD26"
+# fex lcd_pwm: PWM0, active high (unverified)
+CONFIG_VIDEO_LCD_BL_PWM="PH0"
+# CONFIG_VIDEO_LCD_BL_PWM_ACTIVE_LOW is not set
+# Portrait panel mounted landscape; direction unverified, try 1 if upside down
+CONFIG_CONSOLE_ROTATION=y
+CONFIG_VIDEO_LCD_ROTATION=3
+# FEL boot (build.sh fel): sunxi-fel older than U-Boot's SPL header v3
+# (e.g. Arch sunxi-tools 1.4.2) cannot pass the script address, so default
+# it to scriptaddr, where build.sh fel writes fel.scr.
+CONFIG_PREBOOT="if test -n ${fel_booted}; then env exists fel_scriptaddr || setenv fel_scriptaddr ${scriptaddr}; fi"
+# Boot splash: /s30/logo.bmp from the SD card (env in sunxi-common.h patch)
+CONFIG_CMD_BMP=y
+CONFIG_BMP=y
+CONFIG_BMP_24BPP=y
+CONFIG_SPLASH_SCREEN=y
+CONFIG_SPLASH_SOURCE=y
+CONFIG_HIDE_LOGO_VERSION=y
+# SD card: exFAT (patch 0003 fixes U-Boot exFAT on 32-bit ARM)
+CONFIG_FS_EXFAT=y
+# Plugging in USB while off: SPL sees the AXP plug-in power-on flag (reg
+# 0x00 bit 0) and powers back off; only the power key boots
+CONFIG_AXP_DISABLE_BOOT_ON_POWERON=y

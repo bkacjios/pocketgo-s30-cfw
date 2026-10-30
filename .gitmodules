@@ -1,0 +1,12 @@
+[submodule "linux"]
+	path = external/linux
+	url = https://github.com/torvalds/linux.git
+	shallow = true
+[submodule "u-boot"]
+	path = external/u-boot
+	url = https://github.com/u-boot/u-boot.git
+	shallow = true
+[submodule "retroarch"]
+	path = external/retroarch
+	url = https://github.com/libretro/RetroArch.git
+	shallow = true

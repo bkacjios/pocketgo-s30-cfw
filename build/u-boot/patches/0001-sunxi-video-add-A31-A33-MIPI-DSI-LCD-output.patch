@@ -1,0 +1,1152 @@
+diff --git a/arch/arm/include/asm/arch-sunxi/clock_sun6i.h b/arch/arm/include/asm/arch-sunxi/clock_sun6i.h
+index c8f3a16e..4f0f7e1a 100644
+--- a/arch/arm/include/asm/arch-sunxi/clock_sun6i.h
++++ b/arch/arm/include/asm/arch-sunxi/clock_sun6i.h
+@@ -334,8 +334,10 @@ struct sunxi_ccm_reg {
+ #define AHB_GATE_OFFSET_MMC(n)		(AHB_GATE_OFFSET_MMC0 + (n))
+ #define AHB_GATE_OFFSET_DMA		6
+ #define AHB_GATE_OFFSET_SS		5
++#define AHB_GATE_OFFSET_MIPI_DSI	1
+ 
+ /* ahb_gate1 offsets */
++#define AHB_GATE_OFFSET_SAT		26
+ #define AHB_GATE_OFFSET_DRC0		25
+ #define AHB_GATE_OFFSET_DE_FE0		14
+ #define AHB_GATE_OFFSET_DE_BE0		12
+@@ -438,6 +440,15 @@ struct sunxi_ccm_reg {
+ #define CCM_LCD0_CTRL_GATE		(0x1 << 31)
+ #define CCM_LCD0_CTRL_M(n)		((((n) - 1) & 0xf) << 0)
+ 
++#define CCM_MIPI_DSI_CTRL_DPHY_M(n)	((((n) - 1) & 0xf) << 0)
++#define CCM_MIPI_DSI_CTRL_DPHY_PLL3	(0 << 8)
++#define CCM_MIPI_DSI_CTRL_DPHY_PLL6	(2 << 8)
++#define CCM_MIPI_DSI_CTRL_DPHY_GATE	(0x1 << 15)
++#define CCM_MIPI_DSI_CTRL_SCLK_M(n)	((((n) - 1) & 0xf) << 16)
++#define CCM_MIPI_DSI_CTRL_SCLK_PLL3	(0 << 24)
++#define CCM_MIPI_DSI_CTRL_SCLK_PLL3_2X	(2 << 24)
++#define CCM_MIPI_DSI_CTRL_SCLK_GATE	(0x1 << 31)
++
+ #define CCM_LCD1_CTRL_GATE		(0x1 << 31)
+ #define CCM_LCD1_CTRL_M(n)		((((n) - 1) & 0xf) << 0)
+ 
+@@ -479,6 +490,7 @@ struct sunxi_ccm_reg {
+ #define AHB_RESET_OFFSET_MMC0		8
+ #define AHB_RESET_OFFSET_MMC(n)		(AHB_RESET_OFFSET_MMC0 + (n))
+ #define AHB_RESET_OFFSET_SS		5
++#define AHB_RESET_OFFSET_MIPI_DSI	1
+ 
+ /* ahb_reset1 offsets */
+ #define AHB_RESET_OFFSET_SAT		26
+diff --git a/arch/arm/include/asm/arch-sunxi/cpu_sun4i.h b/arch/arm/include/asm/arch-sunxi/cpu_sun4i.h
+index f023a4cf..bf930a8f 100644
+--- a/arch/arm/include/asm/arch-sunxi/cpu_sun4i.h
++++ b/arch/arm/include/asm/arch-sunxi/cpu_sun4i.h
+@@ -124,6 +124,9 @@ defined(CONFIG_MACH_SUN50I)
+ 
+ #define SUNXI_GIC400_BASE		0x01c80000
+ 
++#define SUNXI_MIPI_DSI0_BASE		0x01ca0000
++#define SUNXI_MIPI_DPHY0_BASE		0x01ca1000
++
+ /* module sram */
+ #define SUNXI_SRAM_C_BASE		0x01d00000
+ 
+diff --git a/arch/arm/include/asm/arch-sunxi/dsi.h b/arch/arm/include/asm/arch-sunxi/dsi.h
+new file mode 100644
+index 00000000..e4ee723d
+--- /dev/null
++++ b/arch/arm/include/asm/arch-sunxi/dsi.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Allwinner A31/A33 MIPI DSI host
++ */
++
++#ifndef _SUNXI_DSI_H
++#define _SUNXI_DSI_H
++
++#include <linux/types.h>
++
++struct display_timing;
++
++/*
++ * Enable the DSI block and D-PHY and leave the lanes in LP-11, ready for
++ * sun6i_dsi_dcs_write(). Expects PLL3 to run at 297 MHz.
++ */
++void sun6i_dsi_init(const struct display_timing *mode, int lanes);
++/* Send a DCS command (data[0]) with parameters in low power mode */
++int sun6i_dsi_dcs_write(const u8 *data, size_t len);
++/* Switch to high speed mode and start streaming video from tcon0 */
++void sun6i_dsi_start_video(void);
++/*
++ * Put the DSI block and D-PHY back in reset. The Linux driver only releases
++ * the (shared) reset, and fails its first LP write on a block left streaming.
++ */
++void sun6i_dsi_disable(void);
++
++#endif /* _SUNXI_DSI_H */
+diff --git a/arch/arm/include/asm/arch-sunxi/lcdc.h b/arch/arm/include/asm/arch-sunxi/lcdc.h
+index 90216bcf..8acece6f 100644
+--- a/arch/arm/include/asm/arch-sunxi/lcdc.h
++++ b/arch/arm/include/asm/arch-sunxi/lcdc.h
+@@ -50,7 +50,14 @@ struct sunxi_lcdc_reg {
+ 	u8 res3[0x44];			/* 0xac */
+ 	u32 tcon1_io_polarity;		/* 0xf0 */
+ 	u32 tcon1_io_tristate;		/* 0xf4 */
+-	u8 res4[0x108];			/* 0xf8 */
++	u32 ecc_fifo;			/* 0xf8 */
++	u8 res4[0x64];			/* 0xfc */
++	u32 tcon0_cpu_tri0;		/* 0x160 */
++	u32 tcon0_cpu_tri1;		/* 0x164 */
++	u32 tcon0_cpu_tri2;		/* 0x168 */
++	u8 res6[0x84];			/* 0x16c */
++	u32 safe_period;		/* 0x1f0 */
++	u8 res7[0x0c];			/* 0x1f4 */
+ 	u32 mux_ctrl;			/* 0x200 */
+ 	u8 res5[0x1c];			/* 0x204 */
+ 	u32 lvds_ana0;			/* 0x220 */
+@@ -76,6 +83,7 @@ struct sunxi_lcdc_reg {
+ #define SUNXI_LCDC_TCON0_FRM_TAB2		0x57575555
+ #define SUNXI_LCDC_TCON0_FRM_TAB3		0x7f7f7777
+ #define SUNXI_LCDC_TCON0_CTRL_CLK_DELAY(n)	(((n) & 0x1f) << 4)
++#define SUNXI_LCDC_TCON0_CTRL_IF_8080	(1 << 24)
+ #define SUNXI_LCDC_TCON0_CTRL_ENABLE		(1 << 31)
+ #define SUNXI_LCDC_TCON0_DCLK_DIV(n)		((n) << 0)
+ #define SUNXI_LCDC_TCON0_DCLK_ENABLE		(0xf << 28)
+@@ -91,6 +99,18 @@ struct sunxi_lcdc_reg {
+ #define SUNXI_LCDC_TCON0_LVDS_INTF_BITWIDTH(n)	((n) << 26)
+ #define SUNXI_LCDC_TCON0_LVDS_INTF_ENABLE	(1 << 31)
+ #define SUNXI_LCDC_TCON0_IO_POL_DCLK_PHASE(x)	((x) << 28)
++#define SUNXI_LCDC_TCON0_CPU_IF_TRI_EN		(1 << 0)
++#define SUNXI_LCDC_TCON0_CPU_IF_TRI_FIFO_EN	(1 << 2)
++#define SUNXI_LCDC_TCON0_CPU_IF_TRI_FIFO_FLUSH	(1 << 16)
++#define SUNXI_LCDC_TCON0_CPU_IF_MODE_DSI	(1 << 28)
++#define SUNXI_LCDC_TCON0_CPU_TRI0_BLOCK_SIZE(n)	(((n) - 1) & 0xfff)
++#define SUNXI_LCDC_TCON0_CPU_TRI0_BLOCK_SPACE(n) ((((n) - 1) & 0xfff) << 16)
++#define SUNXI_LCDC_TCON0_CPU_TRI1_BLOCK_NUM(n)	(((n) - 1) & 0xffff)
++#define SUNXI_LCDC_TCON0_CPU_TRI2_TRANS_START(n) ((n) & 0xfff)
++#define SUNXI_LCDC_TCON0_CPU_TRI2_START_DELAY(n) (((n) & 0xffff) << 16)
++#define SUNXI_LCDC_ECC_FIFO_EN			(1 << 3)
++#define SUNXI_LCDC_SAFE_PERIOD_MODE(n)		((n) & 0x3)
++#define SUNXI_LCDC_SAFE_PERIOD_NUM(n)		(((n) & 0xfff) << 16)
+ #define SUNXI_LCDC_TCON1_CTRL_CLK_DELAY(n)	(((n) & 0x1f) << 4)
+ #define SUNXI_LCDC_TCON1_CTRL_INTERLACE_ENABLE	(1 << 20)
+ #define SUNXI_LCDC_TCON1_CTRL_ENABLE		(1 << 31)
+@@ -120,6 +140,8 @@ void lcdc_tcon0_mode_set(struct sunxi_lcdc_reg * const lcdc,
+ 			 const struct display_timing *mode,
+ 			 int clk_div, bool for_ext_vga_dac,
+ 			 int depth, int dclk_phase);
++void lcdc_tcon0_mode_set_dsi(struct sunxi_lcdc_reg * const lcdc,
++			     const struct display_timing *mode, int lanes);
+ void lcdc_tcon1_mode_set(struct sunxi_lcdc_reg * const lcdc,
+ 			 const struct display_timing *mode,
+ 			 bool ext_hvsync, bool is_composite);
+diff --git a/arch/arm/mach-sunxi/Kconfig b/arch/arm/mach-sunxi/Kconfig
+index b0c5d3cd..4c0a8e79 100644
+--- a/arch/arm/mach-sunxi/Kconfig
++++ b/arch/arm/mach-sunxi/Kconfig
+@@ -1096,6 +1096,16 @@ config VIDEO_LCD_BL_PWM_ACTIVE_LOW
+ 	help
+ 	  Set this if the backlight pwm output is active low.
+ 
++config VIDEO_LCD_ROTATION
++	int "LCD console rotation"
++	depends on VIDEO_SUNXI
++	range 0 3
++	default 0
++	help
++	  Rotate the console on the LCD by this many quarter turns (1 = 90,
++	  2 = 180, 3 = 270 degrees), for panels mounted sideways. Non-zero
++	  values need CONSOLE_ROTATION.
++
+ config VIDEO_LCD_PANEL_I2C
+ 	bool "LCD panel needs to be configured via i2c"
+ 	depends on VIDEO_SUNXI
+@@ -1119,6 +1129,9 @@ config VIDEO_LCD_IF_PARALLEL
+ config VIDEO_LCD_IF_LVDS
+ 	bool
+ 
++config VIDEO_LCD_IF_DSI
++	bool
++
+ config SUNXI_DE2
+ 	bool
+ 
+@@ -1149,6 +1162,15 @@ config VIDEO_LCD_PANEL_LVDS
+ 	bool "Generic lvds interface LCD panel"
+ 	select VIDEO_LCD_IF_LVDS
+ 
++config VIDEO_LCD_PANEL_DSI_ILI9488
++	bool "Ilitek ILI9488 1-lane MIPI-DSI LCD panel"
++	depends on MACH_SUN6I || MACH_SUN8I_A33
++	select VIDEO_LCD_ILITEK_ILI9488_DSI
++	select VIDEO_LCD_IF_DSI
++	help
++	  3.5" 320x480 ILI9488 panel on the SoC's MIPI-DSI output, as used
++	  on the PocketGo S30.
++
+ config VIDEO_LCD_PANEL_MIPI_4_LANE_513_MBPS_VIA_SSD2828
+ 	bool "MIPI 4-lane, 513Mbps LCD panel via SSD2828 bridge chip"
+ 	select VIDEO_LCD_SSD2828
+diff --git a/arch/arm/mach-sunxi/clock_sun6i.c b/arch/arm/mach-sunxi/clock_sun6i.c
+index 657736c7..9fc36e0a 100644
+--- a/arch/arm/mach-sunxi/clock_sun6i.c
++++ b/arch/arm/mach-sunxi/clock_sun6i.c
+@@ -240,7 +240,7 @@ void clock_set_pll5(unsigned int clk, bool sigma_delta_enable)
+ 	udelay(5500);
+ }
+ 
+-#ifdef CONFIG_MACH_SUN6I
++#if defined(CONFIG_MACH_SUN6I) || defined(CONFIG_MACH_SUN8I_A33)
+ void clock_set_mipi_pll(unsigned int clk)
+ {
+ 	struct sunxi_ccm_reg * const ccm =
+diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
+index 15000e21..e3c0dfce 100644
+--- a/drivers/video/Kconfig
++++ b/drivers/video/Kconfig
+@@ -710,6 +710,13 @@ config VIDEO_LCD_HITACHI_TX18D42VM
+ 	  lcd controller which needs to be initialized over SPI, once that is
+ 	  done they work like a regular LVDS panel.
+ 
++config VIDEO_LCD_ILITEK_ILI9488_DSI
++	bool "Ilitek ILI9488 MIPI-DSI LCD panel support"
++	depends on VIDEO_SUNXI
++	help
++	  Support for Ilitek ILI9488 320x480 1-lane MIPI-DSI panels driven by
++	  the Allwinner A31/A33 DSI host, such as the one in the PocketGo S30.
++
+ config VIDEO_LCD_SONY_L4F00430T01
+ 	bool "Sony L4F00430T01 480x800 LCD panel support"
+ 	depends on PANEL
+diff --git a/drivers/video/Makefile b/drivers/video/Makefile
+index 082b8967..cca1bb21 100644
+--- a/drivers/video/Makefile
++++ b/drivers/video/Makefile
+@@ -61,6 +61,7 @@ obj-$(CONFIG_VIDEO_LCD_ENDEAVORU) += endeavoru-panel.o
+ obj-$(CONFIG_VIDEO_LCD_HIMAX_HX8394) += himax-hx8394.o
+ obj-$(CONFIG_VIDEO_LCD_HITACHI_TX10D07VM0BAA) += hitachi-tx10d07vm0baa.o
+ obj-$(CONFIG_VIDEO_LCD_HITACHI_TX18D42VM) += hitachi_tx18d42vm_lcd.o
++obj-$(CONFIG_VIDEO_LCD_ILITEK_ILI9488_DSI) += ilitek_ili9488_dsi_lcd.o
+ obj-$(CONFIG_VIDEO_LCD_ILITEK_ILI9806E) += ilitek-ili9806e.o
+ obj-$(CONFIG_VIDEO_LCD_LG_LD070WX3) += lg-ld070wx3.o
+ obj-$(CONFIG_VIDEO_LCD_LG_LH400WV3) += lg-lh400wv3-sd04.o
+diff --git a/drivers/video/ilitek_ili9488_dsi_lcd.c b/drivers/video/ilitek_ili9488_dsi_lcd.c
+new file mode 100644
+index 00000000..ca3c05d2
+--- /dev/null
++++ b/drivers/video/ilitek_ili9488_dsi_lcd.c
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Ilitek ILI9488 MIPI-DSI LCD panel driver, as used in the PocketGo S30.
++ *
++ * The init sequence is the one of the stock firmware (zkswe Linux 3.4
++ * LCD_panel_init), the same as the Linux panel-ilitek-ili9488-dsi driver.
++ */
++
++#include <stdio.h>
++#include <asm/arch/dsi.h>
++#include <asm/gpio.h>
++#include <linux/delay.h>
++#include <linux/kernel.h>
++#include "ilitek_ili9488_dsi_lcd.h"
++
++struct ili9488_cmd {
++	u8 len;
++	u8 data[16];
++	u16 delay_ms;
++};
++
++static const struct ili9488_cmd ili9488_init_seq[] = {
++	/* Positive / negative gamma control */
++	{ 16, { 0xe0, 0x00, 0x10, 0x14, 0x01, 0x0e, 0x04, 0x33, 0x56,
++		0x48, 0x03, 0x0c, 0x0b, 0x2b, 0x34, 0x0f } },
++	{ 16, { 0xe1, 0x00, 0x12, 0x18, 0x05, 0x12, 0x06, 0x40, 0x34,
++		0x57, 0x06, 0x10, 0x0c, 0x3b, 0x3f, 0x0f } },
++	/* Power control 1/2, VCOM control */
++	{ 3, { 0xc0, 0x0f, 0x0c } },
++	{ 2, { 0xc1, 0x41 } },
++	{ 4, { 0xc5, 0x00, 0x26, 0x80 } },
++	/* MADCTL: column address order mirrored, BGR */
++	{ 2, { 0x36, 0x48 } },
++	/* COLMOD: 18 bpp */
++	{ 2, { 0x3a, 0x66 } },
++	/* Interface mode, frame rate, inversion, display function control */
++	{ 2, { 0xb0, 0x00 } },
++	{ 2, { 0xb1, 0xa0 } },
++	{ 2, { 0xb4, 0x02 } },
++	{ 3, { 0xb6, 0x02, 0x02 } },
++	/* Set image function: 24-bit data bus off */
++	{ 2, { 0xe9, 0x00 } },
++	/* Display inversion on */
++	{ 1, { 0x21 } },
++	/* Adjust control 3 */
++	{ 5, { 0xf7, 0xa9, 0x51, 0x2c, 0x82 } },
++	/* Sleep out, display on */
++	{ 1, { 0x11 }, 120 },
++	{ 1, { 0x29 }, 20 },
++};
++
++void ili9488_dsi_init(int reset_pin)
++{
++	const struct ili9488_cmd *cmd;
++	int i;
++
++	/* Stock firmware: release, 50 ms, assert, 20 ms, release, 100 ms */
++	if (reset_pin >= 0) {
++		gpio_direction_output(reset_pin, 1);
++		mdelay(50);
++		gpio_direction_output(reset_pin, 0);
++		mdelay(20);
++		gpio_direction_output(reset_pin, 1);
++		mdelay(100);
++	}
++
++	for (i = 0; i < ARRAY_SIZE(ili9488_init_seq); i++) {
++		cmd = &ili9488_init_seq[i];
++		if (sun6i_dsi_dcs_write(cmd->data, cmd->len)) {
++			printf("ili9488: DCS command 0x%02x failed\n",
++			       cmd->data[0]);
++			return;
++		}
++		mdelay(cmd->delay_ms);
++	}
++}
+diff --git a/drivers/video/ilitek_ili9488_dsi_lcd.h b/drivers/video/ilitek_ili9488_dsi_lcd.h
+new file mode 100644
+index 00000000..b2b4ebc8
+--- /dev/null
++++ b/drivers/video/ilitek_ili9488_dsi_lcd.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Ilitek ILI9488 MIPI-DSI LCD panel driver
++ */
++
++#define ILI9488_DSI_LANES	1
++
++/* Reset the panel and send its init sequence over the sunxi DSI host */
++void ili9488_dsi_init(int reset_pin);
+diff --git a/drivers/video/sunxi/Makefile b/drivers/video/sunxi/Makefile
+index 43216733..3b47613c 100644
+--- a/drivers/video/sunxi/Makefile
++++ b/drivers/video/sunxi/Makefile
+@@ -4,4 +4,5 @@
+ # Wolfgang Denk, DENX Software Engineering, wd@denx.de.
+ 
+ obj-$(CONFIG_VIDEO_SUNXI) += sunxi_display.o simplefb_common.o lcdc.o tve_common.o ../videomodes.o
++obj-$(CONFIG_VIDEO_LCD_IF_DSI) += sun6i_dsi.o
+ obj-$(CONFIG_VIDEO_DE2) += sunxi_de2.o sunxi_dw_hdmi.o simplefb_common.o lcdc.o sunxi_lcd.o
+diff --git a/drivers/video/sunxi/lcdc.c b/drivers/video/sunxi/lcdc.c
+index 264d775c..ac6c5b42 100644
+--- a/drivers/video/sunxi/lcdc.c
++++ b/drivers/video/sunxi/lcdc.c
+@@ -146,6 +146,69 @@ void lcdc_tcon0_mode_set(struct sunxi_lcdc_reg * const lcdc,
+ 	writel(0, &lcdc->tcon0_io_tristate);
+ }
+ 
++/*
++ * Set up tcon0 to feed the A31/A33 MIPI DSI block. DSI is a special case of
++ * the CPU (8080) interface where the DSI block triggers line transfers. The
++ * pixel format is RGB888 and the dot clock must run at 1/4 of the per-lane
++ * bit rate, so the parent clock must be set to pixelclock * 24 / lanes.
++ * Values follow the Linux sun4i_tcon driver (sun4i_tcon0_mode_set_cpu).
++ */
++void lcdc_tcon0_mode_set_dsi(struct sunxi_lcdc_reg * const lcdc,
++			     const struct display_timing *mode, int lanes)
++{
++	const int bpp = 24, clk_div = 4;
++	int htotal, vtotal, block_space, start_delay;
++
++	htotal = mode->hactive.typ + mode->hfront_porch.typ +
++		 mode->hsync_len.typ + mode->hback_porch.typ;
++	vtotal = mode->vactive.typ + mode->vfront_porch.typ +
++		 mode->vsync_len.typ + mode->vback_porch.typ;
++
++	clrsetbits_le32(&lcdc->ctrl, SUNXI_LCDC_CTRL_IO_MAP_MASK,
++			SUNXI_LCDC_CTRL_IO_MAP_TCON0);
++
++	writel(SUNXI_LCDC_TCON0_CTRL_ENABLE | SUNXI_LCDC_TCON0_CTRL_IF_8080,
++	       &lcdc->tcon0_ctrl);
++
++	writel(SUNXI_LCDC_TCON0_DCLK_ENABLE |
++	       SUNXI_LCDC_TCON0_DCLK_DIV(clk_div), &lcdc->tcon0_dclk);
++
++	writel(SUNXI_LCDC_X(mode->hactive.typ) |
++	       SUNXI_LCDC_Y(mode->vactive.typ), &lcdc->tcon0_timing_active);
++
++	/* No dithering for 24 bpp */
++	writel(0, &lcdc->tcon0_frm_ctrl);
++
++	writel(SUNXI_LCDC_ECC_FIFO_EN, &lcdc->ecc_fifo);
++
++	writel(SUNXI_LCDC_TCON0_CPU_IF_MODE_DSI |
++	       SUNXI_LCDC_TCON0_CPU_IF_TRI_FIFO_FLUSH |
++	       SUNXI_LCDC_TCON0_CPU_IF_TRI_FIFO_EN |
++	       SUNXI_LCDC_TCON0_CPU_IF_TRI_EN, &lcdc->tcon0_cpu_intf);
++
++	/* Should be more than 20 pixel cycles; Linux uses this and it works */
++	block_space = htotal * bpp / (clk_div * lanes) -
++		      (mode->hactive.typ + 40);
++	writel(SUNXI_LCDC_TCON0_CPU_TRI0_BLOCK_SPACE(block_space) |
++	       SUNXI_LCDC_TCON0_CPU_TRI0_BLOCK_SIZE(mode->hactive.typ),
++	       &lcdc->tcon0_cpu_tri0);
++
++	writel(SUNXI_LCDC_TCON0_CPU_TRI1_BLOCK_NUM(mode->vactive.typ),
++	       &lcdc->tcon0_cpu_tri1);
++
++	start_delay = (vtotal - mode->vactive.typ - 10 - 1) * htotal * 149 /
++		      (mode->pixelclock.typ / 1000000) / 8;
++	writel(SUNXI_LCDC_TCON0_CPU_TRI2_TRANS_START(10) |
++	       SUNXI_LCDC_TCON0_CPU_TRI2_START_DELAY(start_delay),
++	       &lcdc->tcon0_cpu_tri2);
++
++	/* The Allwinner BSP hardcodes 3000 */
++	writel(SUNXI_LCDC_SAFE_PERIOD_NUM(3000) |
++	       SUNXI_LCDC_SAFE_PERIOD_MODE(3), &lcdc->safe_period);
++
++	writel(0xe0000000, &lcdc->tcon0_io_tristate);
++}
++
+ void lcdc_tcon1_mode_set(struct sunxi_lcdc_reg * const lcdc,
+ 			 const struct display_timing *mode,
+ 			 bool ext_hvsync, bool is_composite)
+diff --git a/drivers/video/sunxi/sun6i_dsi.c b/drivers/video/sunxi/sun6i_dsi.c
+new file mode 100644
+index 00000000..660a1d36
+--- /dev/null
++++ b/drivers/video/sunxi/sun6i_dsi.c
+@@ -0,0 +1,607 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Allwinner A31/A33 MIPI DSI host and D-PHY, for the sunxi boot console.
++ *
++ * Ported from the Linux sun6i_mipi_dsi and phy-sun6i-mipi-dphy drivers:
++ * Copyright (c) 2016 Allwinnertech Co., Ltd.
++ * Copyright (C) 2017-2018 Bootlin
++ * Maxime Ripard <maxime.ripard@bootlin.com>
++ *
++ * Only non-burst video mode with RGB888 pixels is supported, with DCS
++ * writes sent in low power mode before video starts.
++ */
++
++#include <errno.h>
++#include <fdtdec.h>
++#include <mipi_display.h>
++#include <asm/arch/clock.h>
++#include <asm/arch/dsi.h>
++#include <asm/io.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/iopoll.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++
++#define DSI_REG(off)			((void __iomem *)SUNXI_MIPI_DSI0_BASE + (off))
++#define DPHY_REG(off)			((void __iomem *)SUNXI_MIPI_DPHY0_BASE + (off))
++
++#define DSI_CTL_REG			0x000
++#define DSI_CTL_EN				BIT(0)
++
++#define DSI_BASIC_CTL_REG		0x00c
++
++#define DSI_BASIC_CTL0_REG		0x010
++#define DSI_BASIC_CTL0_CRC_EN			BIT(17)
++#define DSI_BASIC_CTL0_ECC_EN			BIT(16)
++#define DSI_BASIC_CTL0_INST_ST			BIT(0)
++
++#define DSI_BASIC_CTL1_REG		0x014
++#define DSI_BASIC_CTL1_VIDEO_ST_DELAY(n)	(((n) & 0x1fff) << 4)
++#define DSI_BASIC_CTL1_VIDEO_FILL		BIT(2)
++#define DSI_BASIC_CTL1_VIDEO_PRECISION		BIT(1)
++#define DSI_BASIC_CTL1_VIDEO_MODE		BIT(0)
++
++#define DSI_BASIC_SIZE0_REG		0x018
++#define DSI_BASIC_SIZE0_VBP(n)			(((n) & 0xfff) << 16)
++#define DSI_BASIC_SIZE0_VSA(n)			((n) & 0xfff)
++
++#define DSI_BASIC_SIZE1_REG		0x01c
++#define DSI_BASIC_SIZE1_VT(n)			(((n) & 0xfff) << 16)
++#define DSI_BASIC_SIZE1_VACT(n)			((n) & 0xfff)
++
++#define DSI_INST_FUNC_REG(n)		(0x020 + (n) * 0x04)
++#define DSI_INST_FUNC_INST_MODE(n)		(((n) & 0xf) << 28)
++#define DSI_INST_FUNC_ESCAPE_ENTRY(n)		(((n) & 0xf) << 24)
++#define DSI_INST_FUNC_TRANS_PACKET(n)		(((n) & 0xf) << 20)
++#define DSI_INST_FUNC_LANE_CEN			BIT(4)
++#define DSI_INST_FUNC_LANE_DEN(n)		((n) & 0xf)
++
++#define DSI_INST_LOOP_SEL_REG		0x040
++
++#define DSI_INST_LOOP_NUM_REG(n)	(0x044 + (n) * 0x10)
++#define DSI_INST_LOOP_NUM_N1(n)			(((n) & 0xfff) << 16)
++#define DSI_INST_LOOP_NUM_N0(n)			((n) & 0xfff)
++
++#define DSI_INST_JUMP_SEL_REG		0x048
++
++#define DSI_INST_JUMP_CFG_REG(n)	(0x04c + (n) * 0x04)
++#define DSI_INST_JUMP_CFG_TO(n)			(((n) & 0xf) << 20)
++#define DSI_INST_JUMP_CFG_POINT(n)		(((n) & 0xf) << 16)
++#define DSI_INST_JUMP_CFG_NUM(n)		((n) & 0xffff)
++
++#define DSI_TRANS_START_REG		0x060
++#define DSI_TRANS_ZERO_REG		0x078
++
++#define DSI_TCON_DRQ_REG		0x07c
++#define DSI_TCON_DRQ_ENABLE_MODE		BIT(28)
++#define DSI_TCON_DRQ_SET(n)			((n) & 0x3ff)
++
++#define DSI_PIXEL_CTL0_REG		0x080
++#define DSI_PIXEL_CTL0_PD_PLUG_DISABLE		BIT(16)
++#define DSI_PIXEL_CTL0_FORMAT(n)		((n) & 0xf)
++
++#define DSI_PIXEL_PH_REG		0x090
++#define DSI_PIXEL_PF0_REG		0x098
++#define DSI_PIXEL_PF0_CRC_FORCE(n)		((n) & 0xffff)
++#define DSI_PIXEL_PF1_REG		0x09c
++#define DSI_PIXEL_PF1_CRC_INIT_LINEN(n)		(((n) & 0xffff) << 16)
++#define DSI_PIXEL_PF1_CRC_INIT_LINE0(n)		((n) & 0xffff)
++
++#define DSI_SYNC_HSS_REG		0x0b0
++#define DSI_SYNC_HSE_REG		0x0b4
++#define DSI_SYNC_VSS_REG		0x0b8
++#define DSI_SYNC_VSE_REG		0x0bc
++
++#define DSI_BLK_HSA0_REG		0x0c0
++#define DSI_BLK_HSA1_REG		0x0c4
++#define DSI_BLK_HBP0_REG		0x0c8
++#define DSI_BLK_HBP1_REG		0x0cc
++#define DSI_BLK_HFP0_REG		0x0d0
++#define DSI_BLK_HFP1_REG		0x0d4
++#define DSI_BLK_HBLK0_REG		0x0e0
++#define DSI_BLK_HBLK1_REG		0x0e4
++#define DSI_BLK_VBLK0_REG		0x0e8
++#define DSI_BLK_VBLK1_REG		0x0ec
++#define DSI_BLK_PF(n)				(((n) & 0xffff) << 16)
++#define DSI_BLK_PD(n)				((n) & 0xff)
++
++#define DSI_CMD_CTL_REG			0x200
++#define DSI_CMD_CTL_RX_OVERFLOW			BIT(26)
++#define DSI_CMD_CTL_RX_FLAG			BIT(25)
++#define DSI_CMD_CTL_TX_FLAG			BIT(9)
++
++#define DSI_DEBUG_DATA_REG		0x2f8
++
++#define DSI_CMD_TX_REG(n)		(0x300 + (n) * 0x04)
++#define DSI_CMD_TX_WORDS			64
++
++#define DPHY_GCTL_REG			0x00
++#define DPHY_GCTL_LANE_NUM(n)			((((n) - 1) & 3) << 4)
++#define DPHY_GCTL_EN				BIT(0)
++
++#define DPHY_TX_CTL_REG			0x04
++#define DPHY_TX_CTL_HS_TX_CLK_CONT		BIT(28)
++
++#define DPHY_TX_TIME0_REG		0x10
++#define DPHY_TX_TIME0_HS_TRAIL(n)		(((n) & 0xff) << 24)
++#define DPHY_TX_TIME0_HS_PREPARE(n)		(((n) & 0xff) << 16)
++#define DPHY_TX_TIME0_LP_CLK_DIV(n)		((n) & 0xff)
++
++#define DPHY_TX_TIME1_REG		0x14
++#define DPHY_TX_TIME1_CLK_POST(n)		(((n) & 0xff) << 24)
++#define DPHY_TX_TIME1_CLK_PRE(n)		(((n) & 0xff) << 16)
++#define DPHY_TX_TIME1_CLK_ZERO(n)		(((n) & 0xff) << 8)
++#define DPHY_TX_TIME1_CLK_PREPARE(n)		((n) & 0xff)
++
++#define DPHY_TX_TIME2_REG		0x18
++#define DPHY_TX_TIME2_CLK_TRAIL(n)		((n) & 0xff)
++
++#define DPHY_TX_TIME3_REG		0x1c
++
++#define DPHY_TX_TIME4_REG		0x20
++#define DPHY_TX_TIME4_HS_TX_ANA1(n)		(((n) & 0xff) << 8)
++#define DPHY_TX_TIME4_HS_TX_ANA0(n)		((n) & 0xff)
++
++#define DPHY_ANA0_REG			0x4c
++#define DPHY_ANA0_REG_PWS			BIT(31)
++#define DPHY_ANA0_REG_DMPC			BIT(28)
++#define DPHY_ANA0_REG_DMPD(n)			(((n) & 0xf) << 24)
++#define DPHY_ANA0_REG_SLV(n)			(((n) & 7) << 12)
++#define DPHY_ANA0_REG_DEN(n)			(((n) & 0xf) << 8)
++
++#define DPHY_ANA1_REG			0x50
++#define DPHY_ANA1_REG_VTTMODE			BIT(31)
++#define DPHY_ANA1_REG_CSMPS(n)			(((n) & 3) << 28)
++#define DPHY_ANA1_REG_SVTT(n)			(((n) & 0xf) << 24)
++
++#define DPHY_ANA2_REG			0x54
++#define DPHY_ANA2_EN_P2S_CPU(n)			(((n) & 0xf) << 24)
++#define DPHY_ANA2_EN_CK_CPU			BIT(4)
++#define DPHY_ANA2_REG_ENIB			BIT(1)
++
++#define DPHY_ANA3_REG			0x58
++#define DPHY_ANA3_EN_VTTD(n)			(((n) & 0xf) << 28)
++#define DPHY_ANA3_EN_VTTC			BIT(27)
++#define DPHY_ANA3_EN_DIV			BIT(26)
++#define DPHY_ANA3_EN_LDOC			BIT(25)
++#define DPHY_ANA3_EN_LDOD			BIT(24)
++#define DPHY_ANA3_EN_LDOR			BIT(18)
++
++#define DPHY_ANA4_REG			0x5c
++#define DPHY_ANA4_REG_DMPLVC			BIT(24)
++#define DPHY_ANA4_REG_DMPLVD(n)			(((n) & 0xf) << 20)
++#define DPHY_ANA4_REG_CKDV(n)			(((n) & 0x1f) << 12)
++#define DPHY_ANA4_REG_TMSC(n)			(((n) & 3) << 10)
++#define DPHY_ANA4_REG_TMSD(n)			(((n) & 3) << 8)
++#define DPHY_ANA4_REG_TXDNSC(n)			(((n) & 3) << 6)
++#define DPHY_ANA4_REG_TXDNSD(n)			(((n) & 3) << 4)
++#define DPHY_ANA4_REG_TXPUSC(n)			(((n) & 3) << 2)
++#define DPHY_ANA4_REG_TXPUSD(n)			((n) & 3)
++
++/* Bytes per RGB888 pixel */
++#define DSI_BPP				3
++
++enum dsi_start_inst {
++	DSI_START_LPTX,
++	DSI_START_HSC,
++	DSI_START_HSD,
++};
++
++enum dsi_inst_id {
++	DSI_INST_ID_LP11	= 0,
++	DSI_INST_ID_TBA,
++	DSI_INST_ID_HSC,
++	DSI_INST_ID_HSD,
++	DSI_INST_ID_LPDT,
++	DSI_INST_ID_HSCEXIT,
++	DSI_INST_ID_NOP,
++	DSI_INST_ID_DLY,
++	DSI_INST_ID_END		= 15,
++};
++
++enum dsi_inst_mode {
++	DSI_INST_MODE_STOP	= 0,
++	DSI_INST_MODE_TBA,
++	DSI_INST_MODE_HS,
++	DSI_INST_MODE_ESCAPE,
++	DSI_INST_MODE_HSCEXIT,
++	DSI_INST_MODE_NOP,
++};
++
++#define DSI_INST_ESCA_LPDT		0
++#define DSI_INST_PACK_PIXEL		0
++#define DSI_INST_PACK_COMMAND		1
++
++static const u32 dsi_ecc_array[] = {
++	[0] = (BIT(0) | BIT(1) | BIT(2) | BIT(4) | BIT(5) | BIT(7) | BIT(10) |
++	       BIT(11) | BIT(13) | BIT(16) | BIT(20) | BIT(21) | BIT(22) |
++	       BIT(23)),
++	[1] = (BIT(0) | BIT(1) | BIT(3) | BIT(4) | BIT(6) | BIT(8) | BIT(10) |
++	       BIT(12) | BIT(14) | BIT(17) | BIT(20) | BIT(21) | BIT(22) |
++	       BIT(23)),
++	[2] = (BIT(0) | BIT(2) | BIT(3) | BIT(5) | BIT(6) | BIT(9) | BIT(11) |
++	       BIT(12) | BIT(15) | BIT(18) | BIT(20) | BIT(21) | BIT(22)),
++	[3] = (BIT(1) | BIT(2) | BIT(3) | BIT(7) | BIT(8) | BIT(9) | BIT(13) |
++	       BIT(14) | BIT(15) | BIT(19) | BIT(20) | BIT(21) | BIT(23)),
++	[4] = (BIT(4) | BIT(5) | BIT(6) | BIT(7) | BIT(8) | BIT(9) | BIT(16) |
++	       BIT(17) | BIT(18) | BIT(19) | BIT(20) | BIT(22) | BIT(23)),
++	[5] = (BIT(10) | BIT(11) | BIT(12) | BIT(13) | BIT(14) | BIT(15) |
++	       BIT(16) | BIT(17) | BIT(18) | BIT(19) | BIT(21) | BIT(22) |
++	       BIT(23)),
++};
++
++static void dsi_write(u32 val, unsigned int reg)
++{
++	writel(val, DSI_REG(reg));
++}
++
++static void dphy_write(u32 val, unsigned int reg)
++{
++	writel(val, DPHY_REG(reg));
++}
++
++/* ECC over the 24 bit packet header */
++static u8 dsi_ecc_compute(u32 data)
++{
++	u8 ecc = 0;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(dsi_ecc_array); i++)
++		ecc |= (hweight32(data & dsi_ecc_array[i]) & 1) << i;
++
++	return ecc;
++}
++
++/* CRC-16-CCITT, LSB first, as used for DSI packet footers */
++static u16 dsi_crc_byte(u16 crc, u8 byte)
++{
++	int i;
++
++	crc ^= byte;
++	for (i = 0; i < 8; i++)
++		crc = (crc >> 1) ^ ((crc & 1) ? 0x8408 : 0);
++
++	return crc;
++}
++
++static u16 dsi_crc_compute(const u8 *buf, size_t len)
++{
++	u16 crc = 0xffff;
++
++	while (len--)
++		crc = dsi_crc_byte(crc, *buf++);
++
++	return crc;
++}
++
++static u32 dsi_build_pkt_hdr(u8 dt, u8 vc, u8 d0, u8 d1)
++{
++	u32 val = (dt & 0x3f) | (vc & 3) << 6 | d0 << 8 | d1 << 16;
++
++	return val | dsi_ecc_compute(val) << 24;
++}
++
++static u32 dsi_build_blk0_pkt(u16 wc)
++{
++	return dsi_build_pkt_hdr(MIPI_DSI_BLANKING_PACKET, 0,
++				 wc & 0xff, wc >> 8);
++}
++
++/* Footer of a blanking packet whose wc byte payload is all zeroes */
++static u32 dsi_build_blk1_pkt(u16 wc)
++{
++	u16 crc = 0xffff;
++
++	while (wc--)
++		crc = dsi_crc_byte(crc, 0);
++
++	return DSI_BLK_PD(0) | DSI_BLK_PF(crc);
++}
++
++static void dsi_inst_abort(void)
++{
++	clrbits_le32(DSI_REG(DSI_BASIC_CTL0_REG), DSI_BASIC_CTL0_INST_ST);
++}
++
++static void dsi_inst_commit(void)
++{
++	setbits_le32(DSI_REG(DSI_BASIC_CTL0_REG), DSI_BASIC_CTL0_INST_ST);
++}
++
++static int dsi_inst_wait_for_completion(void)
++{
++	u32 val;
++
++	return readl_poll_timeout(DSI_REG(DSI_BASIC_CTL0_REG), val,
++				  !(val & DSI_BASIC_CTL0_INST_ST), 5000);
++}
++
++static void dsi_inst_setup(enum dsi_inst_id id, enum dsi_inst_mode mode,
++			   bool clock, u8 data, u8 packet, u8 escape)
++{
++	dsi_write(DSI_INST_FUNC_INST_MODE(mode) |
++		  DSI_INST_FUNC_ESCAPE_ENTRY(escape) |
++		  DSI_INST_FUNC_TRANS_PACKET(packet) |
++		  (clock ? DSI_INST_FUNC_LANE_CEN : 0) |
++		  DSI_INST_FUNC_LANE_DEN(data),
++		  DSI_INST_FUNC_REG(id));
++}
++
++static void dsi_inst_init(int lanes)
++{
++	u8 lanes_mask = GENMASK(lanes - 1, 0);
++
++	dsi_inst_setup(DSI_INST_ID_LP11, DSI_INST_MODE_STOP,
++		       true, lanes_mask, 0, 0);
++	dsi_inst_setup(DSI_INST_ID_TBA, DSI_INST_MODE_TBA,
++		       false, 1, 0, 0);
++	dsi_inst_setup(DSI_INST_ID_HSC, DSI_INST_MODE_HS,
++		       true, 0, DSI_INST_PACK_PIXEL, 0);
++	dsi_inst_setup(DSI_INST_ID_HSD, DSI_INST_MODE_HS,
++		       false, lanes_mask, DSI_INST_PACK_PIXEL, 0);
++	dsi_inst_setup(DSI_INST_ID_LPDT, DSI_INST_MODE_ESCAPE,
++		       false, 1, DSI_INST_PACK_COMMAND, DSI_INST_ESCA_LPDT);
++	dsi_inst_setup(DSI_INST_ID_HSCEXIT, DSI_INST_MODE_HSCEXIT,
++		       true, 0, 0, 0);
++	dsi_inst_setup(DSI_INST_ID_NOP, DSI_INST_MODE_STOP,
++		       false, lanes_mask, 0, 0);
++	dsi_inst_setup(DSI_INST_ID_DLY, DSI_INST_MODE_NOP,
++		       true, lanes_mask, 0, 0);
++
++	dsi_write(DSI_INST_JUMP_CFG_POINT(DSI_INST_ID_NOP) |
++		  DSI_INST_JUMP_CFG_TO(DSI_INST_ID_HSCEXIT) |
++		  DSI_INST_JUMP_CFG_NUM(1),
++		  DSI_INST_JUMP_CFG_REG(0));
++}
++
++static void dsi_start(enum dsi_start_inst func)
++{
++	switch (func) {
++	case DSI_START_LPTX:
++		dsi_write(DSI_INST_ID_LPDT << (4 * DSI_INST_ID_LP11) |
++			  DSI_INST_ID_END  << (4 * DSI_INST_ID_LPDT),
++			  DSI_INST_JUMP_SEL_REG);
++		break;
++	case DSI_START_HSC:
++		dsi_write(DSI_INST_ID_HSC  << (4 * DSI_INST_ID_LP11) |
++			  DSI_INST_ID_END  << (4 * DSI_INST_ID_HSC),
++			  DSI_INST_JUMP_SEL_REG);
++		break;
++	case DSI_START_HSD:
++		dsi_write(DSI_INST_ID_NOP  << (4 * DSI_INST_ID_LP11) |
++			  DSI_INST_ID_HSD  << (4 * DSI_INST_ID_NOP) |
++			  DSI_INST_ID_DLY  << (4 * DSI_INST_ID_HSD) |
++			  DSI_INST_ID_NOP  << (4 * DSI_INST_ID_DLY) |
++			  DSI_INST_ID_END  << (4 * DSI_INST_ID_HSCEXIT),
++			  DSI_INST_JUMP_SEL_REG);
++		break;
++	}
++
++	dsi_inst_abort();
++	dsi_inst_commit();
++
++	if (func == DSI_START_HSC)
++		clrbits_le32(DSI_REG(DSI_INST_FUNC_REG(DSI_INST_ID_LP11)),
++			     DSI_INST_FUNC_LANE_CEN);
++}
++
++static void dsi_setup_video(const struct display_timing *mode)
++{
++	int hfp = mode->hfront_porch.typ, hsync = mode->hsync_len.typ;
++	int hbp = mode->hback_porch.typ, hactive = mode->hactive.typ;
++	int vfp = mode->vfront_porch.typ, vsync = mode->vsync_len.typ;
++	int vbp = mode->vback_porch.typ, vactive = mode->vactive.typ;
++	int htotal = hactive + hfp + hsync + hbp;
++	int vtotal = vactive + vfp + vsync + vbp;
++	u16 delay, hsa, hbp_wc, hfp_wc, hblk;
++	u32 val;
++
++	/* Line at which video starts, counted from the start of vsync */
++	delay = vtotal - vfp + 1;
++	if (delay > vtotal)
++		delay %= vtotal;
++	dsi_write(DSI_BASIC_CTL1_VIDEO_ST_DELAY(max_t(u16, delay, 1)) |
++		  DSI_BASIC_CTL1_VIDEO_FILL |
++		  DSI_BASIC_CTL1_VIDEO_PRECISION |
++		  DSI_BASIC_CTL1_VIDEO_MODE, DSI_BASIC_CTL1_REG);
++
++	/* Non-burst mode: request pixels from tcon when the front porch ends */
++	val = 0;
++	if (hfp > 20)
++		val = DSI_TCON_DRQ_ENABLE_MODE |
++		      DSI_TCON_DRQ_SET((hfp - 20) * DSI_BPP * 8 / 32);
++	dsi_write(val, DSI_TCON_DRQ_REG);
++
++	dsi_write(2 << (4 * DSI_INST_ID_LP11) | 3 << (4 * DSI_INST_ID_DLY),
++		  DSI_INST_LOOP_SEL_REG);
++	dsi_write(DSI_INST_LOOP_NUM_N0(50 - 1) | DSI_INST_LOOP_NUM_N1(50 - 1),
++		  DSI_INST_LOOP_NUM_REG(0));
++	dsi_write(DSI_INST_LOOP_NUM_N0(50 - 1) | DSI_INST_LOOP_NUM_N1(50 - 1),
++		  DSI_INST_LOOP_NUM_REG(1));
++
++	/* RGB888 packed pixel stream, format 8 */
++	val = dsi_build_pkt_hdr(MIPI_DSI_PACKED_PIXEL_STREAM_24, 0,
++				(hactive * DSI_BPP) & 0xff,
++				(hactive * DSI_BPP) >> 8);
++	dsi_write(val, DSI_PIXEL_PH_REG);
++	dsi_write(DSI_PIXEL_PF0_CRC_FORCE(0xffff), DSI_PIXEL_PF0_REG);
++	dsi_write(DSI_PIXEL_PF1_CRC_INIT_LINE0(0xffff) |
++		  DSI_PIXEL_PF1_CRC_INIT_LINEN(0xffff), DSI_PIXEL_PF1_REG);
++	dsi_write(DSI_PIXEL_CTL0_PD_PLUG_DISABLE | DSI_PIXEL_CTL0_FORMAT(8),
++		  DSI_PIXEL_CTL0_REG);
++
++	/*
++	 * Horizontal blanking payload sizes in bytes, minus the packet
++	 * overheads: sync 10 (blanking + sync event), back porch 6 (blanking),
++	 * front porch 16 (sync event + 2 blanking), line blanking 10.
++	 */
++	hsa = max(10, hsync * DSI_BPP - 10);
++	hbp_wc = max(6, hbp * DSI_BPP - 6);
++	hfp_wc = max(16, hfp * DSI_BPP - 16);
++	hblk = max(10, (htotal - hsync) * DSI_BPP - 10);
++
++	dsi_write(0, DSI_BASIC_CTL_REG);
++	dsi_write(dsi_build_pkt_hdr(MIPI_DSI_H_SYNC_START, 0, 0, 0),
++		  DSI_SYNC_HSS_REG);
++	dsi_write(dsi_build_pkt_hdr(MIPI_DSI_H_SYNC_END, 0, 0, 0),
++		  DSI_SYNC_HSE_REG);
++	dsi_write(dsi_build_pkt_hdr(MIPI_DSI_V_SYNC_START, 0, 0, 0),
++		  DSI_SYNC_VSS_REG);
++	dsi_write(dsi_build_pkt_hdr(MIPI_DSI_V_SYNC_END, 0, 0, 0),
++		  DSI_SYNC_VSE_REG);
++
++	dsi_write(DSI_BASIC_SIZE0_VSA(vsync) | DSI_BASIC_SIZE0_VBP(vbp),
++		  DSI_BASIC_SIZE0_REG);
++	dsi_write(DSI_BASIC_SIZE1_VACT(vactive) | DSI_BASIC_SIZE1_VT(vtotal),
++		  DSI_BASIC_SIZE1_REG);
++
++	dsi_write(dsi_build_blk0_pkt(hsa), DSI_BLK_HSA0_REG);
++	dsi_write(dsi_build_blk1_pkt(hsa), DSI_BLK_HSA1_REG);
++	dsi_write(dsi_build_blk0_pkt(hbp_wc), DSI_BLK_HBP0_REG);
++	dsi_write(dsi_build_blk1_pkt(hbp_wc), DSI_BLK_HBP1_REG);
++	dsi_write(dsi_build_blk0_pkt(hfp_wc), DSI_BLK_HFP0_REG);
++	dsi_write(dsi_build_blk1_pkt(hfp_wc), DSI_BLK_HFP1_REG);
++	dsi_write(dsi_build_blk0_pkt(hblk), DSI_BLK_HBLK0_REG);
++	dsi_write(dsi_build_blk1_pkt(hblk), DSI_BLK_HBLK1_REG);
++	dsi_write(dsi_build_blk0_pkt(0), DSI_BLK_VBLK0_REG);
++	dsi_write(dsi_build_blk1_pkt(0), DSI_BLK_VBLK1_REG);
++}
++
++static void dphy_tx_power_on(int lanes)
++{
++	u8 lanes_mask = GENMASK(lanes - 1, 0);
++
++	dphy_write(DPHY_TX_CTL_HS_TX_CLK_CONT, DPHY_TX_CTL_REG);
++	dphy_write(DPHY_TX_TIME0_LP_CLK_DIV(14) |
++		   DPHY_TX_TIME0_HS_PREPARE(6) |
++		   DPHY_TX_TIME0_HS_TRAIL(10), DPHY_TX_TIME0_REG);
++	dphy_write(DPHY_TX_TIME1_CLK_PREPARE(7) |
++		   DPHY_TX_TIME1_CLK_ZERO(50) |
++		   DPHY_TX_TIME1_CLK_PRE(3) |
++		   DPHY_TX_TIME1_CLK_POST(10), DPHY_TX_TIME1_REG);
++	dphy_write(DPHY_TX_TIME2_CLK_TRAIL(30), DPHY_TX_TIME2_REG);
++	dphy_write(0, DPHY_TX_TIME3_REG);
++	dphy_write(DPHY_TX_TIME4_HS_TX_ANA0(3) | DPHY_TX_TIME4_HS_TX_ANA1(3),
++		   DPHY_TX_TIME4_REG);
++
++	dphy_write(DPHY_ANA0_REG_PWS | DPHY_ANA0_REG_DMPC |
++		   DPHY_ANA0_REG_SLV(7) | DPHY_ANA0_REG_DMPD(lanes_mask) |
++		   DPHY_ANA0_REG_DEN(lanes_mask), DPHY_ANA0_REG);
++	dphy_write(DPHY_ANA1_REG_CSMPS(1) | DPHY_ANA1_REG_SVTT(7),
++		   DPHY_ANA1_REG);
++	dphy_write(DPHY_ANA4_REG_CKDV(1) | DPHY_ANA4_REG_TMSC(1) |
++		   DPHY_ANA4_REG_TMSD(1) | DPHY_ANA4_REG_TXDNSC(1) |
++		   DPHY_ANA4_REG_TXDNSD(1) | DPHY_ANA4_REG_TXPUSC(1) |
++		   DPHY_ANA4_REG_TXPUSD(1) | DPHY_ANA4_REG_DMPLVC |
++		   DPHY_ANA4_REG_DMPLVD(lanes_mask), DPHY_ANA4_REG);
++	dphy_write(DPHY_ANA2_REG_ENIB, DPHY_ANA2_REG);
++	udelay(5);
++	dphy_write(DPHY_ANA3_EN_LDOR | DPHY_ANA3_EN_LDOC | DPHY_ANA3_EN_LDOD,
++		   DPHY_ANA3_REG);
++	udelay(1);
++
++	setbits_le32(DPHY_REG(DPHY_ANA3_REG),
++		     DPHY_ANA3_EN_VTTC | DPHY_ANA3_EN_VTTD(lanes_mask));
++	udelay(1);
++	setbits_le32(DPHY_REG(DPHY_ANA3_REG), DPHY_ANA3_EN_DIV);
++	udelay(1);
++	setbits_le32(DPHY_REG(DPHY_ANA2_REG), DPHY_ANA2_EN_CK_CPU);
++	udelay(1);
++	setbits_le32(DPHY_REG(DPHY_ANA1_REG), DPHY_ANA1_REG_VTTMODE);
++	setbits_le32(DPHY_REG(DPHY_ANA2_REG), DPHY_ANA2_EN_P2S_CPU(lanes_mask));
++
++	dphy_write(DPHY_GCTL_LANE_NUM(lanes) | DPHY_GCTL_EN, DPHY_GCTL_REG);
++}
++
++void sun6i_dsi_init(const struct display_timing *mode, int lanes)
++{
++	struct sunxi_ccm_reg * const ccm =
++		(struct sunxi_ccm_reg *)SUNXI_CCM_BASE;
++
++	/* DSI module clock 297 MHz from PLL3, D-PHY 150 MHz from PLL6 */
++	writel(CCM_MIPI_DSI_CTRL_SCLK_GATE | CCM_MIPI_DSI_CTRL_SCLK_PLL3 |
++	       CCM_MIPI_DSI_CTRL_SCLK_M(1) | CCM_MIPI_DSI_CTRL_DPHY_GATE |
++	       CCM_MIPI_DSI_CTRL_DPHY_PLL6 | CCM_MIPI_DSI_CTRL_DPHY_M(4),
++	       &ccm->mipi_dsi_clk_cfg);
++	setbits_le32(&ccm->ahb_gate0, 1 << AHB_GATE_OFFSET_MIPI_DSI);
++	setbits_le32(&ccm->ahb_reset0_cfg, 1 << AHB_RESET_OFFSET_MIPI_DSI);
++
++	dsi_write(DSI_CTL_EN, DSI_CTL_REG);
++	dsi_write(DSI_BASIC_CTL0_ECC_EN | DSI_BASIC_CTL0_CRC_EN,
++		  DSI_BASIC_CTL0_REG);
++	dsi_write(10, DSI_TRANS_START_REG);
++	dsi_write(0, DSI_TRANS_ZERO_REG);
++
++	dsi_inst_init(lanes);
++	dsi_write(0xff, DSI_DEBUG_DATA_REG);
++	dsi_setup_video(mode);
++
++	dphy_tx_power_on(lanes);
++}
++
++int sun6i_dsi_dcs_write(const u8 *data, size_t len)
++{
++	u32 buf[DSI_CMD_TX_WORDS - 1] = { 0 };
++	u16 crc;
++	int i, ret;
++
++	if (!len || len + sizeof(crc) > sizeof(buf))
++		return -EINVAL;
++
++	ret = dsi_inst_wait_for_completion();
++	if (ret)
++		dsi_inst_abort();
++
++	dsi_write(DSI_CMD_CTL_RX_OVERFLOW | DSI_CMD_CTL_RX_FLAG |
++		  DSI_CMD_CTL_TX_FLAG, DSI_CMD_CTL_REG);
++
++	if (len <= 2) {
++		dsi_write(dsi_build_pkt_hdr(len == 1 ?
++					    MIPI_DSI_DCS_SHORT_WRITE :
++					    MIPI_DSI_DCS_SHORT_WRITE_PARAM,
++					    0, data[0], len == 2 ? data[1] : 0),
++			  DSI_CMD_TX_REG(0));
++		clrsetbits_le32(DSI_REG(DSI_CMD_CTL_REG), 0xff, 4 - 1);
++	} else {
++		dsi_write(dsi_build_pkt_hdr(MIPI_DSI_DCS_LONG_WRITE, 0,
++					    len & 0xff, len >> 8),
++			  DSI_CMD_TX_REG(0));
++
++		/* Payload followed by its CRC, little endian */
++		memcpy(buf, data, len);
++		crc = dsi_crc_compute(data, len);
++		((u8 *)buf)[len] = crc & 0xff;
++		((u8 *)buf)[len + 1] = crc >> 8;
++		len += sizeof(crc);
++
++		for (i = 0; i < DIV_ROUND_UP(len, 4); i++)
++			dsi_write(buf[i], DSI_CMD_TX_REG(1 + i));
++		dsi_write(len + 4 - 1, DSI_CMD_CTL_REG);
++	}
++
++	dsi_start(DSI_START_LPTX);
++
++	ret = dsi_inst_wait_for_completion();
++	if (ret)
++		dsi_inst_abort();
++
++	return ret;
++}
++
++void sun6i_dsi_disable(void)
++{
++	struct sunxi_ccm_reg * const ccm =
++		(struct sunxi_ccm_reg *)SUNXI_CCM_BASE;
++
++	/* Reset covers both the DSI block and the D-PHY */
++	clrbits_le32(&ccm->ahb_reset0_cfg, 1 << AHB_RESET_OFFSET_MIPI_DSI);
++	clrbits_le32(&ccm->ahb_gate0, 1 << AHB_GATE_OFFSET_MIPI_DSI);
++}
++
++void sun6i_dsi_start_video(void)
++{
++	dsi_start(DSI_START_HSC);
++	udelay(1000);
++	dsi_start(DSI_START_HSD);
++}
+diff --git a/drivers/video/sunxi/sunxi_display.c b/drivers/video/sunxi/sunxi_display.c
+index fa492c66..f6a2e741 100644
+--- a/drivers/video/sunxi/sunxi_display.c
++++ b/drivers/video/sunxi/sunxi_display.c
+@@ -17,6 +17,7 @@
+ 
+ #include <asm/arch/clock.h>
+ #include <asm/arch/display.h>
++#include <asm/arch/dsi.h>
+ #include <asm/arch/lcdc.h>
+ #include <asm/arch/pwm.h>
+ #include <asm/arch/tve.h>
+@@ -35,6 +36,7 @@
+ #include "../videomodes.h"
+ #include "../anx9804.h"
+ #include "../hitachi_tx18d42vm_lcd.h"
++#include "../ilitek_ili9488_dsi_lcd.h"
+ #include "../ssd2828.h"
+ #include "simplefb_common.h"
+ 
+@@ -636,6 +638,24 @@ static void sunxi_lcdc_tcon0_mode_set(struct sunxi_display_priv *sunxi_display,
+ 	int clk_div, clk_double, pin;
+ 	struct display_timing timing;
+ 
++#ifdef CONFIG_VIDEO_LCD_IF_DSI
++	/*
++	 * The DSI pins are dedicated, so no pinmux. tcon0 must run from the
++	 * MIPI PLL, which also clocks the D-PHY high speed lanes (with PLL3
++	 * as tcon0 parent, LP writes work but HS never starts). Like the stock
++	 * firmware: PLL3 297 MHz (also the DSI module clock), MIPI PLL = PLL3,
++	 * fixed tcon0 divider of 4, so the panel gets 297 / 4 * 4 * lanes / 24
++	 * MHz pixel clock, 12.375 MHz for 1 lane.
++	 */
++	clock_set_pll3(297000000);
++	clock_set_mipi_pll(297000000);
++	writel(CCM_LCD_CH0_CTRL_GATE | CCM_LCD_CH0_CTRL_MIPI_PLL,
++	       &ccm->lcd0_ch0_clk_cfg);
++	video_ctfb_mode_to_display_timing(mode, &timing);
++	lcdc_tcon0_mode_set_dsi(lcdc, &timing, ILI9488_DSI_LANES);
++	return;
++#endif
++
+ #if defined CONFIG_MACH_SUN8I && defined CONFIG_VIDEO_LCD_IF_LVDS
+ 	for (pin = SUNXI_GPD(18); pin <= SUNXI_GPD(27); pin++) {
+ #else
+@@ -848,8 +868,10 @@ static void sunxi_drc_init(void)
+ 	/* On sun6i the drc must be clocked even when in pass-through mode */
+ #ifdef CONFIG_MACH_SUN8I_A33
+ 	setbits_le32(&ccm->ahb_reset1_cfg, 1 << AHB_RESET_OFFSET_SAT);
++	setbits_le32(&ccm->ahb_gate1, 1 << AHB_GATE_OFFSET_SAT);
+ #endif
+ 	setbits_le32(&ccm->ahb_reset1_cfg, 1 << AHB_RESET_OFFSET_DRC0);
++	setbits_le32(&ccm->ahb_gate1, 1 << AHB_GATE_OFFSET_DRC0);
+ 	clock_set_de_mod_clock(&ccm->iep_drc0_clk_cfg, 300000000);
+ #endif
+ }
+@@ -901,6 +923,18 @@ static int sunxi_ssd2828_init(const struct ctfb_res_modes *mode)
+ }
+ #endif /* CONFIG_VIDEO_LCD_SSD2828 */
+ 
++#ifdef CONFIG_VIDEO_LCD_IF_DSI
++static void sunxi_dsi_panel_init(const struct ctfb_res_modes *mode)
++{
++	struct display_timing timing;
++
++	video_ctfb_mode_to_display_timing(mode, &timing);
++	sun6i_dsi_init(&timing, ILI9488_DSI_LANES);
++	ili9488_dsi_init(sunxi_name_to_gpio(CONFIG_VIDEO_LCD_RESET));
++	sun6i_dsi_start_video();
++}
++#endif /* CONFIG_VIDEO_LCD_IF_DSI */
++
+ #ifdef CONFIG_VIDEO_LCD_PANEL_I2C
+ static void sunxi_panel_i2c_init(struct sunxi_display_priv *sunxi_display)
+ {
+@@ -983,6 +1017,9 @@ static void sunxi_mode_set(struct sunxi_display_priv *sunxi_display,
+ 		lcdc_enable(lcdc, sunxi_display->depth);
+ #ifdef CONFIG_VIDEO_LCD_SSD2828
+ 		sunxi_ssd2828_init(mode);
++#endif
++#ifdef CONFIG_VIDEO_LCD_IF_DSI
++		sunxi_dsi_panel_init(mode);
+ #endif
+ 		sunxi_lcdc_backlight_enable();
+ 		break;
+@@ -1236,12 +1273,24 @@ static int sunxi_de_probe(struct udevice *dev)
+ 	uc_priv->bpix = VIDEO_BPP32;
+ 	uc_priv->xsize = mode->xres;
+ 	uc_priv->ysize = mode->yres;
++	if (sunxi_display->monitor == sunxi_monitor_lcd)
++		uc_priv->rot = CONFIG_VIDEO_LCD_ROTATION;
+ 
+ 	video_set_flush_dcache(dev, true);
+ 
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_VIDEO_LCD_IF_DSI
++/* Called before booting the OS (DM_FLAG_OS_PREPARE) */
++static int sunxi_de_remove(struct udevice *dev)
++{
++	sun6i_dsi_disable();
++
++	return 0;
++}
++#endif
++
+ static int sunxi_de_bind(struct udevice *dev)
+ {
+ 	struct video_uc_plat *plat = dev_get_uclass_plat(dev);
+@@ -1260,8 +1309,13 @@ U_BOOT_DRIVER(sunxi_de) = {
+ 	.ops	= &sunxi_de_ops,
+ 	.bind	= sunxi_de_bind,
+ 	.probe	= sunxi_de_probe,
+-	.priv_auto = sizeof(struct sunxi_display_priv),
++#ifdef CONFIG_VIDEO_LCD_IF_DSI
++	.remove	= sunxi_de_remove,
++	.flags	= DM_FLAG_PRE_RELOC | DM_FLAG_OS_PREPARE,
++#else
+ 	.flags	= DM_FLAG_PRE_RELOC,
++#endif
++	.priv_auto = sizeof(struct sunxi_display_priv),
+ };
+ 
+ U_BOOT_DRVINFO(sunxi_de) = {

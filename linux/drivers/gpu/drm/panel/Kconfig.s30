@@ -1,0 +1,9 @@
+config DRM_PANEL_ILITEK_ILI9488_DSI
+	tristate "Ilitek ILI9488 MIPI-DSI panel"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  Say Y here to support the Ilitek ILI9488 320x480 MIPI-DSI panel
+	  used in the PocketGo S30.
+

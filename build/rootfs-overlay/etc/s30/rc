@@ -1,0 +1,97 @@
+#!/bin/sh
+# System setup, run once by init (sysinit) before the frontend and shells.
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+hostname pocketgo-s30
+# Boot splash: the U-Boot image with a progress bar
+s30-splash 5
+. /etc/profile.d/s30.sh
+mkdir -p -m 0700 "$XDG_RUNTIME_DIR"
+mkdir -p "$HOME/roms"
+
+# udevd: device properties (ID_INPUT_JOYSTICK etc.) for RetroArch's udev
+# input/joypad drivers
+udevd --daemon
+udevadm trigger --action=add
+udevadm settle --timeout=5
+s30-splash 40
+
+# Audio: stock-like levels. The codec driver follows the headphone jack
+# (speaker mono/differential without headphones, off with them); the volume
+# (Headphone Playback Volume) is s30-volumed's, from the volume keys.
+(
+	m() { tinymix -D 0 set "$@" >/dev/null 2>&1; }
+	until tinymix -D 0 get "AIF1 Slot 0 Digital DAC Playback Switch" >/dev/null 2>&1; do
+		sleep 1
+	done
+	m "AIF1 DA0 Playback Volume" 160 160
+	m "DAC Playback Volume" 160 160
+	m "AIF1 Slot 0 Digital DAC Playback Switch" 1 1
+) &
+
+# USB gadget: serial shell (ACM, host /dev/ttyACM*) plus NCM networking
+# (device 10.42.0.2, see /etc/udhcpd.conf). Fixed MACs so the host sees the
+# same interface every boot.
+G=/sys/kernel/config/usb_gadget/s30
+mount -t configfs configfs /sys/kernel/config
+mkdir -p $G/strings/0x409 $G/configs/c.1/strings/0x409 \
+	$G/functions/acm.usb0 $G/functions/ncm.usb0
+echo 0x1d6b > $G/idVendor	# Linux Foundation
+echo 0x0104 > $G/idProduct	# Multifunction Composite Gadget
+echo PocketGo > $G/strings/0x409/manufacturer
+echo "PocketGo S30" > $G/strings/0x409/product
+echo s30 > $G/strings/0x409/serialnumber
+echo "ACM + NCM" > $G/configs/c.1/strings/0x409/configuration
+echo 02:53:33:30:00:02 > $G/functions/ncm.usb0/dev_addr
+echo 02:53:33:30:00:01 > $G/functions/ncm.usb0/host_addr
+ln -s $G/functions/acm.usb0 $G/functions/ncm.usb0 $G/configs/c.1/
+ls /sys/class/udc > $G/UDC
+ifconfig lo 127.0.0.1 up
+ifconfig usb0 10.42.0.2 netmask 255.255.255.0 up
+touch /tmp/udhcpd.leases
+busybox-extras udhcpd /etc/udhcpd.conf
+s30-splash 60
+
+# ssh (root, keys baked in by build.sh initramfs). Host key kept on the SD
+# card so it stays the same across boots.
+hostkey=$HOME/.dropbear/ed25519_host_key
+if [ ! -f "$hostkey" ]; then
+	mkdir -p "${hostkey%/*}"
+	dropbearkey -t ed25519 -f "$hostkey" >/dev/null
+fi
+dropbear -r "$hostkey"
+s30-splash 75
+
+# RetroArch uses ~/.config/retroarch/retroarch.cfg; /etc/retroarch.cfg only
+# seeds it
+cfg=$HOME/.config/retroarch/retroarch.cfg
+if [ ! -f "$cfg" ]; then
+	mkdir -p "${cfg%/*}"
+	cp /etc/retroarch.cfg "$cfg"
+fi
+
+# Launcher apps: /mnt/sd/apps holds launch scripts (edit or add your own);
+# missing defaults are copied from /usr/share/s30/apps
+mkdir -p /mnt/sd/apps
+for app in /usr/share/s30/apps/*.sh; do
+	[ -e "/mnt/sd/apps/${app##*/}" ] || cp "$app" /mnt/sd/apps/
+done
+
+# Joystick calibration (saved by s30-joycal), applied by the gamepad driver
+if [ -f "$HOME/.config/joystick.cal" ]; then
+	for f in /sys/bus/i2c/drivers/pocketgo-s30-gamepad/*/calibration; do
+		cat "$HOME/.config/joystick.cal" > "$f"
+	done
+fi
+
+s30-splash 100
+# Then black: fbcon shows /dev/fb0 again whenever an app (KMS) exits, so the
+# splash would come back between apps. dd stops at the end of the
+# framebuffer (No space left on device).
+dd if=/dev/zero of=/dev/fb0 bs=64k 2>/dev/null
+
+# Boot finished: blue status LED on
+for led in /sys/class/leds/*:status; do echo 1 > "$led/brightness"; done

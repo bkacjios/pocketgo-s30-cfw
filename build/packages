@@ -1,0 +1,36 @@
+# Extra Alpine packages (armv7, latest-stable) installed into the rootfs.
+# Dependencies are resolved by tools/apk_resolve.py; !name excludes a package.
+devmem2
+i2c-tools
+tinyalsa
+alsa-lib
+alsa-utils
+kmscube
+# ssh over USB networking: dropbear, sftp-server for scp/sftp, rsync,
+# udhcpd (busybox-extras) to give the host its address
+dropbear
+openssh-sftp-server
+rsync
+busybox-extras
+mesa-dri-gallium
+# RetroArch itself is built by build.sh retroarch (patched for screen
+# rotation); these are its runtime libraries, udevd for joypad detection,
+# core info files and cores.
+eudev
+eudev-libs
+alsa-lib
+mesa-egl
+mesa-gbm
+mesa-gles
+libstdc++
+libretro-core-info
+# RetroArch menu assets (Ozone/XMB/GLUI themes, fonts, sounds) in
+# /usr/share/libretro/assets; the launcher uses its Ozone fonts
+retroarch-assets
+# Launcher (build.sh launcher)
+sdl2
+sdl2_ttf
+libretro-fceumm
+libretro-gambatte
+libretro-gpsp
+libretro-mgba

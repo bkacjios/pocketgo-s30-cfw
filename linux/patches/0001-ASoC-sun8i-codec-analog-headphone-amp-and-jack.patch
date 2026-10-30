@@ -1,0 +1,380 @@
+diff --git a/sound/soc/sunxi/sun8i-codec-analog.c b/sound/soc/sunxi/sun8i-codec-analog.c
+index 3335855c6..f6f9b9910 100644
+--- a/sound/soc/sunxi/sun8i-codec-analog.c
++++ b/sound/soc/sunxi/sun8i-codec-analog.c
+@@ -11,8 +11,11 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
++#include <linux/workqueue.h>
+ 
++#include <sound/jack.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dapm.h>
+ #include <sound/tlv.h>
+@@ -323,6 +326,13 @@ static const struct snd_kcontrol_new sun8i_codec_headphone_controls[] = {
+ 		   SUN8I_ADDA_DAC_PA_SRC,
+ 		   SUN8I_ADDA_DAC_PA_SRC_LHPPAMUTE,
+ 		   SUN8I_ADDA_DAC_PA_SRC_RHPPAMUTE, 1, 0),
++	/*
++	 * Drive the right headphone output with the inverted left signal, for
++	 * a mono speaker amplifier bridged across HPL and HPR.
++	 */
++	SOC_SINGLE("Headphone Mono Differential Playback Switch",
++		   SUN8I_ADDA_PAEN_HP_CTRL,
++		   SUN8I_ADDA_PAEN_HP_CTRL_LTRNMUTE, 1, 0),
+ };
+ 
+ static const char * const sun8i_codec_hp_src_enum_text[] = {
+@@ -340,11 +350,99 @@ static const struct snd_kcontrol_new sun8i_codec_hp_src[] = {
+ 		      sun8i_codec_hp_src_enum),
+ };
+ 
++/*
++ * Some boards sense the headphone jack through a contact that is only pulled
++ * up while the headphone amplifier is powered. There the amplifier (and
++ * HPCOM, see below) is enabled once at probe and left on, outside of DAPM:
++ * a force-enabled widget would stop power changes from propagating along the
++ * path to the outputs.
++ */
++static bool sun8i_headphone_amp_always_on(struct snd_soc_component *component)
++{
++	return device_property_read_bool(component->dev,
++					 "allwinner,headphone-amp-always-on");
++}
++
++/*
++ * Always-on boards also keep HPCOM driven: with capless headphones the plug
++ * returns through HPCOM, and an idle (undriven) HPCOM loads the amplifier's
++ * DC bias enough to reset the analog block to its power-on defaults.
++ */
++#define SUN8I_ADDA_PAEN_HP_CTRL_HP_ON	(BIT(SUN8I_ADDA_PAEN_HP_CTRL_HPPAEN) | \
++					 (0x3 << SUN8I_ADDA_PAEN_HP_CTRL_HPCOM_FC) | \
++					 BIT(SUN8I_ADDA_PAEN_HP_CTRL_COMPTEN))
++
++#define SUN8I_ADDA_PAEN_HP_CTRL_HPCOM_ON	((0x3 << SUN8I_ADDA_PAEN_HP_CTRL_HPCOM_FC) | \
++					 BIT(SUN8I_ADDA_PAEN_HP_CTRL_COMPTEN))
++#define SUN8I_ADDA_PAEN_HP_CTRL_ANTI_POP_MAX	(0x3 << SUN8I_ADDA_PAEN_HP_CTRL_PA_ANTI_POP_CTRL)
++#define SUN8I_HP_ANTI_POP_MS	600	/* longest PA ramp, with margin */
++
++/*
++ * Switches the amplifier on without a pop: longest anti-pop ramp, HPCOM (the
++ * headphone return) settled before the PA. Nothing to do if already on.
++ */
++static void sun8i_codec_hp_on(struct snd_soc_component *component)
++{
++	unsigned int val = snd_soc_component_read(component, SUN8I_ADDA_PAEN_HP_CTRL);
++
++	if ((val & SUN8I_ADDA_PAEN_HP_CTRL_HP_ON) == SUN8I_ADDA_PAEN_HP_CTRL_HP_ON)
++		return;
++	snd_soc_component_update_bits(component, SUN8I_ADDA_PAEN_HP_CTRL,
++				      SUN8I_ADDA_PAEN_HP_CTRL_ANTI_POP_MAX |
++				      SUN8I_ADDA_PAEN_HP_CTRL_HPCOM_ON,
++				      SUN8I_ADDA_PAEN_HP_CTRL_ANTI_POP_MAX |
++				      SUN8I_ADDA_PAEN_HP_CTRL_HPCOM_ON);
++	msleep(50);
++	snd_soc_component_update_bits(component, SUN8I_ADDA_PAEN_HP_CTRL,
++				      BIT(SUN8I_ADDA_PAEN_HP_CTRL_HPPAEN),
++				      BIT(SUN8I_ADDA_PAEN_HP_CTRL_HPPAEN));
++}
++
++/*
++ * With the amplifier outside of DAPM, userspace can switch it (and HPCOM)
++ * back on should the analog block still lose its state.
++ */
++static int sun8i_codec_hp_amp_get(struct snd_kcontrol *kcontrol,
++				  struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	unsigned int val = snd_soc_component_read(component, SUN8I_ADDA_PAEN_HP_CTRL);
++
++	ucontrol->value.integer.value[0] =
++		(val & SUN8I_ADDA_PAEN_HP_CTRL_HP_ON) == SUN8I_ADDA_PAEN_HP_CTRL_HP_ON;
++	return 0;
++}
++
++static int sun8i_codec_hp_amp_put(struct snd_kcontrol *kcontrol,
++				  struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	unsigned int val = snd_soc_component_read(component, SUN8I_ADDA_PAEN_HP_CTRL);
++	bool on = (val & SUN8I_ADDA_PAEN_HP_CTRL_HP_ON) == SUN8I_ADDA_PAEN_HP_CTRL_HP_ON;
++
++	if (on == !!ucontrol->value.integer.value[0])
++		return 0;
++	if (!on)
++		sun8i_codec_hp_on(component);
++	else
++		snd_soc_component_update_bits(component, SUN8I_ADDA_PAEN_HP_CTRL,
++					      SUN8I_ADDA_PAEN_HP_CTRL_HP_ON, 0);
++	return 1;
++}
++
++static const struct snd_kcontrol_new sun8i_codec_hp_amp_switch[] = {
++	SOC_SINGLE_BOOL_EXT("Headphone Amp Playback Switch", 0,
++			    sun8i_codec_hp_amp_get, sun8i_codec_hp_amp_put),
++};
++
+ static int sun8i_headphone_amp_event(struct snd_soc_dapm_widget *w,
+ 				     struct snd_kcontrol *k, int event)
+ {
+ 	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+ 
++	if (sun8i_headphone_amp_always_on(component))
++		return 0;
++
+ 	if (SND_SOC_DAPM_EVENT_ON(event)) {
+ 		snd_soc_component_update_bits(component, SUN8I_ADDA_PAEN_HP_CTRL,
+ 					      BIT(SUN8I_ADDA_PAEN_HP_CTRL_HPPAEN),
+@@ -367,15 +465,24 @@ static int sun8i_headphone_amp_event(struct snd_soc_dapm_widget *w,
+ static const struct snd_soc_dapm_widget sun8i_codec_headphone_widgets[] = {
+ 	SND_SOC_DAPM_MUX("Headphone Source Playback Route",
+ 			 SND_SOC_NOPM, 0, 0, sun8i_codec_hp_src),
+-	SND_SOC_DAPM_OUT_DRV_E("Headphone Amp", SUN8I_ADDA_PAEN_HP_CTRL,
+-			       SUN8I_ADDA_PAEN_HP_CTRL_HPPAEN, 0, NULL, 0,
++	/* The event handler switches the amplifier (HPPAEN) */
++	SND_SOC_DAPM_OUT_DRV_E("Headphone Amp", SND_SOC_NOPM, 0, 0, NULL, 0,
+ 			       sun8i_headphone_amp_event,
+ 			       SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_PRE_PMD),
++	SND_SOC_DAPM_OUTPUT("HP"),
++};
++
++static const struct snd_soc_dapm_widget sun8i_codec_hpcom_widgets[] = {
+ 	SND_SOC_DAPM_SUPPLY("HPCOM Protection", SUN8I_ADDA_PAEN_HP_CTRL,
+ 			    SUN8I_ADDA_PAEN_HP_CTRL_COMPTEN, 0, NULL, 0),
+ 	SND_SOC_DAPM_REG(snd_soc_dapm_supply, "HPCOM", SUN8I_ADDA_PAEN_HP_CTRL,
+ 			 SUN8I_ADDA_PAEN_HP_CTRL_HPCOM_FC, 0x3, 0x3, 0),
+-	SND_SOC_DAPM_OUTPUT("HP"),
++};
++
++/* Always-on boards: switched with the amplifier, outside of DAPM */
++static const struct snd_soc_dapm_widget sun8i_codec_hpcom_always_on_widgets[] = {
++	SND_SOC_DAPM_SUPPLY("HPCOM Protection", SND_SOC_NOPM, 0, 0, NULL, 0),
++	SND_SOC_DAPM_SUPPLY("HPCOM", SND_SOC_NOPM, 0, 0, NULL, 0),
+ };
+ 
+ static const struct snd_soc_dapm_route sun8i_codec_headphone_routes[] = {
+@@ -404,6 +511,12 @@ static int sun8i_codec_add_headphone(struct snd_soc_component *cmpnt)
+ 
+ 	ret = snd_soc_dapm_new_controls(dapm, sun8i_codec_headphone_widgets,
+ 					ARRAY_SIZE(sun8i_codec_headphone_widgets));
++	if (!ret && sun8i_headphone_amp_always_on(cmpnt))
++		ret = snd_soc_dapm_new_controls(dapm, sun8i_codec_hpcom_always_on_widgets,
++						ARRAY_SIZE(sun8i_codec_hpcom_always_on_widgets));
++	else if (!ret)
++		ret = snd_soc_dapm_new_controls(dapm, sun8i_codec_hpcom_widgets,
++						ARRAY_SIZE(sun8i_codec_hpcom_widgets));
+ 	if (ret) {
+ 		dev_err(dev, "Failed to add Headphone DAPM widgets: %d\n", ret);
+ 		return ret;
+@@ -786,9 +899,163 @@ static int sun8i_codec_analog_cmpnt_probe(struct snd_soc_component *cmpnt)
+ 			return ret;
+ 	}
+ 
++	if (quirks->has_headphone && sun8i_headphone_amp_always_on(cmpnt)) {
++		sun8i_codec_hp_on(cmpnt);
++		ret = snd_soc_add_component_controls(cmpnt,
++						     sun8i_codec_hp_amp_switch,
++						     ARRAY_SIZE(sun8i_codec_hp_amp_switch));
++		if (ret)
++			return ret;
++	}
++
+ 	return 0;
+ }
+ 
++/*
++ * Headphone jack (hp-det-gpios) owned by the codec, so that it can switch the
++ * outputs: on boards with a mono speaker amplifier bridged across HPL/HPR
++ * ("allwinner,bridged-mono-speaker"), the speaker plays the DAC's mono mix
++ * differentially while no headphone is in, and is switched off otherwise.
++ * "allwinner,headphone-lr-swapped" swaps the channels for the headphone.
++ */
++struct sun8i_codec_analog_jack {
++	struct snd_soc_component *component;
++	struct snd_soc_jack *jack;
++	struct snd_soc_jack_gpio gpio;
++	struct notifier_block nb;
++	struct delayed_work work;
++	int tries;
++	bool headphone;
++};
++
++/* Sets a card control (both channels where it has two); -ENOENT if missing */
++static int sun8i_codec_jack_set_ctl(struct snd_soc_card *card, const char *name,
++				    int left, int right)
++{
++	struct snd_kcontrol *kctl = snd_soc_card_get_kcontrol(card, name);
++	struct snd_ctl_elem_info info = {};
++	struct snd_ctl_elem_value *val;
++	int ret;
++
++	if (!kctl)
++		return -ENOENT;
++	ret = kctl->info(kctl, &info);
++	if (ret)
++		return ret;
++	val = kzalloc(sizeof(*val), GFP_KERNEL);
++	if (!val)
++		return -ENOMEM;
++	if (info.type == SNDRV_CTL_ELEM_TYPE_ENUMERATED) {
++		val->value.enumerated.item[0] = left;
++		val->value.enumerated.item[1] = right;
++	} else {
++		val->value.integer.value[0] = left;
++		val->value.integer.value[1] = right;
++	}
++	ret = kctl->put(kctl, val);
++	if (ret > 0)
++		snd_ctl_notify(card->snd_card, SNDRV_CTL_EVENT_MASK_VALUE, &kctl->id);
++	kfree(val);
++	return ret < 0 ? ret : 0;
++}
++
++static void sun8i_codec_jack_work(struct work_struct *work)
++{
++	struct sun8i_codec_analog_jack *aj =
++		container_of(work, struct sun8i_codec_analog_jack, work.work);
++	struct snd_soc_component *component = aj->component;
++	struct snd_soc_card *card = aj->jack->card;
++	struct snd_soc_dapm_context *dapm = snd_soc_card_to_dapm(card);
++	bool swap = device_property_read_bool(component->dev,
++					      "allwinner,headphone-lr-swapped");
++	bool hp = aj->headphone;
++	int ret;
++
++	if (!device_property_read_bool(component->dev,
++				       "allwinner,bridged-mono-speaker"))
++		return;
++
++	/* Enum: Stereo, Reverse Stereo, Sum Mono, Mix Mono */
++	ret = sun8i_codec_jack_set_ctl(card, "AIF1 DA0 Stereo Playback Route",
++				       hp ? swap : 3, hp ? swap : 3);
++	if (!ret)
++		ret = sun8i_codec_jack_set_ctl(card,
++				"Headphone Mono Differential Playback Switch", !hp, 0);
++	if (!ret)
++		ret = sun8i_codec_jack_set_ctl(card, "Headphone Playback Switch",
++					       1, hp);
++	if (ret == -ENOENT && ++aj->tries < 50) {
++		/* The card is still being bound: its controls are not all there */
++		schedule_delayed_work(&aj->work, msecs_to_jiffies(100));
++		return;
++	}
++	if (ret)
++		dev_err(component->dev, "Failed to switch outputs: %d\n", ret);
++
++	if (hp)
++		snd_soc_dapm_disable_pin(dapm, "Speaker");
++	else
++		snd_soc_dapm_enable_pin(dapm, "Speaker");
++	snd_soc_dapm_sync(dapm);
++}
++
++static int sun8i_codec_jack_notify(struct notifier_block *nb,
++				   unsigned long status, void *data)
++{
++	struct sun8i_codec_analog_jack *aj =
++		container_of(nb, struct sun8i_codec_analog_jack, nb);
++
++	/* Plugging can disturb the outputs: make sure the amplifier is on */
++	if (sun8i_headphone_amp_always_on(aj->component))
++		sun8i_codec_hp_on(aj->component);
++	aj->headphone = status & SND_JACK_HEADPHONE;
++	aj->tries = 0;
++	mod_delayed_work(system_percpu_wq, &aj->work, 0);
++	return NOTIFY_OK;
++}
++
++static void sun8i_codec_jack_cancel(void *data)
++{
++	struct sun8i_codec_analog_jack *aj = data;
++
++	cancel_delayed_work_sync(&aj->work);
++}
++
++static int sun8i_codec_analog_get_jack_type(struct snd_soc_component *component)
++{
++	return device_property_present(component->dev, "hp-det-gpios") ?
++	       SND_JACK_HEADPHONE : 0;
++}
++
++static int sun8i_codec_analog_set_jack(struct snd_soc_component *component,
++				       struct snd_soc_jack *jack, void *data)
++{
++	struct device *dev = component->dev;
++	struct sun8i_codec_analog_jack *aj;
++	int ret;
++
++	if (!jack)
++		return 0;
++	aj = devm_kzalloc(dev, sizeof(*aj), GFP_KERNEL);
++	if (!aj)
++		return -ENOMEM;
++	aj->component = component;
++	aj->jack = jack;
++	INIT_DELAYED_WORK(&aj->work, sun8i_codec_jack_work);
++	ret = devm_add_action_or_reset(dev, sun8i_codec_jack_cancel, aj);
++	if (ret)
++		return ret;
++
++	aj->nb.notifier_call = sun8i_codec_jack_notify;
++	snd_soc_jack_notifier_register(jack, &aj->nb);
++
++	aj->gpio.gpiod_dev = dev;
++	aj->gpio.name = "hp-det";
++	aj->gpio.report = SND_JACK_HEADPHONE;
++	aj->gpio.debounce_time = 150;
++	return snd_soc_jack_add_gpios(jack, 1, &aj->gpio);
++}
++
+ static const struct snd_soc_component_driver sun8i_codec_analog_cmpnt_drv = {
+ 	.controls		= sun8i_codec_common_controls,
+ 	.num_controls		= ARRAY_SIZE(sun8i_codec_common_controls),
+@@ -797,6 +1064,8 @@ static const struct snd_soc_component_driver sun8i_codec_analog_cmpnt_drv = {
+ 	.dapm_routes		= sun8i_codec_common_routes,
+ 	.num_dapm_routes	= ARRAY_SIZE(sun8i_codec_common_routes),
+ 	.probe			= sun8i_codec_analog_cmpnt_probe,
++	.get_jack_type		= sun8i_codec_analog_get_jack_type,
++	.set_jack		= sun8i_codec_analog_set_jack,
+ };
+ 
+ static const struct of_device_id sun8i_codec_analog_of_match[] = {
+@@ -835,12 +1104,35 @@ static int sun8i_codec_analog_probe(struct platform_device *pdev)
+ 					       NULL, 0);
+ }
+ 
++/*
++ * Power off / reboot: ramp an always-on amplifier down before the supply goes
++ * (cutting it while biased pops): mute, PA off and its anti-pop ramp, then
++ * HPCOM.
++ */
++static void sun8i_codec_analog_shutdown(struct platform_device *pdev)
++{
++	struct regmap *regmap = dev_get_regmap(&pdev->dev, NULL);
++
++	if (!regmap || !device_property_read_bool(&pdev->dev,
++						  "allwinner,headphone-amp-always-on"))
++		return;
++	regmap_update_bits(regmap, SUN8I_ADDA_DAC_PA_SRC,
++			   BIT(SUN8I_ADDA_DAC_PA_SRC_LHPPAMUTE) |
++			   BIT(SUN8I_ADDA_DAC_PA_SRC_RHPPAMUTE), 0);
++	regmap_update_bits(regmap, SUN8I_ADDA_PAEN_HP_CTRL,
++			   BIT(SUN8I_ADDA_PAEN_HP_CTRL_HPPAEN), 0);
++	msleep(SUN8I_HP_ANTI_POP_MS);
++	regmap_update_bits(regmap, SUN8I_ADDA_PAEN_HP_CTRL,
++			   SUN8I_ADDA_PAEN_HP_CTRL_HPCOM_ON, 0);
++}
++
+ static struct platform_driver sun8i_codec_analog_driver = {
+ 	.driver = {
+ 		.name = "sun8i-codec-analog",
+ 		.of_match_table = sun8i_codec_analog_of_match,
+ 	},
+ 	.probe = sun8i_codec_analog_probe,
++	.shutdown = sun8i_codec_analog_shutdown,
+ };
+ module_platform_driver(sun8i_codec_analog_driver);
+ 

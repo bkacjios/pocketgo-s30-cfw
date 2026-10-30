@@ -1,0 +1,9 @@
+config JOYSTICK_POCKETGO_S30
+	tristate "PocketGo S30 gamepad"
+	depends on I2C
+	depends on GPIOLIB || COMPILE_TEST
+	help
+	  Say Y here for the PocketGo S30 handheld's analog stick (read via a
+	  microcontroller on I2C) and gamepad buttons, reported as one input
+	  device.
+

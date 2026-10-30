@@ -1,0 +1,15 @@
+#!/bin/sh
+# Frontend, respawned by init: the launcher starts apps from /mnt/sd/apps;
+# without it, run RetroArch directly.
+. /etc/profile.d/s30.sh
+cd "$HOME"
+# Apps' output: a log in RAM rather than the serial console (/dev/console),
+# where a chatty app would stall on the UART
+exec >>/tmp/frontend.log 2>&1
+if [ -x /usr/bin/s30-launcher ]; then
+	s30-launcher /mnt/sd/apps
+else
+	retroarch -c "$HOME/.config/retroarch/retroarch.cfg"
+fi
+# init respawns at once: don't spin if it keeps failing
+sleep 1

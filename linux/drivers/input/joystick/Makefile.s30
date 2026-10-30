@@ -1,0 +1,1 @@
+obj-$(CONFIG_JOYSTICK_POCKETGO_S30)	+= pocketgo-s30-gamepad.o

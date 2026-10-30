@@ -1,0 +1,63 @@
+#!/bin/busybox sh
+# initramfs /init: mount the SD card, loop-mount /boot/rootfs.sqfs (read-only
+# system) under a tmpfs overlay (writable, lost at reboot) and switch to it.
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+
+fail() { echo "s30-loader: $*" > /dev/console; exec sh; }
+
+mkdir -p /sd /ro /rw /root
+i=0
+until [ -b /dev/mmcblk0p1 ]; do
+	i=$((i + 1)); [ $i -gt 100 ] && fail "no SD card"
+	sleep 0.1
+done
+
+# Hold SELECT (BTN_SELECT 314) at power on: USB disk mode. The whole SD card
+# is a USB mass storage device on the PC; nothing on it is mounted here.
+# Ejecting it on the PC or pressing START (BTN_START 315) reboots.
+if s30-keyheld 314; then
+	s30-splash -i /usb.bmp
+	G=/sys/kernel/config/usb_gadget/s30
+	F=$G/functions/mass_storage.usb0
+	mount -t configfs configfs /sys/kernel/config
+	mkdir -p $G/strings/0x409 $G/configs/c.1 $F
+	echo 0x1d6b > $G/idVendor	# Linux Foundation
+	echo 0x0104 > $G/idProduct	# Multifunction Composite Gadget
+	echo PocketGo > $G/strings/0x409/manufacturer
+	echo "PocketGo S30" > $G/strings/0x409/product
+	echo s30 > $G/strings/0x409/serialnumber
+	# removable: a PC eject closes the backing file (lun.0/file reads empty)
+	echo 1 > $F/lun.0/removable
+	echo /dev/mmcblk0 > $F/lun.0/file
+	ln -s $F $G/configs/c.1/
+	i=0
+	until [ -n "$(ls /sys/class/udc)" ] || [ $i -gt 50 ]; do
+		i=$((i + 1)); sleep 0.1
+	done
+	ls /sys/class/udc > $G/UDC
+	while [ -n "$(cat $F/lun.0/file)" ] && ! s30-keyheld 315; do
+		sleep 0.2
+	done
+	echo > $G/UDC
+	sync
+	reboot -f
+fi
+
+# FAT (stock card) or ext4
+mount /dev/mmcblk0p1 /sd || fail "cannot mount SD card"
+# Staged update (copied over ssh while the old one is in use as /)
+[ -f /sd/boot/rootfs.sqfs.new ] && mv /sd/boot/rootfs.sqfs.new /sd/boot/rootfs.sqfs
+mount -t squashfs -o loop,ro /sd/boot/rootfs.sqfs /ro || fail "cannot mount /boot/rootfs.sqfs"
+mount -t tmpfs -o mode=755 tmpfs /rw
+mkdir -p /rw/upper /rw/work
+mount -t overlay overlay -o lowerdir=/ro,upperdir=/rw/upper,workdir=/rw/work /root ||
+	fail "cannot mount overlay"
+
+mkdir -p /root/mnt/sd
+mount --move /sd /root/mnt/sd
+mount --move /dev /root/dev
+umount /proc /sys
+exec switch_root /root /sbin/init

@@ -1,0 +1,1 @@
+obj-$(CONFIG_DRM_PANEL_ILITEK_ILI9488_DSI) += panel-ilitek-ili9488-dsi.o

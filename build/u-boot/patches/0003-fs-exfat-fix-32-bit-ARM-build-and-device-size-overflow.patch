@@ -1,0 +1,74 @@
+diff --git a/fs/exfat/io.c b/fs/exfat/io.c
+index 6c86688c..be983999 100644
+--- a/fs/exfat/io.c
++++ b/fs/exfat/io.c
+@@ -412,7 +412,8 @@ struct exfat_dev* exfat_open(const char* spec, enum exfat_mode mode)
+ 		return NULL;
+ 	}
+ 	dev->mode = EXFAT_MODE_RW;
+-	dev->size = ctxt.cur_part_info.size * ctxt.cur_part_info.blksz;
++	/* 64-bit multiply: lbaint_t and blksz are 32 bits on 32-bit targets */
++	dev->size = (off_t)ctxt.cur_part_info.size * ctxt.cur_part_info.blksz;
+ 	dev->ctxt = &ctxt;
+ 
+ 	return dev;
+diff --git a/fs/exfat/platform.h b/fs/exfat/platform.h
+index 66885760..e55f4b04 100644
+--- a/fs/exfat/platform.h
++++ b/fs/exfat/platform.h
+@@ -24,7 +24,7 @@
+ #ifndef PLATFORM_H_INCLUDED
+ #define PLATFORM_H_INCLUDED
+ 
+-#if defined(__linux__) || defined(__GLIBC__) || defined(__GNU__)
++#if defined(__UBOOT__) || defined(__linux__) || defined(__GLIBC__) || defined(__GNU__)
+ 
+ #ifndef __UBOOT__
+ #include <endian.h>
+diff --git a/fs/exfat/time.c b/fs/exfat/time.c
+index f2217dd7..22411cda 100644
+--- a/fs/exfat/time.c
++++ b/fs/exfat/time.c
+@@ -115,6 +115,7 @@ void exfat_unix2exfat(time_t unix_time, le16_t* date, le16_t* time,
+ 		uint8_t* centisec, uint8_t* tzoffset)
+ {
+ 	time_t shift = EPOCH_DIFF_SEC + exfat_timezone;
++	uint64_t utime;
+ 	uint16_t day, month, year;
+ 	uint16_t twosec, min, hour;
+ 	int days;
+@@ -124,9 +125,13 @@ void exfat_unix2exfat(time_t unix_time, le16_t* date, le16_t* time,
+ 	if (unix_time < shift)
+ 		unix_time = shift;
+ 
+-	unix_time -= shift;
++	/*
++	 * Non-negative from here on: divide unsigned, as there is no signed
++	 * 64-bit division helper (__aeabi_ldivmod) in U-Boot on 32-bit ARM
++	 */
++	utime = unix_time - shift;
+ 
+-	days = unix_time / SEC_IN_DAY;
++	days = utime / SEC_IN_DAY;
+ 	year = (4 * days) / (4 * 365 + 1);
+ 	days -= year * 365 + LEAP_YEARS(year);
+ 	month = 0;
+@@ -144,14 +149,14 @@ void exfat_unix2exfat(time_t unix_time, le16_t* date, le16_t* time,
+ 	}
+ 	day = days + 1;
+ 
+-	hour = (unix_time % SEC_IN_DAY) / SEC_IN_HOUR;
+-	min = (unix_time % SEC_IN_HOUR) / SEC_IN_MIN;
+-	twosec = (unix_time % SEC_IN_MIN) / 2;
++	hour = (utime % SEC_IN_DAY) / SEC_IN_HOUR;
++	min = (utime % SEC_IN_HOUR) / SEC_IN_MIN;
++	twosec = (utime % SEC_IN_MIN) / 2;
+ 
+ 	*date = cpu_to_le16(day | (month << 5) | (year << 9));
+ 	*time = cpu_to_le16(twosec | (min << 5) | (hour << 11));
+ 	if (centisec)
+-		*centisec = (unix_time % 2) * 100;
++		*centisec = (utime % 2) * 100;
+ 
+ 	/* record our local timezone offset in exFAT (15 minute increment) format */
+ 	*tzoffset = (uint8_t)(-exfat_timezone / 60 / 15) | 0x80;

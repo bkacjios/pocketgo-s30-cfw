@@ -1,0 +1,13 @@
+# Build trees and outputs (build.sh: $WORK and $OUT)
+/s30-build/
+/out/
+# Stock firmware dumps and their decoded parts (not redistributable)
+/S30-info/
+/firmware-decoded/
+# Game ports live in their own repositories
+/ports/
+# Old U-Boot checkout kept for reference (not built)
+/u-boot/
+/testing.tar.gz
+__pycache__/
+*.pyc
