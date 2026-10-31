@@ -21,3 +21,4 @@
 [submodule "external/es-theme-carbon"]
 	path = external/es-theme-carbon
 	url = https://github.com/RetroPie/es-theme-carbon.git
+	shallow = true

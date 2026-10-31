@@ -73,6 +73,12 @@ if [ ! -f "$cfg" ]; then
 	cp /etc/retroarch.cfg "$cfg"
 fi
 
+# EmulationStation's input mapping for the gamepad (no setup prompt)
+if [ ! -f "$HOME/.emulationstation/es_input.cfg" ]; then
+	mkdir -p "$HOME/.emulationstation"
+	cp /etc/emulationstation/es_input.cfg "$HOME/.emulationstation/"
+fi
+
 # Launcher apps: /mnt/sd/apps holds launch scripts (edit or add your own);
 # missing defaults are copied from /usr/share/s30/apps
 mkdir -p /mnt/sd/apps

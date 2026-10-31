@@ -204,7 +204,8 @@ step_rootfs() {
 # Cross sysroot for clang builds (RetroArch, launcher): Alpine minirootfs +
 # toolchain runtime (gcc for crt/libgcc) + -dev packages, and single-word
 # compiler wrappers $WORK/bin/armv7-clang[++]. Rebuilt when the list changes.
-SYSROOT_PKGS="gcc g++ musl-dev linux-headers libdrm-dev mesa-dev alsa-lib-dev eudev-dev zlib-dev sdl2-dev sdl2_ttf-dev"
+SYSROOT_PKGS="gcc g++ musl-dev linux-headers libdrm-dev mesa-dev alsa-lib-dev eudev-dev zlib-dev sdl2-dev sdl2_ttf-dev
+	freeimage-dev freetype-dev curl-dev vlc-dev rapidjson-dev pugixml-dev"
 ensure_sysroot() {
 	local sr="$WORK/sysroot" idx name ver repo t
 	if [ "$(cat "$sr/.done" 2>/dev/null)" != "$SYSROOT_PKGS" ]; then
@@ -290,6 +291,39 @@ step_retroarch() {
 	ls -l "$WORK/retroarch.bin"
 }
 
+# EmulationStation (RetroPie's), cross-compiled with clang for armv7 musl
+# against the Alpine sysroot: Mesa GLES 2.0 renderer (the Mali-400 has no
+# GLES 3), Alpine's pugixml (not the bundled submodule), plus
+# emulationstation/patches (0001 from the AUR package: install rules,
+# resources in /usr/share/EmulationStation). Output: installed under
+# $WORK/emulationstation-root (/usr/bin/emulationstation, its resources)
+step_emulationstation() {
+	local src="$WORK/emulationstation" sr="$WORK/sysroot" patch
+	upstream_tree emulationstation
+	for patch in "$PROJECT"/emulationstation/patches/*.patch; do
+		[ -e "$patch" ] || continue
+		git -C "$src" apply --reverse --check "$patch" 2>/dev/null ||
+			git -C "$src" apply "$patch"
+	done
+
+	ensure_sysroot
+
+	PKG_CONFIG_SYSROOT_DIR="$sr" \
+	PKG_CONFIG_LIBDIR="$sr/usr/lib/pkgconfig:$sr/usr/share/pkgconfig" \
+	cmake -S "$src" -B "$src/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=armv7 \
+		-DCMAKE_C_COMPILER="$WORK/bin/armv7-clang" -DCMAKE_CXX_COMPILER="$WORK/bin/armv7-clang++" \
+		-DCMAKE_SYSROOT="$sr" -DCMAKE_FIND_ROOT_PATH="$sr" \
+		-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+		-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
+		-DCMAKE_STRIP="$(command -v llvm-strip)" -DCMAKE_INSTALL_PREFIX=/usr -DUSE_MESA_GLES=ON \
+		-DCMAKE_CXX_FLAGS=-D_LARGEFILE64_SOURCE # musl >= 1.2.4 hides stat64 otherwise
+	cmake --build "$src/build" -j"$JOBS"
+	rm -rf "$WORK/emulationstation-root"
+	DESTDIR="$WORK/emulationstation-root" cmake --install "$src/build" --strip
+	ls -l "$WORK/emulationstation-root/usr/bin/emulationstation"
+}
+
 # Root filesystem for build.sh fel: rootfs.sqfs (minirootfs + packages +
 # rootfs-overlay) goes to /s30 on the SD card; uInitrd is a small loader (busybox,
 # musl, s30-loader as /init) that mounts it with a tmpfs overlay.
@@ -322,6 +356,14 @@ step_initramfs() {
 		install -m 0755 "$WORK/s30-splash.bin" "$root/usr/bin/s30-splash"
 	[ -f "$WORK/s30-display.bin" ] &&
 		install -m 0755 "$WORK/s30-display.bin" "$root/usr/bin/s30-display"
+	[ -d "$WORK/emulationstation-root" ] &&
+		cp -r "$WORK/emulationstation-root/." "$root/"
+	# EmulationStation theme (submodule external/es-theme-carbon)
+	if [ -f "$PROJECT/external/es-theme-carbon/carbon.xml" ]; then
+		mkdir -p "$root/etc/emulationstation/themes/carbon"
+		tar -C "$PROJECT/external/es-theme-carbon" -cf - --exclude=.git . |
+			tar -C "$root/etc/emulationstation/themes/carbon" -xf -
+	fi
 	[ -f "$WORK/libs30lease.so" ] &&
 		install -D -m 0755 "$WORK/libs30lease.so" "$root/usr/lib/s30/libs30lease.so"
 	# Boot splash: the same image U-Boot shows
@@ -477,9 +519,10 @@ case "${1:-all}" in
 	image) step_image ;;
 	initramfs) step_initramfs ;;
 	retroarch) step_retroarch ;;
+	emulationstation) step_emulationstation ;;
 	launcher) step_launcher ;;
 	fel) step_fel ;;
 	sdcard) step_sdcard "${2:-}" "${3:-}" ;;
 	all) step_deps; step_linux; step_uboot; step_rootfs; step_image ;;
-	*) echo "usage: $0 [deps|linux|uboot|rootfs|image|initramfs|retroarch|launcher|fel|sdcard /dev/sdX [format]|all]" >&2; exit 2 ;;
+	*) echo "usage: $0 [deps|linux|uboot|rootfs|image|initramfs|retroarch|emulationstation|launcher|fel|sdcard /dev/sdX [format]|all]" >&2; exit 2 ;;
 esac

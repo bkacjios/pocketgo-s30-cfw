@@ -34,3 +34,9 @@ libretro-fceumm
 libretro-gambatte
 libretro-gpsp
 libretro-mgba
+# EmulationStation (build.sh emulationstation): runtime libraries. vlc-libs
+# only (libvlc, for linking): without VLC's plugins video previews don't play
+freeimage
+libcurl
+pugixml
+vlc-libs

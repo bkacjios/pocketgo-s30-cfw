@@ -398,6 +398,30 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
 - Select-based hotkeys were tried and removed at the user's request.
 - Cores from Alpine: fceumm, gambatte, gpsp, mgba.
 
+## EmulationStation (started 2026-10-31)
+
+- RetroPie's EmulationStation (submodule external/emulationstation), not
+  ES-DE: ES-DE 2.0+ needs OpenGL ES 3.0, the Mali-400 has 2.0. Built by
+  `build.sh emulationstation` (cmake, Mesa GLES 2.0 renderer
+  `USE_MESA_GLES`, Alpine pugixml instead of the bundled submodule:
+  upstream already uses a system pugixml when found; `_LARGEFILE64_SOURCE`
+  because musl >= 1.2.4 hides stat64), installed under
+  $WORK/emulationstation-root and copied into the rootfs.
+- Patches (emulationstation/patches): 0001 from the AUR package (install
+  rules, resources in /usr/share/EmulationStation); 0002 input setup without
+  the right stick, right thumb and hotkey entries, and no hotkey prompt
+  (games are exited from the power key's system menu).
+- Runtime: freeimage, libcurl, pugixml, vlc-libs only (libvlc to link; no
+  VLC plugins, so video previews don't play).
+- Launcher app EmulationStation.sh: `--screenrotate 3 --screensize 480 320`
+  (window is the panel's 320x480; the canvas is laid out landscape).
+- /etc/emulationstation: es_systems.cfg (gb, gba, nes from ~/roms/<system>
+  through RetroArch with gambatte, mgba, fceumm), es_input.cfg (the S30
+  gamepad, copied to ~/.emulationstation by rc when missing), themes/carbon
+  (submodule external/es-theme-carbon).
+- Not yet verified: launching a game from ES (lease handover to RetroArch
+  and back), how Carbon looks at 480x320.
+
 ## Power key, reboot (verified 2026-10-29)
 
 - Holding power 6 s is a hardware power-off by the AXP (reg 0x36 = 0x5d:
