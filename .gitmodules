@@ -10,3 +10,7 @@
 	path = external/retroarch
 	url = https://github.com/libretro/RetroArch.git
 	shallow = true
+[submodule "ports/oot"]
+	path = ports/oot
+	url = https://github.com/bkacjios/oot-s30.git
+	shallow = true

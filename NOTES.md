@@ -40,6 +40,8 @@ u-boot/                   Old U-Boot v2022.01 checkout (reference only, NOT buil
                           not in this repo)
 external/                 Submodules, pinned: linux (v7.3), u-boot (v2026.10),
                           retroarch (v1.22.2). Built in worktrees under $WORK.
+ports/oot/                Submodule: Ocarina of Time port (bkacjios/oot-s30).
+                          Other ports/ checkouts are not in this repo.
 s30-build/                $WORK: build trees (git worktrees of external/*,
                           patched there; sysroot) and outputs (boot/, rootfs.sqfs,
                           uInitrd, fel.scr, retroarch.bin, u-boot-sunxi-with-spl.bin)
@@ -559,19 +561,20 @@ layout and does not match it; use `sdcard`.
   the panel's get_modes (property created after DRM registration). Cosmetic.
 - Backlight PWM is active high (verified).
 
-## Ocarina of Time port (ports/oot-dc, branch s30) (started 2026-10-29)
+## Ocarina of Time port (ports/oot, submodule) (started 2026-10-29)
 
-Base: github.com/jnmartin84/oot-dc (ZeldaRET decomp ported to Dreamcast).
+Repo: github.com/bkacjios/oot-s30 (submodule `ports/oot`, branch main),
+started from github.com/jnmartin84/oot-dc (history not kept).
 All Dreamcast code is stripped; the tree is S30-only. ROM: `gc-us` (USA
 GameCube, regular quest) at `baseroms/gc-us/baserom.z64` (git-ignored), from
 `/run/media/jake/games/Roms/N64/Legend of Zelda, The - Ocarina of Time (USA) (GC).z64`.
 
-Build (from ports/oot-dc):
+Build (from ports/oot):
 
 ```
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # once
 make -f Makefile.s30 extract    # ROM -> extracted/gc-us, build/gc-us (12 s)
-make -f Makefile.s30 assets     # ARM asset segments -> data/*.bin, build_dc/assets (1.5 min)
+make -f Makefile.s30 assets     # ARM asset segments -> data/*.bin, build_assets/assets (1.5 min)
 make -f Makefile.s30 -j$(nproc) # zelda
 rsync -rt zelda data root@10.42.0.2:/mnt/sd/oot/
 ```
@@ -579,7 +582,7 @@ rsync -rt zelda data root@10.42.0.2:/mnt/sd/oot/
 - Game code: arm-none-eabi-gcc (needs `-fno-toplevel-reorder`) against the
   Alpine musl headers, `-fno-short-enums`; `src/s30/` (EGL/DRM/ALSA) and the
   link use the clang wrapper. Asset symbols come from
-  `build_dc/assets/symbols.ld` (lld rejects the duplicate absolute symbols
+  `build_assets/assets/symbols.ld` (lld rejects the duplicate absolute symbols
   of `--just-symbols` on every asset ELF).
 - `src/s30/`: display.c (KMS/GBM/EGL, 427x320 offscreen FBO rotated onto the
   portrait panel, 3 vblanks per frame = 20 fps; orientation verified),

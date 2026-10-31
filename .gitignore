@@ -4,8 +4,9 @@
 # Stock firmware dumps and their decoded parts (not redistributable)
 /S30-info/
 /firmware-decoded/
-# Game ports live in their own repositories
-/ports/
+# Game ports live in their own repositories (ports/oot is a submodule)
+/ports/*
+!/ports/oot
 # Old U-Boot checkout kept for reference (not built)
 /u-boot/
 /testing.tar.gz
