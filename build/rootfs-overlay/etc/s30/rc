@@ -21,7 +21,7 @@ s30-splash 40
 
 # Audio: stock-like levels. The codec driver follows the headphone jack
 # (speaker mono/differential without headphones, off with them); the volume
-# (Headphone Playback Volume) is s30-volumed's, from the volume keys.
+# (Master Playback Volume) is s30-volumed's, from the volume keys.
 (
 	m() { tinymix -D 0 set "$@" >/dev/null 2>&1; }
 	until tinymix -D 0 get "AIF1 Slot 0 Digital DAC Playback Switch" >/dev/null 2>&1; do

@@ -56,9 +56,17 @@ linux/
   drivers/gpu/drm/panel/  ILI9488 DSI panel driver (+Kconfig.s30/Makefile.s30)
   drivers/input/joystick/ pocketgo-s30-gamepad (MCU stick + GPIO buttons)
   drivers/video/logo/     logo_pocketgo_s30_clut224.ppm (kernel boot logo)
-  patches/0001            sun8i-codec-analog: mono differential switch,
+patches/                  Changes to the submodules, one folder each, applied
+                          in order by build.sh in the worktrees:
+  linux/0001              sun8i-codec-analog: mono differential switch,
                           headphone amp + HPCOM always on, owns the jack
-                          (output switching on plug/unplug)
+                          (output switching on plug/unplug), volume control
+                          named Master
+  u-boot/                 0001 DSI LCD, 0002 splash env, 0003 exFAT on 32-bit
+                          ARM, 0004 AXP PEK restart bit
+  retroarch/              0001 gl2 screen rotation, 0002 NEON asm syntax (clang)
+  emulationstation/       0001 install rules + /usr/share resources (AUR),
+                          0002 S30 input setup entries, no hotkey prompt
 build/
   build.sh                deps|linux|uboot|rootfs|initramfs|retroarch|fel|sdcard
   kernel.config           Fragment on top of sunxi_defconfig
@@ -69,9 +77,7 @@ build/
                           default launcher apps, retroarch.cfg, autoconfig
   fel.cmd / fel-ram.cmd   Boot scripts (fel.scr is also /boot/boot.scr on SD)
   splash/logo.bmp         U-Boot splash (stock logo, 320x480 panel-native)
-  u-boot/                 defconfig + patches 0001 DSI LCD, 0002 splash env,
-                          0003 exFAT on 32-bit ARM, 0004 AXP PEK restart bit
-retroarch/patches/        0001 gl2 screen rotation, 0002 NEON asm syntax (clang)
+  u-boot/                 defconfig + board devicetree
 launcher/                 Launcher (filebrowser.c) and joystick calibration
 utils/                    s30-fel (reboot into FEL), s30-volumed (volume keys,
                           jack), s30-display (DRM lease broker + OSD) with its
@@ -152,7 +158,7 @@ delay 20 ms
 - Mainline support: A33 DSI host is `sun6i_mipi_dsi` + `phy-sun6i-mipi-dphy`.
   Mainline has no ILI9488 DSI driver, hence `panel-ilitek-ili9488-dsi.c`
   (uses 6.15+ APIs: `devm_drm_panel_alloc`, `mipi_dsi_*_multi`).
-- U-Boot: mainline has no sunxi DSI support, so `build/u-boot/patches/0001-*`
+- U-Boot: mainline has no sunxi DSI support, so `patches/u-boot/0001-*`
   adds it to the legacy `sunxi_display` (DE1) driver: TCON0 in DSI/CPU mode
   (`lcdc_tcon0_mode_set_dsi`), a DSI host + D-PHY port of Linux
   `sun6i_mipi_dsi`/`phy-sun6i-mipi-dphy` (`drivers/video/sunxi/sun6i_dsi.c`),
@@ -175,7 +181,7 @@ delay 20 ms
     `tools/fel_dsi_test.py` drives DSI/DCS directly over FEL. FEL USB wedges
     after a few hundred `sunxi-fel` calls; power cycle to recover.
   To change the patch: edit `s30-build/u-boot`, then
-  `git diff -- . ':!arch/arm/dts/Makefile' ':!configs' > build/u-boot/patches/0001-...patch`
+  `git diff -- . ':!arch/arm/dts/Makefile' ':!configs' > patches/u-boot/0001-...patch`
   (new files need `git add -N` first).
 
 ## Stock firmware
@@ -299,7 +305,9 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   `x-powers,system-power-controller`, so poweroff cuts power via the AXP.
 - `s30-volumed` (utils/s30-volumed.c, respawned by init): volume keys
   (gpio-keys, polled, no autorepeat: the daemon repeats while held) step
-  "Headphone Playback Volume" (0-63, step 3; drives speaker and headphones)
+  "Master Playback Volume" (0-63, step 3; drives speaker and headphones;
+  the codec's headphone output volume, renamed in patches/linux/0001 since
+  the speaker amp is fed from that output; apps' "Master" defaults find it)
   for every app; level saved to `~/.config/volume` 2 s after the last change
   and restored at boot. RetroArch's volume hotkeys are unbound (`nul`).
   Also watches the codec's jack input device (`...-jack`, SW_HEADPHONE_INSERT)
@@ -407,7 +415,7 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   upstream already uses a system pugixml when found; `_LARGEFILE64_SOURCE`
   because musl >= 1.2.4 hides stat64), installed under
   $WORK/emulationstation-root and copied into the rootfs.
-- Patches (emulationstation/patches): 0001 from the AUR package (install
+- Patches (patches/emulationstation): 0001 from the AUR package (install
   rules, resources in /usr/share/EmulationStation); 0002 input setup without
   the right stick, right thumb and hotkey entries, and no hotkey prompt
   (games are exited from the power key's system menu).

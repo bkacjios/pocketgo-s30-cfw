@@ -1,11 +1,14 @@
 /*
  * s30-volumed: system volume from the volume keys (gpio-keys KEY_VOLUMEUP/
- * KEY_VOLUMEDOWN). Steps the codec's "Headphone Playback Volume", which
+ * KEY_VOLUMEDOWN). Steps the codec's "Master Playback Volume" (the headphone
+ * output stage, renamed by patches/linux/0001), which
  * drives both the headphones and the speaker amp, so it applies to every app.
  * The level is restored at start and saved to the file given as argument.
  * Holding a key repeats (gpio-keys-polled has no autorepeat).
  * Volume changes and headphones being plugged in or out are shown by
- * s30-display's OSD (output icon and volume bar).
+ * s30-display's OSD (output icon and volume bar). Changes made by others
+ * (EmulationStation's volume slider) arrive as ALSA control events: they
+ * are shown and saved the same way.
  *
  * Usage: s30-volumed STATE_FILE
  */
@@ -22,7 +25,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#define CONTROL "Headphone Playback Volume"
+#define CONTROL "Master Playback Volume"
 #define DEFAULT_LEVEL 40
 #define STEP 3
 #define REPEAT_DELAY_MS 400
@@ -32,6 +35,7 @@
 static snd_ctl_t *sCtl;
 static snd_ctl_elem_value_t *sVal;
 static long sMax;
+static long sLevel = -1; // last level set or seen: control events at it are our own
 
 #define OSD_SOCKET "/run/s30-display.sock"
 
@@ -84,6 +88,8 @@ static int open_mixer(void) {
 		return -1;
 	}
 	sMax = snd_ctl_elem_info_get_max(info);
+	snd_ctl_nonblock(sCtl, 1);
+	snd_ctl_subscribe_events(sCtl, 1); // changes by others
 	return 0;
 }
 
@@ -100,6 +106,29 @@ static void set_level(long level) {
 	if (snd_ctl_elem_write(sCtl, sVal) < 0) {
 		fprintf(stderr, "s30-volumed: cannot set " CONTROL "\n");
 	}
+	sLevel = level;
+}
+
+/* Control events: whether CONTROL was changed by someone else (now at a
+   level we didn't set) */
+static int changed_elsewhere(void) {
+	snd_ctl_event_t *ev;
+	int changed = 0;
+
+	snd_ctl_event_alloca(&ev);
+	while (snd_ctl_read(sCtl, ev) > 0) {
+		if (snd_ctl_event_get_type(ev) == SND_CTL_EVENT_ELEM &&
+		    snd_ctl_event_elem_get_mask(ev) != SND_CTL_EVENT_MASK_REMOVE &&
+		    (snd_ctl_event_elem_get_mask(ev) & SND_CTL_EVENT_MASK_VALUE) &&
+		    strcmp(snd_ctl_event_elem_get_name(ev), CONTROL) == 0) {
+			long level = get_level();
+			if (level >= 0 && level != sLevel) {
+				sLevel = level;
+				changed = 1;
+			}
+		}
+	}
+	return changed;
 }
 
 /* Headphones plugged in, from the codec's jack input device */
@@ -161,8 +190,8 @@ static void save_level(const char *path, long level) {
 }
 
 int main(int argc, char **argv) {
-	struct pollfd fds[2] = { { .events = POLLIN }, { .fd = -1, .events = POLLIN } };
-	struct pollfd *pfd = &fds[0], *jack = &fds[1];
+	struct pollfd fds[3] = { { .events = POLLIN }, { .fd = -1, .events = POLLIN }, { .fd = -1, .events = POLLIN } };
+	struct pollfd *pfd = &fds[0], *jack = &fds[1], *ctl = &fds[2];
 	int held = 0; // +1 / -1 while a key is down
 	int timeout, saveIn = -1;
 
@@ -179,11 +208,15 @@ int main(int argc, char **argv) {
 	}
 	set_level(load_level(argv[1]));
 	jack->fd = open_input("-jack", 1); // optional: no OSD on plug-in without it
+	if (snd_ctl_poll_descriptors(sCtl, ctl, 1) != 1) {
+		ctl->fd = -1;
+	}
+	ctl->events = POLLIN;
 
 	timeout = -1;
 	for (;;) {
 		int wait = held ? timeout : saveIn;
-		int n = poll(fds, 2, wait);
+		int n = poll(fds, 3, wait);
 
 		if (n < 0) {
 			if (errno == EINTR) {
@@ -208,6 +241,10 @@ int main(int argc, char **argv) {
 		struct input_event ev[16];
 		ssize_t len;
 
+		if (ctl->fd >= 0 && (ctl->revents & POLLIN) && changed_elsewhere()) {
+			show_osd(jack->fd);
+			saveIn = SAVE_DELAY_MS;
+		}
 		if (jack->revents & POLLIN) {
 			len = read(jack->fd, ev, sizeof(ev));
 			for (size_t i = 0; len > 0 && i < len / sizeof(ev[0]); i++) {
