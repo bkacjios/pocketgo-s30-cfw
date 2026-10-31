@@ -48,7 +48,8 @@
  *   "osd ICON PERCENT"       ICON: speaker, headphones, mute, charging,
  *                            battery; PERCENT 0-100
  *
- * Volume changes while the menu is open show the volume box above it.
+ * Volume changes while the menu is open show the volume box above it (eased
+ * and faded the same way).
  *
  * Usage: s30-display [BRIGHTNESS_FILE]
  */
@@ -138,9 +139,10 @@ static int sPadFd = -1;       // gamepad, grabbed while the menu is open
 static pid_t sKillPid;        // exiting app: SIGKILL at sKillAt if still there
 static uint64_t sKillAt;
 static uint64_t sWokeAt;      // last return from sleep
-static uint64_t sMenuOsdUntil; // volume box shown over the menu until then
 static char sBacklight[300];  // backlight sysfs directory, "" if none
-static int sBright, sBrightMax; // backlight level (brightness_min()..sBrightMax)
+static int sBright, sBrightMax; // backlight level wanted (brightness_min()..sBrightMax)
+static float sBrightShown;      // level in the backlight and on the slider, easing to sBright
+static int sBrightWritten = -1; // last level written to sysfs
 static int sRepeatDir;          // slider key held: -1 left, 1 right, 0 none
 static uint64_t sRepeatAt;
 static const char* sBrightFile; // where the level is saved, or NULL
@@ -436,16 +438,61 @@ static int menu_count(void) {
 static int brightness_min(void);
 static int brightness_step(void);
 
+/* Colour a over b by coverage f (0-1) */
+static uint32_t mix(uint32_t a, uint32_t b, float f) {
+	uint32_t r = (uint32_t)(((a >> 16) & 0xff) * f + ((b >> 16) & 0xff) * (1 - f));
+	uint32_t g = (uint32_t)(((a >> 8) & 0xff) * f + ((b >> 8) & 0xff) * (1 - f));
+
+	return (r << 16) | (g << 8) | (uint32_t)((a & 0xff) * f + (b & 0xff) * (1 - f));
+}
+
 /* Brightness row at y: sun, then a bar like the OSD's (white on the
-   selection, which is the bar's purple); the minimum shows one step */
+   selection, which is the bar's purple) at the easing level, its end pixel
+   blended; the minimum shows one step */
 static void draw_brightness_row(int y, int selected) {
 	const int barX = MENU_X + 36, barW = MENU_W - 36 - 12, barY = y + (MENU_ROW_H - 8) / 2;
 	const int lo = brightness_min(), step = brightness_step();
-	int full = sBrightMax > lo ? barW * (sBright - lo + step) / (sBrightMax - lo + step) : barW;
+	const uint32_t track = selected ? 0x3a2a70 : 0x404048, bar = selected ? 0xffffff : 0x8060e0;
+	float end = sBrightMax > lo ? barW * (sBrightShown - lo + step) / (sBrightMax - lo + step) : barW;
+	int full;
 
+	end = end < 0 ? 0 : end > barW ? barW : end;
+	full = (int)end;
 	draw_icon(kSun, MENU_X + 12, y + (MENU_ROW_H - 16) / 2, 1, argb(0xffffff, 1.0f));
-	fill(barX, barY, barW, 8, argb(selected ? 0x3a2a70 : 0x404048, 1.0f));
-	fill(barX, barY, full, 8, argb(selected ? 0xffffff : 0x8060e0, 1.0f));
+	fill(barX, barY, barW, 8, argb(track, 1.0f));
+	fill(barX, barY, full, 8, argb(bar, 1.0f));
+	if (full < barW && end > full) {
+		fill(barX + full, barY, 1, 8, argb(mix(bar, track, end - full), 1.0f));
+	}
+}
+
+/* The B button, 14x14 at 1x: a round button, the letter (6x8) cut in dark */
+static const char* const kButton[14] = {
+	"....######....", "..##########..", ".############.", ".############.", "##############",
+	"##############", "##############", "##############", "##############", "##############",
+	".############.", ".############.", "..##########..", "....######....",
+};
+static const char* const kLetterB[8] = { "#####.", "##..##", "##..##", "#####.", "##..##", "##..##", "##..##", "#####." };
+
+static void draw_button_b(int x0, int y0) {
+	int x, y;
+
+	for (y = 0; y < 14; y++) {
+		for (x = 0; x < 14; x++) {
+			if (kButton[y][x] == '#') {
+				int lx = x - 4, ly = y - 3; // the letter's cell
+				int letter = lx >= 0 && lx < 6 && ly >= 0 && ly < 8 && kLetterB[ly][lx] == '#';
+				put(x0 + x, y0 + y, argb(letter ? 0x101018 : 0xc8c8c8, 1.0f));
+			}
+		}
+	}
+}
+
+/* Top of menu row i */
+static int menu_row_y(int i) {
+	const int h = menu_count() * MENU_ROW_H + 2 * MENU_PAD;
+
+	return (PANEL_W - h) / 2 + MENU_PAD + i * MENU_ROW_H;
 }
 
 static void draw_menu(void) {
@@ -456,8 +503,9 @@ static void draw_menu(void) {
 
 	draw_box(MENU_X, y0, MENU_W, h, 0.92f);
 	draw_battery();
-	if (now_ms() < sMenuOsdUntil) {
-		draw_osd(BOX_X, BOX_Y, sIcon, sTarget, 1.0f);
+	fill(BOX_X, BOX_Y, BOX_W, BOX_H, 0); // the OSD box above the menu, as osd_frame left it
+	if (sAlpha > 0.0f) {
+		draw_osd(BOX_X, BOX_Y, sIcon, sShown, sAlpha);
 	}
 	for (i = 0; i < count; i++) {
 		int y = top + i * rowH;
@@ -468,8 +516,12 @@ static void draw_menu(void) {
 		if (items[i] == NULL) {
 			draw_brightness_row(y, i == sMenuSel);
 		} else {
-			int len = (int)strlen(items[i]);
-			draw_text(items[i], MENU_X + (MENU_W - len * 8) / 2, y + (rowH - 16) / 2, 1, argb(0xffffff, 1.0f));
+			int len = (int)strlen(items[i]), x = MENU_X + (MENU_W - len * 8) / 2;
+
+			draw_text(items[i], x, y + (rowH - 16) / 2, 1, argb(0xffffff, 1.0f));
+			if (sMenuLauncher ? i == SYS_CANCEL : i == APP_RESUME) {
+				draw_button_b(x - 6 - 14, y + (rowH - 14) / 2); // what B does
+			}
 		}
 	}
 }
@@ -495,6 +547,16 @@ static void present(void) {
 	}
 }
 
+/* Only landscape (lx, ly, lw, lh) of the back buffer: panel rows
+   BUF_W - lx - lw to BUF_W - lx, pixels ly to ly + lh */
+static void present_rect(int lx, int ly, int lw, int lh) {
+	int row;
+
+	for (row = BUF_W - lx - lw; row < BUF_W - lx; row++) {
+		memcpy(&sPixels[row * sPitch + ly], &sBack[row * BUF_H + ly], lh * sizeof(uint32_t));
+	}
+}
+
 /* Show the buffer's landscape (0, 0, lw, lh) as a box at landscape (lx, ly).
    Panel rectangle: x = ly, y = 479 - (lx + lw - 1); source rows from
    BUF_W - lw. */
@@ -511,10 +573,14 @@ static int set_plane(int lx, int ly, int lw, int lh) {
 }
 
 /* Draw now, after the next vblank (no tearing) */
-static void present_synced(void) {
+static void wait_vblank(void) {
 	drmVBlank vbl = { .request = { .type = DRM_VBLANK_RELATIVE, .sequence = 1 } };
 
 	drmWaitVBlank(sFd, &vbl);
+}
+
+static void present_synced(void) {
+	wait_vblank();
 	present();
 }
 
@@ -529,15 +595,6 @@ static void plane_off(void) {
 static void osd_show(const char* icon, int percent) {
 	if (!sMaster || sLessee == 0) {
 		return; // nobody on screen through a lease (the display isn't ours)
-	}
-	if (sMenu) {
-		// The plane is the menu's: the box is drawn with it, above the menu
-		snprintf(sIcon, sizeof(sIcon), "%s", icon);
-		sTarget = sShown = percent;
-		sMenuOsdUntil = now_ms() + OSD_MS;
-		draw_menu();
-		present_synced();
-		return;
 	}
 	snprintf(sIcon, sizeof(sIcon), "%s", icon);
 	sTarget = percent;
@@ -558,7 +615,7 @@ static void osd_show(const char* icon, int percent) {
 static int osd_frame(void) {
 	float want = now_ms() < sOsdUntil ? 1.0f : 0.0f;
 
-	if (!sPlaneOn || sMenu || (!sDirty && sAlpha == want && sShown == sTarget)) {
+	if (!sPlaneOn || (!sDirty && sAlpha == want && sShown == sTarget)) {
 		return 0;
 	}
 	if (sAlpha != want) {
@@ -569,8 +626,19 @@ static int osd_frame(void) {
 	if (sShown - sTarget < 0.2f && sTarget - sShown < 0.2f) {
 		sShown = sTarget;
 	}
-	draw_osd(0, 0, sIcon, sShown, sAlpha);
-	present_synced();
+	if (sMenu) {
+		// Above the menu (the plane is the menu's, the whole screen): redraw
+		// and copy in only the box's spot
+		fill(BOX_X, BOX_Y, BOX_W, BOX_H, 0);
+		if (sAlpha > 0.0f) {
+			draw_osd(BOX_X, BOX_Y, sIcon, sShown, sAlpha);
+		}
+		wait_vblank();
+		present_rect(BOX_X, BOX_Y, BOX_W, BOX_H);
+	} else {
+		draw_osd(0, 0, sIcon, sShown, sAlpha);
+		present_synced();
+	}
 	sDirty = 0;
 	return 1;
 }
@@ -642,7 +710,8 @@ static void menu_close(int exitApp) {
 		return;
 	}
 	sMenu = 0;
-	sMenuOsdUntil = 0;
+	sAlpha = 0.0f; // the OSD box goes with the menu
+	sOsdUntil = 0;
 	sRepeatDir = 0;
 	if (sLessee != 0) {
 		// Back to the (transparent) OSD box before the app runs again
@@ -744,20 +813,51 @@ static int brightness_step(void) {
 	return step > 1 ? step : 1;
 }
 
-static void brightness_set(int level) {
+static void brightness_write(int level) {
 	char path[320];
 	FILE* f;
 
-	if (sBacklight[0] == '\0') {
-		return;
-	}
-	sBright = level < brightness_min() ? brightness_min() : level > sBrightMax ? sBrightMax : level;
 	snprintf(path, sizeof(path), "%s/brightness", sBacklight);
 	f = fopen(path, "w");
 	if (f != NULL) {
-		fprintf(f, "%d\n", sBright);
+		fprintf(f, "%d\n", level);
 		fclose(f);
 	}
+	sBrightWritten = level;
+}
+
+/* The level to ease to (brightness_frame) */
+static void brightness_set(int level) {
+	if (sBacklight[0] != '\0') {
+		sBright = level < brightness_min() ? brightness_min() : level > sBrightMax ? sBrightMax : level;
+	}
+}
+
+/* One frame of easing the backlight (and the slider, while the menu is
+   open: only its row is copied in) to sBright; paced by the vblank, which
+   osd_frame may already have waited for. Returns whether more are needed. */
+static int brightness_frame(int vblankDone) {
+	int level;
+
+	if (sBacklight[0] == '\0' || sBrightShown == sBright) {
+		return 0;
+	}
+	sBrightShown += (sBright - sBrightShown) * EASE;
+	if (sBrightShown - sBright < 0.5f && sBright - sBrightShown < 0.5f) {
+		sBrightShown = sBright;
+	}
+	level = (int)(sBrightShown + 0.5f);
+	if (level != sBrightWritten) {
+		brightness_write(level);
+	}
+	if (!vblankDone) {
+		wait_vblank();
+	}
+	if (sMenu) {
+		draw_menu();
+		present_rect(MENU_X, menu_row_y(0), MENU_W, MENU_ROW_H);
+	}
+	return 1;
 }
 
 /* Find the backlight; restore the saved level */
@@ -788,6 +888,8 @@ static void brightness_init(void) {
 	if (sBrightFile != NULL && read_int(sBrightFile) > 0) {
 		brightness_set(read_int(sBrightFile));
 	}
+	sBrightShown = sBright; // at start: straight there
+	brightness_write(sBright);
 }
 
 /* The level to the brightness file (temp file, then rename) */
@@ -1119,6 +1221,8 @@ int main(int argc, char** argv) {
 		uint64_t t = now_ms();
 		int animating = osd_frame(); // waits for a vblank when drawing
 
+		animating |= brightness_frame(animating);
+
 		if (t >= sNextLeaseCheck) {
 			check_lease();
 			sNextLeaseCheck = t + LEASE_POLL_MS;
@@ -1130,13 +1234,6 @@ int main(int argc, char** argv) {
 		if (sMenu && sRepeatDir != 0 && t >= sRepeatAt) {
 			brightness_nudge(sRepeatDir); // slider key held
 			sRepeatAt = t + REPEAT_MS;
-			draw_menu();
-			present_synced();
-		}
-		if (sMenu && sMenuOsdUntil != 0 && t >= sMenuOsdUntil) {
-			// Volume box over the menu timed out
-			sMenuOsdUntil = 0;
-			fill(BOX_X, BOX_Y, BOX_W, BOX_H, 0);
 			draw_menu();
 			present_synced();
 		}

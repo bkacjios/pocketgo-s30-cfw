@@ -14,3 +14,10 @@
 	path = ports/oot
 	url = https://github.com/bkacjios/oot-s30.git
 	shallow = true
+[submodule "external/emulationstation"]
+	path = external/emulationstation
+	url = https://github.com/RetroPie/EmulationStation.git
+	shallow = true
+[submodule "external/es-theme-carbon"]
+	path = external/es-theme-carbon
+	url = https://github.com/RetroPie/es-theme-carbon.git

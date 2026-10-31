@@ -336,14 +336,18 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   drawn, else the old position flashes it). Lessee pid from SO_PEERCRED at
   lease time; gamepad grabbed while open. Row 0 of both menus is a
   brightness slider (sun icon + bar, D-pad left/right, held repeats; 32
-  steps from 25 % of the range, below which the screen is all but off; saved to the file given as argument,
+  steps from 25 % of the range, below which the screen is all but off; the
+  backlight and the bar ease to the new level per frame like the OSD bar,
+  only the slider row copied in; saved to the file given as argument,
   /mnt/sd/home/.config/brightness from inittab, 2 s after the last change,
   restored at start; A on it does nothing). Then over an app: Resume / Sleep /
   Exit game (SIGTERM, SIGKILL after 2 s); over the launcher: Sleep / Reboot /
-  Shut down / Cancel. The box is 160 px wide, 28 px rows of 1x 8x16 text
+  Shut down / Cancel; the row B also triggers (Resume / Cancel) has a 14 px
+  B button badge left of its text. The box is 160 px wide, 28 px rows of 1x 8x16 text
   (2x was too big), sized to its rows. Volume keys still work
   while it is open (s30-volumed's gpio-keys aren't grabbed); their OSD box
-  is drawn above the menu for 1.5 s. Battery box: see the launcher battery
+  is drawn above the menu, eased and faded like the normal OSD (only the
+  box's area is copied in per frame). Battery box: see the launcher battery
   below; redrawn on power_supply uevents.
   Text: kernel VGA 8x16 font (utils/osd_font.h from tools/make_osd_font.py).
 - Launcher text: the system menu's VGA 8x16 font (utils/osd_font.h, a glyph
