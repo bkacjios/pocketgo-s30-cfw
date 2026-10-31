@@ -293,9 +293,9 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
 - `HOME=/mnt/sd/home`, `XDG_RUNTIME_DIR=/run/user/0` from
   `/etc/profile.d/s30.sh` (login shells, rc, frontend; `ssh host cmd` is not
   a login shell and keeps HOME=/root).
-- System menu (s30-display, power key): Reboot / Shut down / Cancel over
-  the launcher (`reboot` / `poweroff` through init), Resume / Exit game over
-  an app. The PMIC node has
+- System menu (s30-display, power key): Sleep / Reboot / Shut down / Cancel
+  over the launcher (`reboot` / `poweroff` through init), Resume / Sleep /
+  Exit game over an app. The PMIC node has
   `x-powers,system-power-controller`, so poweroff cuts power via the AXP.
 - `s30-volumed` (utils/s30-volumed.c, respawned by init): volume keys
   (gpio-keys, polled, no autorepeat: the daemon repeats while held) step
@@ -331,9 +331,9 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   the resize commits happen while the lessee is SIGSTOPped, so they can't
   collide with its flips; the plane is cleared and moved before the menu is
   drawn, else the old position flashes it). Lessee pid from SO_PEERCRED at
-  lease time; gamepad grabbed while open. Over an app: Resume / Exit game
-  (SIGTERM, SIGKILL after 2 s); over the launcher: Reboot / Shut down /
-  Cancel. Text: kernel VGA 8x16 font (utils/osd_font.h from
+  lease time; gamepad grabbed while open. Over an app: Resume / Sleep / Exit
+  game (SIGTERM, SIGKILL after 2 s); over the launcher: Sleep / Reboot /
+  Shut down / Cancel (buffer 220x160 for four rows). Text: kernel VGA 8x16 font (utils/osd_font.h from
   tools/make_osd_font.py).
 - Launcher header battery: icon filled to the level (green > 50 %, yellow
   > 20 %, red), percentage inside, white bolt while `status` is Charging.
@@ -395,13 +395,17 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   the system menu (RetroArch's menu: L1+R1+Start+Select). Clean power-off: the
   system menu over the launcher (Shut down = `poweroff`, AXP
   system-power-controller).
-- Sleep (planned, not started): short press = s2idle (`echo freeze >
-  /sys/power/state`), press again = wake (AXP PEK IRQ), long press = AXP
-  hardware off as now. One button daemon would take over from s30-volumed
-  (volume + power); apps must survive ALSA suspend (ESTRPIPE). Needs a
-  decision first: RetroArch's menu is on the power key and would move (e.g.
-  `input_menu_toggle_gamepad_combo` Select+Start). Suspend-to-RAM would need
-  Crust firmware, which likely doesn't support the A33.
+- Sleep (built 2026-10-31, untested on hardware): "Sleep" in the system menu
+  (over apps and the launcher) clears the menu, syncs and writes `freeze` to
+  /sys/power/state (s2idle; CONFIG_SUSPEND/PM_SLEEP in kernel.config). The
+  app stays SIGSTOPped through sleep and resumes after wake. Wake = power key
+  (axp20x-pek is a wakeup source, r_intc supports set_wake); on the AXP223
+  the waking press still reaches userspace, so s30-display ignores power key
+  presses for 500 ms after waking. sun4i-drm suspends via
+  drm_mode_config_helper_suspend (panel off, state restored on resume). Long
+  press = AXP hardware off as before. Apps must survive ALSA suspend
+  (ESTRPIPE; RetroArch and SDL use snd_pcm_recover). Suspend-to-RAM would
+  need Crust firmware, which likely doesn't support the A33.
 - `reboot -f` (watchdog) warm-resets and boots the card again, with bit 2
   set or clear (RTC GP breadcrumbs survive). The old "reboot powers off"
   dated from the FEL dev loop, when the card had no U-Boot.
@@ -718,7 +722,8 @@ rsync -rt zelda data root@10.42.0.2:/mnt/sd/oot/
 
 ## Next session
 
-- User decision for sleep mode (where RetroArch's menu goes), then build it.
+- Test Sleep on hardware: panel off/on, wake on power key, audio after
+  resume, current draw while asleep (s2idle saves less than suspend-to-RAM).
 - Verify Shut down from the launcher actually cuts power.
 - `s30-fel` (reboot into FEL via nvmem-reboot-mode) is untested.
 - I2C errors to the gamepad MCU (addr 0x60) every ~5.6 s in dmesg; harmless

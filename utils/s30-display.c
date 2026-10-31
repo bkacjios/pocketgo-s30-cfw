@@ -25,13 +25,17 @@
  * works when the daemon is not involved.
  *
  * System menu: the power key (grabbed, so apps never see it) opens a menu
- * over whoever holds the lease: Resume / Exit game over an app, Reboot /
- * Shut down / Cancel over the launcher. That process is frozen (SIGSTOP) and
+ * over whoever holds the lease: Resume / Sleep / Exit game over an app, Sleep /
+ * Reboot / Shut down / Cancel over the launcher. That process is frozen (SIGSTOP) and
  * the gamepad grabbed while the menu is open; Exit sends SIGTERM, then
  * SIGKILL if it hasn't gone after EXIT_GRACE_MS. The
  * menu uses the same overlay plane (the display engine blends only one
  * alpha plane), resized: those commits happen while the app is frozen, so
  * they can't collide with its page flips.
+ *
+ * Sleep is s2idle ("freeze" to /sys/power/state, which returns on wake): the
+ * menu is cleared first, the app stays stopped until the system is back, and
+ * the power key press that woke it is ignored (WAKE_IGNORE_MS).
  *
  * Socket messages (SOCK_SEQPACKET, /run/s30-display.sock):
  *   "lease PATH"             PATH being opened; for the display card reply "ok"
@@ -74,6 +78,7 @@
 #define EASE 0.3f         // fraction of the remaining bar distance per frame
 #define LEASE_POLL_MS 250 // check whether the lessee has gone
 #define EXIT_GRACE_MS 2000 // after SIGTERM, before SIGKILL
+#define WAKE_IGNORE_MS 500 // power key presses after waking: the one that woke us
 
 /* The panel is 320x480 portrait, held landscape with its +x pointing down:
    landscape (x right, y down; 480x320) to panel is px = y, py = 479 - x */
@@ -83,7 +88,7 @@
 /* The overlay buffer, landscape BUF_W x BUF_H: the OSD box uses its top
    BOX_H rows, the menu all of it */
 #define BUF_W 220
-#define BUF_H 124
+#define BUF_H 160
 
 /* OSD box in landscape coordinates: centred near the top */
 #define BOX_W BUF_W
@@ -118,6 +123,7 @@ static int sMenuLauncher;     // the menu is over the launcher (power menu)
 static int sPadFd = -1;       // gamepad, grabbed while the menu is open
 static pid_t sKillPid;        // exiting app: SIGKILL at sKillAt if still there
 static uint64_t sKillAt;
+static uint64_t sWokeAt;      // last return from sleep
 
 static uint64_t now_ms(void) {
 	struct timespec t;
@@ -344,13 +350,13 @@ static void draw_osd(const char* icon, float percent, float alpha) {
 	}
 }
 
-enum { APP_RESUME, APP_EXIT };
-static const char* const kAppItems[] = { "Resume", "Exit game" };
-enum { SYS_REBOOT, SYS_POWEROFF, SYS_CANCEL };
-static const char* const kSysItems[] = { "Reboot", "Shut down", "Cancel" };
+enum { APP_RESUME, APP_SLEEP, APP_EXIT };
+static const char* const kAppItems[] = { "Resume", "Sleep", "Exit game" };
+enum { SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_CANCEL };
+static const char* const kSysItems[] = { "Sleep", "Reboot", "Shut down", "Cancel" };
 
 static int menu_count(void) {
-	return sMenuLauncher ? 3 : 2;
+	return sMenuLauncher ? 4 : 3;
 }
 
 static void draw_menu(void) {
@@ -553,7 +559,31 @@ static void run_system(const char* cmd) {
 	}
 }
 
+/* s2idle until a wakeup source (the power key) fires. The menu is cleared
+   first so the panel doesn't come back showing it; the app is still stopped
+   and resumes when the menu closes after waking. */
+static void system_sleep(void) {
+	int fd;
+
+	fill(0, 0, BUF_W, BUF_H, 0);
+	present_synced();
+	sync();
+	fd = open("/sys/power/state", O_WRONLY | O_CLOEXEC);
+	if (fd < 0 || write(fd, "freeze", 6) != 6) {
+		fprintf(stderr, "s30-display: sleep: %s\n", strerror(errno));
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
+	sWokeAt = now_ms();
+}
+
 static void menu_confirm(void) {
+	if ((sMenuLauncher && sMenuSel == SYS_SLEEP) || (!sMenuLauncher && sMenuSel == APP_SLEEP)) {
+		system_sleep();
+		menu_close(0);
+		return;
+	}
 	if (!sMenuLauncher) {
 		menu_close(sMenuSel == APP_EXIT);
 		return;
@@ -601,7 +631,8 @@ static void power_key(int fd) {
 	int i;
 
 	for (i = 0; n > 0 && i < (int)(n / sizeof(ev[0])); i++) {
-		if (ev[i].type == EV_KEY && ev[i].code == KEY_POWER && ev[i].value == 1) {
+		if (ev[i].type == EV_KEY && ev[i].code == KEY_POWER && ev[i].value == 1 &&
+		    now_ms() - sWokeAt >= WAKE_IGNORE_MS) {
 			if (sMenu) {
 				menu_close(0);
 			} else {
