@@ -22,3 +22,7 @@
 	path = external/es-theme-carbon
 	url = https://github.com/RetroPie/es-theme-carbon.git
 	shallow = true
+[submodule "ports/mm"]
+	path = ports/mm
+	url = https://github.com/bkacjios/mm-s30.git
+	shallow = true

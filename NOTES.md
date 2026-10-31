@@ -41,6 +41,7 @@ u-boot/                   Old U-Boot v2022.01 checkout (reference only, NOT buil
 external/                 Submodules, pinned: linux (v7.3), u-boot (v2026.10),
                           retroarch (v1.22.2). Built in worktrees under $WORK.
 ports/oot/                Submodule: Ocarina of Time port (bkacjios/oot-s30).
+ports/mm/                 Submodule: Majora's Mask port (bkacjios/mm-s30).
                           Other ports/ checkouts are not in this repo.
 s30-build/                $WORK: build trees (git worktrees of external/*,
                           patched there; sysroot) and outputs (boot/, rootfs.sqfs,
