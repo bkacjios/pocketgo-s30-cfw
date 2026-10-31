@@ -32,14 +32,17 @@ ROMs go in `/home/roms` on the card.
 ## Layout
 
 ```
-build/            build.sh, kernel config, U-Boot board files and patches,
+build/            build.sh, kernel config, U-Boot board files,
                   initramfs loader, rootfs overlay (init, launcher apps,
-                  RetroArch config), boot scripts, splash images
-linux/            Board devicetree, panel and gamepad drivers, kernel patches
+                  RetroArch and EmulationStation config), boot scripts,
+                  splash images
+linux/            Board devicetree, panel and gamepad drivers
+patches/          Patches to the submodules, one folder each: linux,
+                  u-boot, retroarch, emulationstation
 launcher/         s30-launcher (file browser) and joystick calibration
 utils/            Small system tools (volume daemon, splash, FEL reboot, ...)
-retroarch/        RetroArch patches
 tools/            Firmware decoding and host-side helpers
-external/         Submodules: linux, u-boot, retroarch
+external/         Submodules: linux, u-boot, retroarch, emulationstation,
+                  es-theme-carbon
 NOTES.md          Hardware and development notes
 ```

@@ -82,7 +82,7 @@ step_linux() {
 
 	# Kernel patches (idempotent: skip if already applied).
 	local patch
-	for patch in "$PROJECT"/linux/patches/*.patch; do
+	for patch in "$PROJECT"/patches/linux/*.patch; do
 		git -C "$src" apply --reverse --check "$patch" 2>/dev/null ||
 			git -C "$src" apply "$patch"
 	done
@@ -140,7 +140,7 @@ step_uboot() {
 
 	# Board patches (idempotent: skip if already applied).
 	local patch
-	for patch in "$HERE"/u-boot/patches/*.patch; do
+	for patch in "$PROJECT"/patches/u-boot/*.patch; do
 		git -C "$src" apply --reverse --check "$patch" 2>/dev/null ||
 			git -C "$src" apply "$patch"
 	done
@@ -261,12 +261,12 @@ step_launcher() {
 
 # RetroArch, cross-compiled with clang for armv7 musl against an Alpine
 # sysroot (Alpine -dev packages, resolved like build/packages), lean config
-# (KMS/EGL/GLES2, ALSA, udev) plus retroarch/patches. Output: $WORK/retroarch.bin
+# (KMS/EGL/GLES2, ALSA, udev) plus patches/retroarch. Output: $WORK/retroarch.bin
 step_retroarch() {
 	local src="$WORK/retroarch" sr="$WORK/sysroot"
 	local idx name ver repo patch t
 	upstream_tree retroarch
-	for patch in "$PROJECT"/retroarch/patches/*.patch; do
+	for patch in "$PROJECT"/patches/retroarch/*.patch; do
 		git -C "$src" apply --reverse --check "$patch" 2>/dev/null ||
 			git -C "$src" apply "$patch"
 	done
@@ -294,13 +294,13 @@ step_retroarch() {
 # EmulationStation (RetroPie's), cross-compiled with clang for armv7 musl
 # against the Alpine sysroot: Mesa GLES 2.0 renderer (the Mali-400 has no
 # GLES 3), Alpine's pugixml (not the bundled submodule), plus
-# emulationstation/patches (0001 from the AUR package: install rules,
+# patches/emulationstation (0001 from the AUR package: install rules,
 # resources in /usr/share/EmulationStation). Output: installed under
 # $WORK/emulationstation-root (/usr/bin/emulationstation, its resources)
 step_emulationstation() {
 	local src="$WORK/emulationstation" sr="$WORK/sysroot" patch
 	upstream_tree emulationstation
-	for patch in "$PROJECT"/emulationstation/patches/*.patch; do
+	for patch in "$PROJECT"/patches/emulationstation/*.patch; do
 		[ -e "$patch" ] || continue
 		git -C "$src" apply --reverse --check "$patch" 2>/dev/null ||
 			git -C "$src" apply "$patch"
