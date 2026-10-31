@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "../utils/osd_font.h"
 
 #include <fcntl.h>
 #include <linux/input.h>
@@ -7,7 +8,6 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#define FONT_DIR "/usr/share/libretro/assets/ozone"
 #define GAMEPAD_NAME "PocketGo S30 Gamepad"
 
 // Purple of s30-display's overlays (0x8060e0), lightened for text on black
@@ -16,26 +16,39 @@ const SDL_Color UI_TEXT = { 255, 255, 255, 255 };
 const SDL_Color UI_DIM = { 175, 175, 175, 255 };
 
 SDL_Renderer* gUiRenderer;
-TTF_Font* gUiFontBold;
-TTF_Font* gUiFontRegular;
-TTF_Font* gUiFontSmall;
 
 static SDL_Window* sWindow;
 static SDL_Texture* sCanvas;
+static SDL_Texture* sGlyphs; // the font's 95 glyphs in a row, white on transparent
 
 bool ui_init(void) {
-    if (SDL_Init(0) != 0 || TTF_Init() != 0) {
+    if (SDL_Init(0) != 0) {
         fprintf(stderr, "ui: SDL init failed: %s\n", SDL_GetError());
         return false;
     }
-    gUiFontBold = TTF_OpenFont(FONT_DIR "/bold.ttf", 16);
-    gUiFontRegular = TTF_OpenFont(FONT_DIR "/regular.ttf", 16);
-    gUiFontSmall = TTF_OpenFont(FONT_DIR "/bold.ttf", 12);
-    if (gUiFontBold == NULL || gUiFontRegular == NULL || gUiFontSmall == NULL) {
-        fprintf(stderr, "ui: fonts in %s: %s\n", FONT_DIR, TTF_GetError());
-        return false;
-    }
     return ui_video_open();
+}
+
+/* Glyph strip for ui_text (tinted per call with the colour mod) */
+static SDL_Texture* make_glyphs(void) {
+    static Uint32 px[UI_CHAR_H][95 * UI_CHAR_W];
+    SDL_Texture* t = SDL_CreateTexture(gUiRenderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC,
+                                       95 * UI_CHAR_W, UI_CHAR_H);
+    int c, x, y;
+
+    if (t == NULL) {
+        return NULL;
+    }
+    for (c = 0; c < 95; c++) {
+        for (y = 0; y < UI_CHAR_H; y++) {
+            for (x = 0; x < UI_CHAR_W; x++) {
+                px[y][c * UI_CHAR_W + x] = kOsdFont[c][y] & (0x80 >> x) ? 0xffffffff : 0;
+            }
+        }
+    }
+    SDL_UpdateTexture(t, NULL, px, sizeof(px[0]));
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    return t;
 }
 
 bool ui_video_open(void) {
@@ -58,7 +71,8 @@ bool ui_video_open(void) {
         return false;
     }
     sCanvas = SDL_CreateTexture(gUiRenderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, UI_W, UI_H);
-    if (sCanvas == NULL) {
+    sGlyphs = make_glyphs();
+    if (sCanvas == NULL || sGlyphs == NULL) {
         fprintf(stderr, "ui: canvas: %s\n", SDL_GetError());
         return false;
     }
@@ -66,10 +80,12 @@ bool ui_video_open(void) {
 }
 
 void ui_video_close(void) {
+    SDL_DestroyTexture(sGlyphs);
     SDL_DestroyTexture(sCanvas);
     SDL_DestroyRenderer(gUiRenderer);
     SDL_DestroyWindow(sWindow);
     sCanvas = NULL;
+    sGlyphs = NULL;
     gUiRenderer = NULL;
     sWindow = NULL;
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
@@ -95,20 +111,19 @@ void ui_present(void) {
     SDL_RenderPresent(gUiRenderer);
 }
 
-void ui_text(TTF_Font* font, const char* text, SDL_Color color, int x, int y, int maxW) {
-    SDL_Surface* s;
-    SDL_Texture* t;
-    SDL_Rect src, dst;
+/* `text` in 8x16 cells from (x, y), cut off at maxW pixels */
+void ui_text(const char* text, SDL_Color color, int x, int y, int maxW) {
+    int off;
 
-    if (text[0] == 0 || (s = TTF_RenderUTF8_Blended(font, text, color)) == NULL) {
-        return;
+    SDL_SetTextureColorMod(sGlyphs, color.r, color.g, color.b);
+    SDL_SetTextureAlphaMod(sGlyphs, color.a);
+    for (off = 0; *text != '\0' && off < maxW; text++, off += UI_CHAR_W) {
+        unsigned char c = (unsigned char)*text < 0x20 || (unsigned char)*text > 0x7e ? '?' : *text;
+        int w = maxW - off < UI_CHAR_W ? maxW - off : UI_CHAR_W;
+        SDL_Rect src = { (c - 0x20) * UI_CHAR_W, 0, w, UI_CHAR_H }, dst = { x + off, y, w, UI_CHAR_H };
+
+        SDL_RenderCopy(gUiRenderer, sGlyphs, &src, &dst);
     }
-    t = SDL_CreateTextureFromSurface(gUiRenderer, s);
-    src = (SDL_Rect){ 0, 0, s->w < maxW ? s->w : maxW, s->h };
-    dst = (SDL_Rect){ x, y, src.w, src.h };
-    SDL_RenderCopy(gUiRenderer, t, &src, &dst);
-    SDL_DestroyTexture(t);
-    SDL_FreeSurface(s);
 }
 
 int ui_pad_open(void) {

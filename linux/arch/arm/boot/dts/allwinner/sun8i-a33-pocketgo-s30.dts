@@ -63,12 +63,14 @@
 		};
 	};
 
-	/* fex [pwm0_para] + lcd_pwm_freq 50000 (20000 ns), lcd_pwm_pol 0 */
+	/*
+	 * fex [pwm0_para] + lcd_pwm_freq 50000 (20000 ns), lcd_pwm_pol 0. No
+	 * brightness-levels: the driver's own CIE 1931 table (perceptually even
+	 * steps), 1334 levels for this period; default the middle one.
+	 */
 	backlight: backlight {
 		compatible = "pwm-backlight";
 		pwms = <&pwm 0 20000 0>;
-		brightness-levels = <0 4 8 16 32 64 128 255>;
-		default-brightness-level = <5>;
 	};
 
 	/*

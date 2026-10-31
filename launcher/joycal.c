@@ -284,16 +284,16 @@ int main(void) {
         // --- Draw: raw stick on the left, corrected on the right ---
         ui_begin();
         if (phase == PH_CENTER) {
-            ui_text(gUiFontBold, "Let go of the stick...", UI_ACCENT, 12, 8, UI_W - 24);
+            ui_text("Let go of the stick...", UI_ACCENT, 12, 8, UI_W - 24);
         } else if (phase == PH_ROTATE) {
             snprintf(msg, sizeof(msg), "Rotate around the edge: %.1f / %.0f turns, %d%% of directions",
                      fabs(turns) < TURNS ? fabs(turns) : TURNS, TURNS, sFilled * 100 / BINS);
-            ui_text(gUiFontBold, msg, UI_ACCENT, 12, 8, UI_W - 24);
+            ui_text(msg, UI_ACCENT, 12, 8, UI_W - 24);
         } else {
-            ui_text(gUiFontBold, "Check the stick. A: save   B: redo   Start: quit", UI_ACCENT, 12, 8, UI_W - 24);
+            ui_text("Check the stick. A: save   B: redo   Start: quit", UI_ACCENT, 12, 8, UI_W - 24);
         }
-        ui_text(gUiFontRegular, "raw", UI_DIM, 110, 290, 60);
-        ui_text(gUiFontRegular, "calibrated", UI_DIM, 330, 290, 100);
+        ui_text("raw", UI_DIM, 110, 290, 60);
+        ui_text("calibrated", UI_DIM, 330, 290, 100);
 
         // Raw: 0-255 mapped to a 220 px box centred at (120, 160)
         draw_circle(120, 160, 110, UI_DIM);

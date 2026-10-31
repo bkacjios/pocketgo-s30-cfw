@@ -2,30 +2,29 @@
 #define S30_UI_H
 
 /* Shared UI for the S30 launcher apps: SDL2 on KMS with the GLES2 renderer,
-   a 480x320 landscape canvas rotated onto the portrait panel, Ozone fonts,
-   the gamepad from evdev. */
+   a 480x320 landscape canvas rotated onto the portrait panel, text in the
+   system menu's 8x16 font (utils/osd_font.h), the gamepad from evdev. */
 #include <SDL2/SDL.h>
-#include <SDL2/SDL_ttf.h>
 #include <stdbool.h>
 
 #define UI_W 480
 #define UI_H 320
 
+#define UI_CHAR_W 8 // text cells are 8x16
+#define UI_CHAR_H 16
+
 extern SDL_Renderer* gUiRenderer;
-extern TTF_Font* gUiFontBold;
-extern TTF_Font* gUiFontRegular;
-extern TTF_Font* gUiFontSmall; // bold, 12 px
 
 extern const SDL_Color UI_ACCENT;
 extern const SDL_Color UI_TEXT;
 extern const SDL_Color UI_DIM;
 
-bool ui_init(void);           // fonts + display
+bool ui_init(void);           // display
 bool ui_video_open(void);     // (re)acquire the display
 void ui_video_close(void);    // release it (e.g. while another app runs)
 void ui_begin(void);          // start drawing on the canvas (cleared black)
 void ui_present(void);        // canvas onto the panel
-void ui_text(TTF_Font* font, const char* text, SDL_Color color, int x, int y, int maxW);
+void ui_text(const char* text, SDL_Color color, int x, int y, int maxW); // ASCII; others '?'
 
 /* Gamepad (evdev "PocketGo S30 Gamepad") */
 int ui_pad_open(void);                 // fd or -1

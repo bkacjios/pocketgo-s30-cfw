@@ -25,13 +25,18 @@
  * works when the daemon is not involved.
  *
  * System menu: the power key (grabbed, so apps never see it) opens a menu
- * over whoever holds the lease: Resume / Sleep / Exit game over an app, Sleep /
- * Reboot / Shut down / Cancel over the launcher. That process is frozen (SIGSTOP) and
+ * over whoever holds the lease: a brightness slider (D-pad left/right; the
+ * level is saved to the file given as argument and restored at start), then
+ * Resume / Sleep / Exit game over an app, Sleep /
+ * Reboot / Shut down / Cancel over the launcher, with the battery (level, and a
+ * bolt while charging) in a small box in the screen's top right, where the
+ * launcher shows it. That process is frozen (SIGSTOP) and
  * the gamepad grabbed while the menu is open; Exit sends SIGTERM, then
  * SIGKILL if it hasn't gone after EXIT_GRACE_MS. The
  * menu uses the same overlay plane (the display engine blends only one
- * alpha plane), resized: those commits happen while the app is frozen, so
- * they can't collide with its page flips.
+ * alpha plane), resized to the whole screen (transparent around the menu and
+ * battery boxes): those commits happen while the app is frozen, so they can't
+ * collide with its page flips.
  *
  * Sleep is s2idle ("freeze" to /sys/power/state, which returns on wake): the
  * menu is cleared first, the app stays stopped until the system is back, and
@@ -43,7 +48,9 @@
  *   "osd ICON PERCENT"       ICON: speaker, headphones, mute, charging,
  *                            battery; PERCENT 0-100
  *
- * Usage: s30-display
+ * Volume changes while the menu is open show the volume box above it.
+ *
+ * Usage: s30-display [BRIGHTNESS_FILE]
  */
 #define _GNU_SOURCE // struct ucred
 #include <errno.h>
@@ -79,28 +86,34 @@
 #define LEASE_POLL_MS 250 // check whether the lessee has gone
 #define EXIT_GRACE_MS 2000 // after SIGTERM, before SIGKILL
 #define WAKE_IGNORE_MS 500 // power key presses after waking: the one that woke us
+#define SAVE_DELAY_MS 2000 // brightness saved this long after the last change
+#define BRIGHTNESS_STEPS 32   // slider positions from the minimum to full
+#define BRIGHTNESS_MIN_PCT 25 // of the backlight's range: lower is all but off
+#define REPEAT_DELAY_MS 400   // holding left/right on the slider repeats
+#define REPEAT_MS 60
 
 /* The panel is 320x480 portrait, held landscape with its +x pointing down:
    landscape (x right, y down; 480x320) to panel is px = y, py = 479 - x */
 #define PANEL_W 320
 #define PANEL_H 480
 
-/* The overlay buffer, landscape BUF_W x BUF_H: the OSD box uses its top
-   BOX_H rows, the menu all of it */
-#define BUF_W 220
-#define BUF_H 160
+/* The overlay buffer, the whole landscape screen: the OSD box uses its top
+   left BOX_W x BOX_H, the menu all of it (the plane shows only the part in
+   use, and only that part is copied in) */
+#define BUF_W PANEL_H
+#define BUF_H PANEL_W
 
 /* OSD box in landscape coordinates: centred near the top */
-#define BOX_W BUF_W
+#define BOX_W 220
 #define BOX_H 40
 #define BOX_X ((PANEL_H - BOX_W) / 2)
 #define BOX_Y 12
 
 /* Menu box: centred */
-#define MENU_W BUF_W
-#define MENU_H BUF_H
+#define MENU_W 160
+#define MENU_ROW_H 28
+#define MENU_PAD 6 // above the first row and below the last
 #define MENU_X ((PANEL_H - MENU_W) / 2)
-#define MENU_Y ((PANEL_W - MENU_H) / 2)
 
 static int sFd = -1;
 static char sCard[32]; // the display (KMS) card
@@ -111,6 +124,7 @@ static uint32_t sFb;         // overlay buffer, panel orientation (BUF_H x BUF_W
 static uint32_t* sPixels;    // the plane's buffer (scanned out)
 static uint32_t sPitch;      // in pixels
 static uint32_t sBack[BUF_W * BUF_H]; // frame being drawn, panel layout, pitch BUF_H
+static int sShowW = BOX_W, sShowH = BOX_H; // part of the buffer the plane shows (landscape, from 0, 0)
 static int sPlaneOn;          // overlay plane enabled (for the current lease)
 static char sIcon[16] = "speaker";
 static float sTarget, sShown; // bar percent: requested, drawn
@@ -124,6 +138,13 @@ static int sPadFd = -1;       // gamepad, grabbed while the menu is open
 static pid_t sKillPid;        // exiting app: SIGKILL at sKillAt if still there
 static uint64_t sKillAt;
 static uint64_t sWokeAt;      // last return from sleep
+static uint64_t sMenuOsdUntil; // volume box shown over the menu until then
+static char sBacklight[300];  // backlight sysfs directory, "" if none
+static int sBright, sBrightMax; // backlight level (brightness_min()..sBrightMax)
+static int sRepeatDir;          // slider key held: -1 left, 1 right, 0 none
+static uint64_t sRepeatAt;
+static const char* sBrightFile; // where the level is saved, or NULL
+static uint64_t sBrightSaveAt;
 
 static uint64_t now_ms(void) {
 	struct timespec t;
@@ -242,7 +263,7 @@ static void fill(int x0, int y0, int w, int h, uint32_t argb) {
 	}
 }
 
-/* 16x16 icons, drawn at 2x */
+/* 16x16 icons (the OSD's at 2x) */
 static const char* const kSpeaker[16] = {
 	"................", "........#.......", ".......##.......", "......###...#...",
 	".....####....#..", "########.#....#.", "########..#...#.", "########..#...#.",
@@ -274,29 +295,36 @@ static const char* const kHeadphones[16] = {
 	"####........####", ".##..........##.", "................", "................",
 };
 
-static void draw_icon(const char* const* icon, int x0, int y0, uint32_t argb) {
+static const char* const kSun[16] = {
+	"................", ".......#........", "..#....#....#...", "...#.......#....",
+	"......###.......", ".....#####......", "....#######.....", ".##.#######.##..",
+	"....#######.....", ".....#####......", "......###.......", "...#.......#....",
+	"..#....#....#...", ".......#........", "................", "................",
+};
+
+static void draw_icon(const char* const* icon, int x0, int y0, int scale, uint32_t argb) {
 	int x, y;
 
 	for (y = 0; y < 16; y++) {
 		for (x = 0; x < 16; x++) {
 			if (icon[y][x] == '#') {
-				fill(x0 + x * 2, y0 + y * 2, 2, 2, argb);
+				fill(x0 + x * scale, y0 + y * scale, scale, scale, argb);
 			}
 		}
 	}
 }
 
-/* Dark rounded box over (0, 0, w, h) */
-static void draw_box(int w, int h, float alpha) {
+/* Dark rounded box over (x0, y0, w, h) */
+static void draw_box(int x0, int y0, int w, int h, float alpha) {
 	const int corner[4] = { 3, 2, 1, 1 };
 	int i;
 
-	fill(0, 0, w, h, argb(0x101018, alpha));
+	fill(x0, y0, w, h, argb(0x101018, alpha));
 	for (i = 0; i < 4; i++) {
-		fill(0, i, corner[i], 1, 0);
-		fill(w - corner[i], i, corner[i], 1, 0);
-		fill(0, h - 1 - i, corner[i], 1, 0);
-		fill(w - corner[i], h - 1 - i, corner[i], 1, 0);
+		fill(x0, y0 + i, corner[i], 1, 0);
+		fill(x0 + w - corner[i], y0 + i, corner[i], 1, 0);
+		fill(x0, y0 + h - 1 - i, corner[i], 1, 0);
+		fill(x0 + w - corner[i], y0 + h - 1 - i, corner[i], 1, 0);
 	}
 }
 
@@ -316,9 +344,9 @@ static void draw_text(const char* text, int x0, int y0, int scale, uint32_t argb
 	}
 }
 
-/* The box at opacity `alpha`, bar at `percent` (fractional: the bar's end
-   pixel is blended, so it moves smoothly) */
-static void draw_osd(const char* icon, float percent, float alpha) {
+/* The box at (ox, oy) at opacity `alpha`, bar at `percent` (fractional: the
+   bar's end pixel is blended, so it moves smoothly) */
+static void draw_osd(int ox, int oy, const char* icon, float percent, float alpha) {
 	const int barX = 52, barW = BOX_W - barX - 14, barY = (BOX_H - 8) / 2;
 	const uint32_t track = 0x404048, bar = 0x8060e0;
 	int full;
@@ -329,49 +357,120 @@ static void draw_osd(const char* icon, float percent, float alpha) {
 		return;
 	}
 	percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
-	draw_box(BOX_W, BOX_H, 0.75f * alpha);
+	draw_box(ox, oy, BOX_W, BOX_H, 0.75f * alpha);
 	draw_icon(strcmp(icon, "headphones") == 0 ? kHeadphones
 	          : strcmp(icon, "mute") == 0     ? kMute
 	          : strcmp(icon, "charging") == 0 ? kCharging
 	          : strcmp(icon, "battery") == 0  ? kBattery
 	                                          : kSpeaker,
-	          10, (BOX_H - 32) / 2, argb(0xffffff, alpha));
+	          ox + 10, oy + (BOX_H - 32) / 2, 2, argb(0xffffff, alpha));
 	end = barW * percent / 100.0f;
 	full = (int)end;
 	frac = end - full;
-	fill(barX, barY, barW, 8, argb(track, alpha));
-	fill(barX, barY, full, 8, argb(bar, alpha));
+	fill(ox + barX, oy + barY, barW, 8, argb(track, alpha));
+	fill(ox + barX, oy + barY, full, 8, argb(bar, alpha));
 	if (full < barW && frac > 0.0f) {
 		// end pixel: bar over track by coverage
 		uint32_t r = (uint32_t)(((bar >> 16) & 0xff) * frac + ((track >> 16) & 0xff) * (1 - frac));
 		uint32_t g = (uint32_t)(((bar >> 8) & 0xff) * frac + ((track >> 8) & 0xff) * (1 - frac));
 		uint32_t b = (uint32_t)((bar & 0xff) * frac + (track & 0xff) * (1 - frac));
-		fill(barX + full, barY, 1, 8, argb((r << 16) | (g << 8) | b, alpha));
+		fill(ox + barX + full, oy + barY, 1, 8, argb((r << 16) | (g << 8) | b, alpha));
 	}
 }
 
-enum { APP_RESUME, APP_SLEEP, APP_EXIT };
-static const char* const kAppItems[] = { "Resume", "Sleep", "Exit game" };
-enum { SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_CANCEL };
-static const char* const kSysItems[] = { "Sleep", "Reboot", "Shut down", "Cancel" };
+static const char* const kBolt[7] = { "...##", "..##.", ".##..", "#####", "..##.", ".##..", "##..." };
+
+static int external_power(int* capacity, int* charging);
+
+/* Battery in a small box in the screen's top right, where the launcher
+   shows it (right edge 10 px in, centred 16 px down): a battery filled to
+   the level (green, yellow, red) with the percentage inside, and a bolt to
+   its left while charging (the battery itself never moves) */
+static void draw_battery(void) {
+	const int bw = 42, bh = 18, right = PANEL_H - 10, y = 16 - bh / 2, pad = 5;
+	int capacity, charging, len, x, left, i, j;
+	char text[8];
+	uint32_t level;
+
+	external_power(&capacity, &charging);
+	if (capacity < 0) {
+		return; // no fuel gauge
+	}
+	capacity = capacity > 100 ? 100 : capacity;
+	level = capacity > 50 ? 0x46c85a : capacity > 20 ? 0xebbe28 : 0xe13c32;
+	x = right - 3 - bw;
+	left = charging ? x - 4 - 10 : x;
+	draw_box(left - pad, y - pad, right - left + 2 * pad, bh + 2 * pad, 0.92f);
+	// Outline only: the empty part shows the box, as translucent as the menu
+	fill(x, y, bw, 1, argb(0xc8c8c8, 1.0f));
+	fill(x, y + bh - 1, bw, 1, argb(0xc8c8c8, 1.0f));
+	fill(x, y + 1, 1, bh - 2, argb(0xc8c8c8, 1.0f));
+	fill(x + bw - 1, y + 1, 1, bh - 2, argb(0xc8c8c8, 1.0f));
+	fill(x + 2, y + 2, (bw - 4) * capacity / 100, bh - 4, argb(level, 1.0f));
+	fill(x + bw, y + 5, 3, bh - 10, argb(0xc8c8c8, 1.0f)); // nub
+	// Percentage inside, shadowed (the digits are font rows 2-11: centred)
+	len = snprintf(text, sizeof(text), "%d%%", capacity);
+	draw_text(text, x + (bw - len * 8) / 2 + 1, y + bh / 2 - 7 + 1, 1, argb(0x000000, 1.0f));
+	draw_text(text, x + (bw - len * 8) / 2, y + bh / 2 - 7, 1, argb(0xffffff, 1.0f));
+	if (charging) {
+		for (j = 0; j < 7; j++) {
+			for (i = 0; i < 5; i++) {
+				if (kBolt[j][i] == '#') {
+					fill(left + i * 2, y + 2 + j * 2, 2, 2, argb(0xffffff, 1.0f));
+				}
+			}
+		}
+	}
+}
+
+/* Row 0 of both menus is the brightness slider (NULL) */
+enum { APP_BRIGHTNESS, APP_RESUME, APP_SLEEP, APP_EXIT };
+static const char* const kAppItems[] = { NULL, "Resume", "Sleep", "Exit game" };
+enum { SYS_BRIGHTNESS, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_CANCEL };
+static const char* const kSysItems[] = { NULL, "Sleep", "Reboot", "Shut down", "Cancel" };
 
 static int menu_count(void) {
-	return sMenuLauncher ? 4 : 3;
+	return sMenuLauncher ? 5 : 4;
+}
+
+static int brightness_min(void);
+static int brightness_step(void);
+
+/* Brightness row at y: sun, then a bar like the OSD's (white on the
+   selection, which is the bar's purple); the minimum shows one step */
+static void draw_brightness_row(int y, int selected) {
+	const int barX = MENU_X + 36, barW = MENU_W - 36 - 12, barY = y + (MENU_ROW_H - 8) / 2;
+	const int lo = brightness_min(), step = brightness_step();
+	int full = sBrightMax > lo ? barW * (sBright - lo + step) / (sBrightMax - lo + step) : barW;
+
+	draw_icon(kSun, MENU_X + 12, y + (MENU_ROW_H - 16) / 2, 1, argb(0xffffff, 1.0f));
+	fill(barX, barY, barW, 8, argb(selected ? 0x3a2a70 : 0x404048, 1.0f));
+	fill(barX, barY, full, 8, argb(selected ? 0xffffff : 0x8060e0, 1.0f));
 }
 
 static void draw_menu(void) {
 	const char* const* items = sMenuLauncher ? kSysItems : kAppItems;
-	const int rowH = 36, count = menu_count(), top = (MENU_H - count * rowH) / 2;
+	const int rowH = MENU_ROW_H, count = menu_count(), h = count * rowH + 2 * MENU_PAD;
+	const int y0 = (PANEL_W - h) / 2, top = y0 + MENU_PAD;
 	int i;
 
-	draw_box(MENU_W, MENU_H, 0.92f);
+	draw_box(MENU_X, y0, MENU_W, h, 0.92f);
+	draw_battery();
+	if (now_ms() < sMenuOsdUntil) {
+		draw_osd(BOX_X, BOX_Y, sIcon, sTarget, 1.0f);
+	}
 	for (i = 0; i < count; i++) {
-		int y = top + i * rowH, len = (int)strlen(items[i]);
+		int y = top + i * rowH;
 
 		if (i == sMenuSel) {
-			fill(10, y + 1, MENU_W - 20, rowH - 2, argb(0x8060e0, 1.0f));
+			fill(MENU_X + 6, y + 1, MENU_W - 12, rowH - 2, argb(0x8060e0, 1.0f));
 		}
-		draw_text(items[i], (MENU_W - len * 16) / 2, y + (rowH - 32) / 2, 2, argb(0xffffff, 1.0f));
+		if (items[i] == NULL) {
+			draw_brightness_row(y, i == sMenuSel);
+		} else {
+			int len = (int)strlen(items[i]);
+			draw_text(items[i], MENU_X + (MENU_W - len * 8) / 2, y + (rowH - 16) / 2, 1, argb(0xffffff, 1.0f));
+		}
 	}
 }
 
@@ -385,22 +484,28 @@ static void set_master(int on) {
 	}
 }
 
-/* Back buffer to the scanned-out one */
+/* Back buffer to the scanned-out one: the part the plane shows (landscape
+   x < sShowW is panel rows from BUF_W - sShowW, y < sShowH their first
+   sShowH pixels). The rest stays transparent: it is cleared while shown. */
 static void present(void) {
 	int row;
 
-	for (row = 0; row < BUF_W; row++) {
-		memcpy(&sPixels[row * sPitch], &sBack[row * BUF_H], BUF_H * sizeof(uint32_t));
+	for (row = BUF_W - sShowW; row < BUF_W; row++) {
+		memcpy(&sPixels[row * sPitch], &sBack[row * BUF_H], sShowH * sizeof(uint32_t));
 	}
 }
 
-/* Show the top `lh` landscape rows of the buffer as a lw x lh box at
-   landscape (lx, ly). Panel rectangle: x = ly, y = 479 - (lx + lw - 1). */
+/* Show the buffer's landscape (0, 0, lw, lh) as a box at landscape (lx, ly).
+   Panel rectangle: x = ly, y = 479 - (lx + lw - 1); source rows from
+   BUF_W - lw. */
 static int set_plane(int lx, int ly, int lw, int lh) {
-	if (drmModeSetPlane(sFd, sOverlay, sCrtc, sFb, 0, ly, PANEL_H - lx - lw, lh, lw, 0, 0, lh << 16, lw << 16) != 0) {
+	if (drmModeSetPlane(sFd, sOverlay, sCrtc, sFb, 0, ly, PANEL_H - lx - lw, lh, lw, 0, (BUF_W - lw) << 16, lh << 16,
+	                    lw << 16) != 0) {
 		fprintf(stderr, "s30-display: overlay: %s\n", strerror(errno));
 		return -1;
 	}
+	sShowW = lw;
+	sShowH = lh;
 	sPlaneOn = 1;
 	return 0;
 }
@@ -422,8 +527,17 @@ static void plane_off(void) {
 }
 
 static void osd_show(const char* icon, int percent) {
-	if (!sMaster || sLessee == 0 || sMenu) {
-		return; // nobody on screen through a lease (the display isn't ours), or the menu is up
+	if (!sMaster || sLessee == 0) {
+		return; // nobody on screen through a lease (the display isn't ours)
+	}
+	if (sMenu) {
+		// The plane is the menu's: the box is drawn with it, above the menu
+		snprintf(sIcon, sizeof(sIcon), "%s", icon);
+		sTarget = sShown = percent;
+		sMenuOsdUntil = now_ms() + OSD_MS;
+		draw_menu();
+		present_synced();
+		return;
 	}
 	snprintf(sIcon, sizeof(sIcon), "%s", icon);
 	sTarget = percent;
@@ -433,7 +547,7 @@ static void osd_show(const char* icon, int percent) {
 	sOsdUntil = now_ms() + OSD_MS;
 	sDirty = 1;
 	if (!sPlaneOn) {
-		draw_osd(sIcon, sShown, 0.0f); // starts transparent, fades in
+		draw_osd(0, 0, sIcon, sShown, 0.0f); // starts transparent, fades in
 		present();
 		set_plane(BOX_X, BOX_Y, BOX_W, BOX_H);
 	}
@@ -455,7 +569,7 @@ static int osd_frame(void) {
 	if (sShown - sTarget < 0.2f && sTarget - sShown < 0.2f) {
 		sShown = sTarget;
 	}
-	draw_osd(sIcon, sShown, sAlpha);
+	draw_osd(0, 0, sIcon, sShown, sAlpha);
 	present_synced();
 	sDirty = 0;
 	return 1;
@@ -517,7 +631,7 @@ static void menu_open(void) {
 	// plane still sits where the OSD box was until the move takes effect
 	fill(0, 0, BUF_W, BUF_H, 0);
 	present_synced();
-	set_plane(MENU_X, MENU_Y, MENU_W, MENU_H);
+	set_plane(0, 0, BUF_W, BUF_H);
 	draw_menu();
 	present_synced();
 }
@@ -528,6 +642,8 @@ static void menu_close(int exitApp) {
 		return;
 	}
 	sMenu = 0;
+	sMenuOsdUntil = 0;
+	sRepeatDir = 0;
 	if (sLessee != 0) {
 		// Back to the (transparent) OSD box before the app runs again
 		fill(0, 0, BUF_W, BUF_H, 0);
@@ -579,6 +695,9 @@ static void system_sleep(void) {
 }
 
 static void menu_confirm(void) {
+	if (sMenuSel == 0) {
+		return; // the brightness slider: left/right only
+	}
 	if ((sMenuLauncher && sMenuSel == SYS_SLEEP) || (!sMenuLauncher && sMenuSel == APP_SLEEP)) {
 		system_sleep();
 		menu_close(0);
@@ -594,6 +713,106 @@ static void menu_confirm(void) {
 	}
 }
 
+/* ---------------------------------------------------------------------------
+ * Brightness: the first backlight in sysfs, levels brightness_min()..max
+ * ------------------------------------------------------------------------- */
+
+static int read_int(const char* path) {
+	FILE* f = fopen(path, "r");
+	int v = -1;
+
+	if (f != NULL) {
+		if (fscanf(f, "%d", &v) != 1) {
+			v = -1;
+		}
+		fclose(f);
+	}
+	return v;
+}
+
+/* Lowest slider level: BRIGHTNESS_MIN_PCT of the range (the kernel's
+   default table is perceptual, so this is a quarter of full lightness, a few
+   percent of the backlight's power) */
+static int brightness_min(void) {
+	return sBrightMax * BRIGHTNESS_MIN_PCT / 100 > 1 ? sBrightMax * BRIGHTNESS_MIN_PCT / 100 : 1;
+}
+
+/* One slider step: BRIGHTNESS_STEPS positions from the minimum to full
+   (equal steps look equal on the perceptual table) */
+static int brightness_step(void) {
+	int step = (sBrightMax - brightness_min()) / (BRIGHTNESS_STEPS - 1);
+	return step > 1 ? step : 1;
+}
+
+static void brightness_set(int level) {
+	char path[320];
+	FILE* f;
+
+	if (sBacklight[0] == '\0') {
+		return;
+	}
+	sBright = level < brightness_min() ? brightness_min() : level > sBrightMax ? sBrightMax : level;
+	snprintf(path, sizeof(path), "%s/brightness", sBacklight);
+	f = fopen(path, "w");
+	if (f != NULL) {
+		fprintf(f, "%d\n", sBright);
+		fclose(f);
+	}
+}
+
+/* Find the backlight; restore the saved level */
+static void brightness_init(void) {
+	DIR* d = opendir("/sys/class/backlight");
+	struct dirent* e;
+	char path[320];
+
+	while (d != NULL && (e = readdir(d)) != NULL && sBacklight[0] == '\0') {
+		if (e->d_name[0] != '.') {
+			snprintf(sBacklight, sizeof(sBacklight), "/sys/class/backlight/%s", e->d_name);
+		}
+	}
+	if (d != NULL) {
+		closedir(d);
+	}
+	if (sBacklight[0] == '\0') {
+		return;
+	}
+	snprintf(path, sizeof(path), "%s/max_brightness", sBacklight);
+	sBrightMax = read_int(path);
+	snprintf(path, sizeof(path), "%s/brightness", sBacklight);
+	sBright = read_int(path);
+	if (sBrightMax <= 0) {
+		sBacklight[0] = '\0';
+		return;
+	}
+	if (sBrightFile != NULL && read_int(sBrightFile) > 0) {
+		brightness_set(read_int(sBrightFile));
+	}
+}
+
+/* The level to the brightness file (temp file, then rename) */
+static void brightness_save(void) {
+	char tmp[300];
+	FILE* f;
+
+	if (sBrightFile == NULL) {
+		return;
+	}
+	snprintf(tmp, sizeof(tmp), "%s.tmp", sBrightFile);
+	f = fopen(tmp, "w");
+	if (f != NULL) {
+		fprintf(f, "%d\n", sBright);
+		fclose(f);
+		rename(tmp, sBrightFile);
+	}
+}
+
+/* One slider step left (-1) or right (1); saved after SAVE_DELAY_MS */
+static void brightness_nudge(int dir) {
+	brightness_set(sBright + dir * brightness_step());
+	sBrightSaveAt = now_ms() + SAVE_DELAY_MS;
+}
+
 /* Gamepad events while the menu is open */
 static void menu_input(void) {
 	struct input_event ev[16];
@@ -601,14 +820,31 @@ static void menu_input(void) {
 	int i, redraw = 0;
 
 	for (i = 0; n > 0 && i < (int)(n / sizeof(ev[0])); i++) {
-		if (ev[i].type != EV_KEY || ev[i].value != 1) {
+		if (ev[i].type != EV_KEY) {
+			continue;
+		}
+		if (ev[i].value == 0 && (ev[i].code == BTN_DPAD_LEFT || ev[i].code == BTN_DPAD_RIGHT)) {
+			sRepeatDir = 0; // released
+			continue;
+		}
+		if (ev[i].value != 1) {
 			continue;
 		}
 		switch (ev[i].code) {
 			case BTN_DPAD_UP:
 			case BTN_DPAD_DOWN:
 				sMenuSel = (sMenuSel + (ev[i].code == BTN_DPAD_UP ? menu_count() - 1 : 1)) % menu_count();
+				sRepeatDir = 0;
 				redraw = 1;
+				break;
+			case BTN_DPAD_LEFT:
+			case BTN_DPAD_RIGHT:
+				if (sMenuSel == 0 && sBacklight[0] != '\0') {
+					sRepeatDir = ev[i].code == BTN_DPAD_RIGHT ? 1 : -1;
+					sRepeatAt = now_ms() + REPEAT_DELAY_MS;
+					brightness_nudge(sRepeatDir);
+					redraw = 1;
+				}
 				break;
 			case BTN_EAST: // A: confirm
 				menu_confirm();
@@ -707,14 +943,16 @@ static int read_sysfs(const char* dir, const char* attr, char* buf, size_t len) 
 	return ok;
 }
 
-/* Whether a mains or USB supply is online; battery capacity in *capacity */
-static int external_power(int* capacity) {
+/* Whether a mains or USB supply is online; battery capacity in *capacity
+   (-1 if none), *charging whether its status is Charging ("Full" is not) */
+static int external_power(int* capacity, int* charging) {
 	DIR* d = opendir(POWER_SUPPLY);
 	struct dirent* e;
 	char buf[32];
 	int online = 0;
 
 	*capacity = -1;
+	*charging = 0;
 	while (d != NULL && (e = readdir(d)) != NULL) {
 		if (e->d_name[0] == '.' || !read_sysfs(e->d_name, "type", buf, sizeof(buf))) {
 			continue;
@@ -722,6 +960,9 @@ static int external_power(int* capacity) {
 		if (strcmp(buf, "Battery") == 0) {
 			if (read_sysfs(e->d_name, "capacity", buf, sizeof(buf))) {
 				*capacity = atoi(buf);
+			}
+			if (read_sysfs(e->d_name, "status", buf, sizeof(buf))) {
+				*charging = strcmp(buf, "Charging") == 0;
 			}
 		} else if (read_sysfs(e->d_name, "online", buf, sizeof(buf)) && atoi(buf) == 1) {
 			online = 1;
@@ -735,11 +976,12 @@ static int external_power(int* capacity) {
 
 static int sPowerOnline = -1;
 
-/* A uevent arrived: show the OSD if external power came or went */
+/* A uevent arrived: show the OSD if external power came or went; keep the
+   menu's battery line current */
 static void power_changed(int nl) {
 	char buf[2048];
 	ssize_t n = recv(nl, buf, sizeof(buf) - 1, MSG_DONTWAIT);
-	int online, capacity, i, power = 0;
+	int online, capacity, charging, i, power = 0;
 
 	if (n <= 0) {
 		return;
@@ -751,7 +993,11 @@ static void power_changed(int nl) {
 	if (!power) {
 		return;
 	}
-	online = external_power(&capacity);
+	if (sMenu) {
+		draw_menu();
+		present_synced();
+	}
+	online = external_power(&capacity, &charging);
 	if (online != sPowerOnline) {
 		sPowerOnline = online;
 		osd_show(online ? "charging" : "battery", capacity < 0 ? 0 : capacity);
@@ -761,13 +1007,13 @@ static void power_changed(int nl) {
 static int open_uevents(void) {
 	struct sockaddr_nl sa = { .nl_family = AF_NETLINK, .nl_groups = 1 };
 	int nl = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT);
-	int capacity;
+	int capacity, charging;
 
 	if (nl >= 0 && bind(nl, (struct sockaddr*)&sa, sizeof(sa)) != 0) {
 		close(nl);
 		nl = -1;
 	}
-	sPowerOnline = external_power(&capacity); // the state at start is not news
+	sPowerOnline = external_power(&capacity, &charging); // the state at start is not news
 	return nl;
 }
 
@@ -820,11 +1066,13 @@ static void handle_client(int c) {
 	}
 }
 
-int main(void) {
+int main(int argc, char** argv) {
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
-	int srv, nl, power, i;
+	int srv, nl, power, i, timeout;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	sBrightFile = argc > 1 ? argv[1] : NULL;
+	brightness_init();
 	{
 		// Wake promptly after a vblank (short bursts; blocks otherwise).
 		// musl's sched_setscheduler() is a stub: the system call itself.
@@ -875,6 +1123,23 @@ int main(void) {
 			check_lease();
 			sNextLeaseCheck = t + LEASE_POLL_MS;
 		}
+		if (sBrightSaveAt != 0 && t >= sBrightSaveAt) {
+			brightness_save(); // one SD card write per adjustment
+			sBrightSaveAt = 0;
+		}
+		if (sMenu && sRepeatDir != 0 && t >= sRepeatAt) {
+			brightness_nudge(sRepeatDir); // slider key held
+			sRepeatAt = t + REPEAT_MS;
+			draw_menu();
+			present_synced();
+		}
+		if (sMenu && sMenuOsdUntil != 0 && t >= sMenuOsdUntil) {
+			// Volume box over the menu timed out
+			sMenuOsdUntil = 0;
+			fill(BOX_X, BOX_Y, BOX_W, BOX_H, 0);
+			draw_menu();
+			present_synced();
+		}
 		if (sKillAt != 0 && t >= sKillAt) {
 			if (sKillPid == sAppPid && kill(sKillPid, 0) == 0) {
 				kill(sKillPid, SIGKILL); // didn't exit on SIGTERM
@@ -882,7 +1147,12 @@ int main(void) {
 			sKillAt = 0;
 		}
 		// poll() ignores entries with a negative fd
-		if (poll(p, 4, animating ? 0 : (int)(sOsdUntil > t && sPlaneOn ? sOsdUntil - t : LEASE_POLL_MS)) <= 0) {
+		timeout = animating ? 0 : (int)(sOsdUntil > t && sPlaneOn ? sOsdUntil - t : LEASE_POLL_MS);
+		if (sMenu && sRepeatDir != 0) {
+			int r = sRepeatAt > t ? (int)(sRepeatAt - t) : 0; // next slider repeat
+			timeout = r < timeout ? r : timeout;
+		}
+		if (poll(p, 4, timeout) <= 0) {
 			continue;
 		}
 		if (power >= 0 && (p[2].revents & POLLIN)) {

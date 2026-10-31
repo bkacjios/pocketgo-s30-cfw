@@ -232,7 +232,7 @@ ensure_sysroot() {
 
 # Device programs. Launcher apps (launcher/): filebrowser.c, the boot UI that
 # starts RetroArch, OoT and other apps, and joycal.c, the joystick
-# calibration; ui.c is shared. SDL2 (KMS) + SDL2_ttf. Utilities (utils/):
+# calibration; ui.c is shared. SDL2 (KMS), text in utils/osd_font.h. Utilities (utils/):
 # s30-fel, s30-volumed, s30-splash, s30-keyheld, s30-display and its preload
 # libs30lease.so. Output: $WORK/{launcher,joycal,s30-*}.bin, $WORK/libs30lease.so
 step_launcher() {
@@ -241,7 +241,7 @@ step_launcher() {
 	for app in filebrowser:launcher joycal:joycal; do
 		"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/${app#*:}.bin" \
 			"$PROJECT/launcher/${app%%:*}.c" "$PROJECT/launcher/ui.c" \
-			-I"$WORK/sysroot/usr/include/SDL2" -lSDL2 -lSDL2_ttf -lm
+			-I"$WORK/sysroot/usr/include/SDL2" -lSDL2 -lm
 		llvm-strip "$WORK/${app#*:}.bin"
 		ls -l "$WORK/${app#*:}.bin"
 	done

@@ -326,17 +326,34 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   `axp20x-usb`) with the battery level, never "full" or a permanent battery.
   Restarting the daemon revokes the running app's lease (black screen):
   restart the launcher with it.
-  System menu (power key, `axp20x-pek` grabbed): the plane is resized to a
-  centred box (only one alpha plane can blend, so it reuses the OSD plane;
+  System menu (power key, `axp20x-pek` grabbed): the plane is resized to the
+  whole screen, transparent around a centred menu box and a battery box in
+  the top right where the launcher has it (only one alpha plane can blend,
+  so it reuses the OSD plane; the buffer is screen-sized, the OSD box uses
+  its top-left 220x40 and only the shown part is copied in;
   the resize commits happen while the lessee is SIGSTOPped, so they can't
   collide with its flips; the plane is cleared and moved before the menu is
   drawn, else the old position flashes it). Lessee pid from SO_PEERCRED at
-  lease time; gamepad grabbed while open. Over an app: Resume / Sleep / Exit
-  game (SIGTERM, SIGKILL after 2 s); over the launcher: Sleep / Reboot /
-  Shut down / Cancel (buffer 220x160 for four rows). Text: kernel VGA 8x16 font (utils/osd_font.h from
-  tools/make_osd_font.py).
-- Launcher header battery: icon filled to the level (green > 50 %, yellow
-  > 20 %, red), percentage inside, white bolt while `status` is Charging.
+  lease time; gamepad grabbed while open. Row 0 of both menus is a
+  brightness slider (sun icon + bar, D-pad left/right, held repeats; 32
+  steps from 25 % of the range, below which the screen is all but off; saved to the file given as argument,
+  /mnt/sd/home/.config/brightness from inittab, 2 s after the last change,
+  restored at start; A on it does nothing). Then over an app: Resume / Sleep /
+  Exit game (SIGTERM, SIGKILL after 2 s); over the launcher: Sleep / Reboot /
+  Shut down / Cancel. The box is 160 px wide, 28 px rows of 1x 8x16 text
+  (2x was too big), sized to its rows. Volume keys still work
+  while it is open (s30-volumed's gpio-keys aren't grabbed); their OSD box
+  is drawn above the menu for 1.5 s. Battery box: see the launcher battery
+  below; redrawn on power_supply uevents.
+  Text: kernel VGA 8x16 font (utils/osd_font.h from tools/make_osd_font.py).
+- Launcher text: the system menu's VGA 8x16 font (utils/osd_font.h, a glyph
+  texture tinted per call; no bold (double-striking looked bad); non-ASCII bytes show
+  as '?'); SDL2_ttf is no longer linked.
+- Battery (launcher header and system menu, same look and place: right edge
+  10 px in, centred 16 px down): 42x18 outlined battery filled to the level
+  (green > 50 %, yellow > 20 %, red), the percentage inside in the 8x16 font
+  with a shadow, a pixel bolt to its left while `status` is Charging (the
+  battery doesn't move). Over a game the system menu shows it in a small box.
 - `s30-fel` (utils/s30-fel.c): `reboot(RESTART2, "fel")`; the DT's
   nvmem-reboot-mode writes 0x5aa5a55a to RTC GP register 2 (an nvmem cell
   of the RTC), which boot0 checks once.
@@ -563,7 +580,9 @@ layout and does not match it; use `sdcard`.
   opened first; Linux gates it between accesses.
 - Known issue: WARN at boot from `drm_connector_set_panel_orientation()` in
   the panel's get_modes (property created after DRM registration). Cosmetic.
-- Backlight PWM is active high (verified).
+- Backlight PWM is active high (verified). The DT has no brightness-levels
+  (was 8 hand-picked levels): pwm-backlight's own CIE 1931 table, 1334
+  levels for the 20000 ns period, default the middle one.
 
 ## Ocarina of Time port (ports/oot, submodule) (started 2026-10-29)
 

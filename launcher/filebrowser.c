@@ -182,42 +182,45 @@ static int battery(bool* charging) {
     return pct;
 }
 
-/* Battery icon at (x, y), 45x20: filled to the level in green, yellow or
-   red, the percentage inside; a lightning bolt to its left while charging */
-static void draw_battery(int x, int y, int pct, bool charging) {
-    const int w = 42, h = 20;
-    SDL_Rect body = { x, y, w, h }, nub = { x + w, y + 6, 3, h - 12 };
-    SDL_Rect fill = { x + 2, y + 2, (w - 4) * (pct > 100 ? 100 : pct) / 100, h - 4 };
+/* Battery, right-aligned to `right` and centred on `cy`, as in the system
+   menu (s30-display): filled to the level in green, yellow or red with the
+   percentage inside, a pixel bolt to its left while charging (the battery
+   itself never moves) */
+static void draw_battery(int right, int cy, int pct, bool charging) {
+    static const char* const bolt[7] = { "...##", "..##.", ".##..", "#####", "..##.", ".##..", "##..." };
+    const int bw = 42, bh = 18, y = cy - bh / 2, x = right - 3 - bw;
     SDL_Color c = pct > 50 ? (SDL_Color){ 70, 200, 90, 255 }
                   : pct > 20 ? (SDL_Color){ 235, 190, 40, 255 }
                              : (SDL_Color){ 225, 60, 50, 255 };
-    const SDL_Color shadow = { 0, 0, 0, 255 };
     char text[8];
-    int tw = 0, th = 0;
+    int len, i, j;
 
-    SDL_SetRenderDrawColor(gUiRenderer, 30, 30, 30, 255);
+    pct = pct > 100 ? 100 : pct;
+    SDL_Rect body = { x, y, bw, bh }, inner = { x + 1, y + 1, bw - 2, bh - 2 };
+    SDL_Rect fill = { x + 2, y + 2, (bw - 4) * pct / 100, bh - 4 }, nub = { x + bw, y + 5, 3, bh - 10 };
+    SDL_SetRenderDrawColor(gUiRenderer, 200, 200, 200, 255);
     SDL_RenderFillRect(gUiRenderer, &body);
+    SDL_RenderFillRect(gUiRenderer, &nub);
+    SDL_SetRenderDrawColor(gUiRenderer, 30, 30, 30, 255);
+    SDL_RenderFillRect(gUiRenderer, &inner);
     SDL_SetRenderDrawColor(gUiRenderer, c.r, c.g, c.b, 255);
     SDL_RenderFillRect(gUiRenderer, &fill);
-    SDL_SetRenderDrawColor(gUiRenderer, 200, 200, 200, 255);
-    SDL_RenderDrawRect(gUiRenderer, &body);
-    SDL_RenderFillRect(gUiRenderer, &nub);
 
-    snprintf(text, sizeof(text), "%d%%", pct);
-    TTF_SizeUTF8(gUiFontSmall, text, &tw, &th);
-    ui_text(gUiFontSmall, text, shadow, x + (w - tw) / 2 + 1, y + (h - th) / 2 + 1, w);
-    ui_text(gUiFontSmall, text, UI_TEXT, x + (w - tw) / 2, y + (h - th) / 2, w);
+    // Percentage inside, shadowed (the digits are font rows 2-11: centred)
+    len = snprintf(text, sizeof(text), "%d%%", pct);
+    ui_text(text, (SDL_Color){ 0, 0, 0, 255 }, x + (bw - len * 8) / 2 + 1, y + bh / 2 - 7 + 1, bw);
+    ui_text(text, UI_TEXT, x + (bw - len * 8) / 2, y + bh / 2 - 7, bw);
 
     if (charging) {
-        // Bolt: two triangles, 10x18
-        const SDL_Color bolt = { 255, 255, 255, 255 };
-        const float bx = x - 14, by = y + 1;
-        SDL_Vertex v[6] = {
-            { { bx + 7, by + 0 }, bolt, { 0, 0 } },  { { bx + 0, by + 10 }, bolt, { 0, 0 } },
-            { { bx + 6, by + 10 }, bolt, { 0, 0 } }, { { bx + 4, by + 8 }, bolt, { 0, 0 } },
-            { { bx + 10, by + 8 }, bolt, { 0, 0 } }, { { bx + 3, by + 18 }, bolt, { 0, 0 } },
-        };
-        SDL_RenderGeometry(gUiRenderer, NULL, v, 6, NULL, 0);
+        SDL_SetRenderDrawColor(gUiRenderer, 255, 255, 255, 255);
+        for (j = 0; j < 7; j++) {
+            for (i = 0; i < 5; i++) {
+                if (bolt[j][i] == '#') {
+                    SDL_Rect r = { x - 14 + i * 2, y + 2 + j * 2, 2, 2 };
+                    SDL_RenderFillRect(gUiRenderer, &r);
+                }
+            }
+        }
     }
 }
 
@@ -229,9 +232,9 @@ static void render(void) {
     ui_begin();
 
     // Header: current folder, battery
-    ui_text(gUiFontBold, sDir.path, UI_ACCENT, 10, 6, SCRW - 90);
+    ui_text(sDir.path, UI_ACCENT, 10, 8, SCRW - 90);
     if (pct >= 0) {
-        draw_battery(SCRW - 53, 6, pct, charging);
+        draw_battery(SCRW - 10, 16, pct, charging);
     }
     SDL_SetRenderDrawColor(gUiRenderer, 60, 60, 60, 255);
     SDL_RenderDrawLine(gUiRenderer, 8, LIST_Y - 6, SCRW - 8, LIST_Y - 6);
@@ -243,7 +246,7 @@ static void render(void) {
         sDir.scroll = sDir.selected - VISIBLE_ROWS + 1;
     }
     if (sDir.count == 0) {
-        ui_text(gUiFontRegular, "(empty)", UI_DIM, 18, LIST_Y, SCRW - 36);
+        ui_text("(empty)", UI_DIM, 18, LIST_Y + 2, SCRW - 36);
     }
     for (i = sDir.scroll; i < sDir.count && i < sDir.scroll + VISIBLE_ROWS; i++) {
         int y = LIST_Y + (i - sDir.scroll) * ROW_H;
@@ -255,8 +258,8 @@ static void render(void) {
             SDL_RenderFillRect(gUiRenderer, &bar);
         }
         snprintf(label, sizeof(label), "%s%s", sDir.entries[i].name, sDir.entries[i].isDir ? "/" : "");
-        ui_text(gUiFontRegular, label, i == sDir.selected ? UI_TEXT : sDir.entries[i].isDir ? UI_DIM : UI_TEXT,
-                18, y, SCRW - 36);
+        ui_text(label, i == sDir.selected ? UI_TEXT : sDir.entries[i].isDir ? UI_DIM : UI_TEXT,
+                18, y + 2, SCRW - 36);
     }
     ui_present();
 }
