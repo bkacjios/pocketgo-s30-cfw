@@ -80,6 +80,7 @@
 #include <xf86drmMode.h>
 
 #include "osd_font.h"
+#include "s30-frames.h"
 
 #define SOCKET_PATH "/run/s30-display.sock"
 #define OSD_MS 1500       // OSD visible after the last message
@@ -139,6 +140,10 @@ static int sDirty;            // needs a redraw
 static uint64_t sOsdUntil, sNextLeaseCheck;
 static pid_t sAppPid;         // process holding the lease
 static int sMenu, sMenuSel;   // system menu open, selected item
+static int sMenuPage;         // 0: main, 1: settings
+static int sPerf;             // performance overlay on
+static char sPerfFile[320];   // where sPerf is saved ("" if nowhere)
+static uint64_t sPerfNext;    // next overlay update (0: now)
 static int sMenuLauncher;     // the menu is over the launcher (power menu)
 static int sPadFd = -1;       // gamepad, grabbed while the menu is open
 static pid_t sKillPid;        // exiting app: SIGKILL at sKillAt if still there
@@ -416,14 +421,21 @@ static int osd_is_battery(void) {
 	return strcmp(sIcon, "battery") == 0 || strcmp(sIcon, "charging") == 0;
 }
 
-/* Row 0 of both menus is the brightness slider (NULL) */
-enum { APP_BRIGHTNESS, APP_RESUME, APP_SLEEP, APP_EXIT };
-static const char* const kAppItems[] = { NULL, "Resume", "Sleep", "Exit game" };
-enum { SYS_BRIGHTNESS, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_CANCEL };
-static const char* const kSysItems[] = { NULL, "Sleep", "Reboot", "Shut down", "Cancel" };
+/* Row 0 of both main menus opens the settings page: the brightness slider
+   (NULL), the performance overlay switch, back */
+enum { APP_SETTINGS, APP_RESUME, APP_SLEEP, APP_EXIT };
+static const char* const kAppItems[] = { "Settings", "Resume", "Sleep", "Exit game" };
+enum { SYS_SETTINGS, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_CANCEL };
+static const char* const kSysItems[] = { "Settings", "Sleep", "Reboot", "Shut down", "Cancel" };
+enum { SET_BRIGHTNESS, SET_PERF, SET_BACK };
+static const char* const kSetItems[] = { NULL, "Overlay", "Back" };
 
 static int menu_count(void) {
-	return sMenuLauncher ? 5 : 4;
+	return sMenuPage ? 3 : sMenuLauncher ? 5 : 4;
+}
+
+static int on_brightness_row(void) {
+	return sMenuPage == 1 && sMenuSel == SET_BRIGHTNESS;
 }
 
 static int brightness_min(void);
@@ -487,7 +499,7 @@ static int menu_row_y(int i) {
 }
 
 static void draw_menu(void) {
-	const char* const* items = sMenuLauncher ? kSysItems : kAppItems;
+	const char* const* items = sMenuPage ? kSetItems : sMenuLauncher ? kSysItems : kAppItems;
 	const int rowH = MENU_ROW_H, count = menu_count(), h = count * rowH + 2 * MENU_PAD;
 	const int y0 = (PANEL_W - h) / 2, top = y0 + MENU_PAD;
 	int i, capacity, charging;
@@ -508,10 +520,18 @@ static void draw_menu(void) {
 		if (items[i] == NULL) {
 			draw_brightness_row(y, i == sMenuSel);
 		} else {
-			int len = (int)strlen(items[i]), x = MENU_X + (MENU_W - len * 8) / 2;
+			char label[32];
+			int len, x;
 
-			draw_text(items[i], x, y + (rowH - 16) / 2, 1, argb(0xffffff, 1.0f));
-			if (sMenuLauncher ? i == SYS_CANCEL : i == APP_RESUME) {
+			if (sMenuPage && i == SET_PERF) {
+				snprintf(label, sizeof(label), "%s: %s", items[i], sPerf ? "On" : "Off");
+			} else {
+				snprintf(label, sizeof(label), "%s", items[i]);
+			}
+			len = (int)strlen(label);
+			x = MENU_X + (MENU_W - len * 8) / 2;
+			draw_text(label, x, y + (rowH - 16) / 2, 1, argb(0xffffff, 1.0f));
+			if (sMenuPage ? i == SET_BACK : sMenuLauncher ? i == SYS_CANCEL : i == APP_RESUME) {
 				draw_button_b(x - 6 - 14, y + (rowH - 14) / 2); // what B does
 			}
 		}
@@ -584,6 +604,12 @@ static void plane_off(void) {
 	sAlpha = 0.0f;
 }
 
+/* Plane height outside the menu: the OSD strip, or the whole screen while
+   the performance overlay is on */
+static int plane_h(void) {
+	return sPerf ? BUF_H : STRIP_H;
+}
+
 static void osd_show(const char* icon, int percent) {
 	if (!sMaster || sLessee == 0) {
 		return; // nobody on screen through a lease (the display isn't ours)
@@ -596,9 +622,10 @@ static void osd_show(const char* icon, int percent) {
 	sOsdUntil = now_ms() + OSD_MS;
 	sDirty = 1;
 	if (!sPlaneOn) {
-		fill(0, 0, BUF_W, STRIP_H, 0); // starts transparent, fades in
-		present();
-		set_plane(0, 0, BUF_W, STRIP_H);
+		fill(0, 0, BUF_W, BUF_H, 0); // starts transparent, fades in
+		present_rect(0, 0, BUF_W, BUF_H);
+		set_plane(0, 0, BUF_W, plane_h());
+		sPerfNext = 0;
 	}
 }
 
@@ -634,7 +661,8 @@ static int osd_frame(void) {
 		} else if (sAlpha > 0.0f) {
 			draw_osd(BOX_X, BOX_Y, sIcon, sShown, sAlpha);
 		}
-		present_synced();
+		wait_vblank();
+		present_rect(0, 0, BUF_W, STRIP_H); // the strip only (the plane may be the whole screen)
 	}
 	sDirty = 0;
 	return 1;
@@ -689,6 +717,7 @@ static void menu_open(void) {
 	}
 	kill(sAppPid, SIGSTOP);
 	sMenu = 1;
+	sMenuPage = 0;
 	sMenuSel = sMenuLauncher ? SYS_CANCEL : APP_RESUME;
 	sAlpha = 0.0f;
 	sOsdUntil = 0;
@@ -711,10 +740,12 @@ static void menu_close(int exitApp) {
 	sOsdUntil = 0;
 	sRepeatDir = 0;
 	if (sLessee != 0) {
-		// Back to the (transparent) OSD strip before the app runs again
+		// Back to the (transparent) OSD strip, or the whole screen for the
+		// performance overlay, before the app runs again
 		fill(0, 0, BUF_W, BUF_H, 0);
 		present_synced();
-		set_plane(0, 0, BUF_W, STRIP_H);
+		set_plane(0, 0, BUF_W, plane_h());
+		sPerfNext = 0; // overlay back at once
 	}
 	if (sPadFd >= 0) {
 		ioctl(sPadFd, EVIOCGRAB, 0);
@@ -760,9 +791,33 @@ static void system_sleep(void) {
 	sWokeAt = now_ms();
 }
 
+/* The whole menu again (a page change resizes the box) */
+static void menu_redraw(void) {
+	fill(0, 0, BUF_W, BUF_H, 0);
+	draw_menu();
+	present_synced();
+}
+
+static void perf_save(void);
+
 static void menu_confirm(void) {
-	if (sMenuSel == 0) {
+	if (sMenuPage) {
+		if (sMenuSel == SET_PERF) {
+			sPerf = !sPerf;
+			perf_save();
+			menu_redraw();
+		} else if (sMenuSel == SET_BACK) {
+			sMenuPage = 0;
+			sMenuSel = 0;
+			menu_redraw();
+		}
 		return; // the brightness slider: left/right only
+	}
+	if (sMenuSel == 0) {
+		sMenuPage = 1; // settings
+		sMenuSel = SET_BRIGHTNESS;
+		menu_redraw();
+		return;
 	}
 	if ((sMenuLauncher && sMenuSel == SYS_SLEEP) || (!sMenuLauncher && sMenuSel == APP_SLEEP)) {
 		system_sleep();
@@ -938,7 +993,7 @@ static void menu_input(void) {
 				break;
 			case BTN_DPAD_LEFT:
 			case BTN_DPAD_RIGHT:
-				if (sMenuSel == 0 && sBacklight[0] != '\0') {
+				if (on_brightness_row() && sBacklight[0] != '\0') {
 					sRepeatDir = ev[i].code == BTN_DPAD_RIGHT ? 1 : -1;
 					sRepeatAt = now_ms() + REPEAT_DELAY_MS;
 					brightness_nudge(sRepeatDir);
@@ -949,7 +1004,14 @@ static void menu_input(void) {
 				menu_confirm();
 				return;
 			case BTN_SOUTH: // B: back
-				menu_close(0);
+				if (sMenuPage) {
+					sMenuPage = 0;
+					sMenuSel = 0;
+					sRepeatDir = 0;
+					menu_redraw();
+				} else {
+					menu_close(0);
+				}
 				return;
 		}
 	}
@@ -1167,13 +1229,338 @@ static void handle_client(int c) {
 	}
 }
 
+/* ---------------------------------------------------------------------------
+ * Performance overlay (Settings > Overlay), like MangoHud: FPS and frame
+ * times of the app on screen (from the page flips libs30lease.so marks in the
+ * S30_FRAMES_PATH ring), CPU, GPU, temperatures, memory, battery. A box at
+ * the left edge; the plane covers the whole screen while it is on.
+ * ------------------------------------------------------------------------- */
+
+#define PERF_MS 100         // redraw (FPS and the graph)
+#define PERF_SAMPLE_MS 1000 // system stats
+#define PERF_X 4
+#define PERF_W 176
+#define PERF_GRAPH_H 28
+#define PERF_LINES 7
+#define PERF_H (6 + 16 + PERF_GRAPH_H + 4 + (PERF_LINES - 1) * 16 + 6)
+#define PERF_Y ((BUF_H - PERF_H) / 2)
+#define PERF_GRAPH_MS 100.0f // graph full height
+
+static S30Frames* sFrames;
+static char sGpuFreq[300], sPmicTemp[300];
+static char sPerfLine[PERF_LINES - 1][40]; // system stat lines, label first
+static int sPerfLabelLen[PERF_LINES - 1];
+static uint64_t sPerfSampleAt;
+
+static int read_line(const char* path, char* buf, size_t len) {
+	FILE* f = fopen(path, "r");
+	int ok = f != NULL && fgets(buf, len, f) != NULL;
+
+	if (f != NULL) {
+		fclose(f);
+	}
+	return ok;
+}
+
+static long read_long(const char* path) {
+	char buf[64];
+
+	return read_line(path, buf, sizeof(buf)) ? atol(buf) : -1;
+}
+
+static void perf_save(void) {
+	FILE* f;
+
+	if (sPerfFile[0] == '\0') {
+		return;
+	}
+	f = fopen(sPerfFile, "w");
+	if (f != NULL) {
+		fprintf(f, "%d\n", sPerf);
+		fclose(f);
+	}
+}
+
+/* Where things are; the saved switch (next to the brightness file) */
+static void perf_init(void) {
+	DIR* d;
+	struct dirent* e;
+	int fd;
+
+	if (sBrightFile != NULL) {
+		const char* slash = strrchr(sBrightFile, '/');
+		int dirLen = slash != NULL ? (int)(slash - sBrightFile) : 0;
+
+		snprintf(sPerfFile, sizeof(sPerfFile), "%.*s%sperf_overlay", dirLen, sBrightFile, dirLen ? "/" : "");
+		sPerf = read_int(sPerfFile) == 1;
+	}
+	d = opendir("/sys/class/devfreq");
+	while (d != NULL && (e = readdir(d)) != NULL) {
+		if (strstr(e->d_name, "gpu") != NULL) {
+			snprintf(sGpuFreq, sizeof(sGpuFreq), "/sys/class/devfreq/%s/cur_freq", e->d_name);
+		}
+	}
+	if (d != NULL) {
+		closedir(d);
+	}
+	// The PMIC's IIO device (the SoC sensor is a thermal zone)
+	d = opendir("/sys/bus/iio/devices");
+	while (d != NULL && (e = readdir(d)) != NULL) {
+		char link[300], target[300];
+		ssize_t n;
+
+		snprintf(link, sizeof(link), "/sys/bus/iio/devices/%s", e->d_name);
+		n = readlink(link, target, sizeof(target) - 1);
+		if (n > 0 && (target[n] = '\0', strstr(target, "axp") != NULL)) {
+			snprintf(sPmicTemp, sizeof(sPmicTemp), "%s/in_temp", link);
+		}
+	}
+	if (d != NULL) {
+		closedir(d);
+	}
+	// The frame ring the apps' shim writes
+	unlink(S30_FRAMES_PATH);
+	fd = open(S30_FRAMES_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+	if (fd >= 0) {
+		fchmod(fd, 0666);
+		if (ftruncate(fd, sizeof(S30Frames)) == 0) {
+			void* m = mmap(NULL, sizeof(S30Frames), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+			sFrames = m == MAP_FAILED ? NULL : m;
+		}
+		close(fd);
+	}
+}
+
+/* CPU load per core and in total since the last call (/proc/stat) */
+static void cpu_load(int* total, int core[4]) {
+	static unsigned long long prevBusy[5], prevAll[5];
+	char line[256];
+	FILE* f = fopen("/proc/stat", "r");
+	int i;
+
+	*total = 0;
+	for (i = 0; i < 4; i++) {
+		core[i] = -1;
+	}
+	while (f != NULL && fgets(line, sizeof(line), f) != NULL && strncmp(line, "cpu", 3) == 0) {
+		unsigned long long v[8] = { 0 }, all = 0, busy;
+		int idx = line[3] == ' ' ? 0 : atoi(line + 3) + 1, k;
+		char* p = line + 3;
+
+		if (idx > 4) {
+			continue;
+		}
+		while (*p != ' ' && *p != '\0') {
+			p++;
+		}
+		sscanf(p, "%llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+		for (k = 0; k < 8; k++) {
+			all += v[k];
+		}
+		busy = all - v[3] - v[4]; // minus idle and iowait
+		if (all > prevAll[idx]) {
+			int pct = (int)(100 * (busy - prevBusy[idx]) / (all - prevAll[idx]));
+			if (idx == 0) {
+				*total = pct;
+			} else {
+				core[idx - 1] = pct;
+			}
+		}
+		prevBusy[idx] = busy;
+		prevAll[idx] = all;
+	}
+	if (f != NULL) {
+		fclose(f);
+	}
+}
+
+static long meminfo(const char* key) {
+	char line[128];
+	FILE* f = fopen("/proc/meminfo", "r");
+	long v = -1;
+
+	while (f != NULL && fgets(line, sizeof(line), f) != NULL) {
+		if (strncmp(line, key, strlen(key)) == 0) {
+			v = atol(line + strlen(key));
+			break;
+		}
+	}
+	if (f != NULL) {
+		fclose(f);
+	}
+	return v;
+}
+
+/* The system stat lines, once a second */
+static void perf_sample(void) {
+	char path[340], buf[64];
+	int total, core[4], n = 0, capacity, charging;
+	long soc = read_long("/sys/class/thermal/thermal_zone0/temp"), pmic = -1000000, v = -1, ma = 0;
+	long memTotal = meminfo("MemTotal:"), memAvail = meminfo("MemAvailable:");
+	DIR* d;
+	struct dirent* e;
+
+	cpu_load(&total, core);
+#define LINE(label, ...)                                                                       \
+	do {                                                                                       \
+		int l_ = snprintf(sPerfLine[n], sizeof(sPerfLine[n]), "%s", label);                    \
+		snprintf(sPerfLine[n] + l_, sizeof(sPerfLine[n]) - l_, __VA_ARGS__);                   \
+		sPerfLabelLen[n++] = l_;                                                               \
+	} while (0)
+	LINE("CPU ", "%3d%% %4ldMHz", total, read_long("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") / 1000);
+	LINE("    ", "%3d %3d %3d %3d", core[0], core[1], core[2], core[3]);
+	LINE("GPU ", "%4ldMHz", sGpuFreq[0] ? read_long(sGpuFreq) / 1000000 : 0);
+	if (sPmicTemp[0]) {
+		long raw, ofs, scale;
+		snprintf(path, sizeof(path), "%s_raw", sPmicTemp);
+		raw = read_long(path);
+		snprintf(path, sizeof(path), "%s_offset", sPmicTemp);
+		ofs = read_long(path);
+		snprintf(path, sizeof(path), "%s_scale", sPmicTemp);
+		scale = read_long(path);
+		pmic = (raw + ofs) * scale; // millidegrees
+	}
+	if (soc > -1000000 && soc != -1) {
+		LINE("TEMP", " SoC %2ldC PMU %2ldC", soc / 1000, pmic / 1000);
+	} else {
+		LINE("TEMP", " PMU %2ldC", pmic / 1000);
+	}
+	LINE("RAM ", "%3ld/%3ldMB", (memTotal - memAvail) / 1024, memTotal / 1024);
+	external_power(&capacity, &charging);
+	d = opendir(POWER_SUPPLY);
+	while (d != NULL && (e = readdir(d)) != NULL) {
+		if (e->d_name[0] != '.' && read_sysfs(e->d_name, "type", buf, sizeof(buf)) && strcmp(buf, "Battery") == 0) {
+			snprintf(path, sizeof(path), POWER_SUPPLY "/%s/voltage_now", e->d_name);
+			v = read_long(path);
+			snprintf(path, sizeof(path), POWER_SUPPLY "/%s/current_now", e->d_name);
+			ma = read_long(path) / 1000;
+			if (!charging && ma > 0) {
+				ma = -ma; // drawn from the battery
+			}
+		}
+	}
+	if (d != NULL) {
+		closedir(d);
+	}
+	LINE("BAT ", "%3d%% %ld.%02ldV %+ldmA", capacity, v / 1000000, v % 1000000 / 10000, ma);
+#undef LINE
+}
+
+/* Frame intervals (ms) of the app on screen, newest last, into out[max];
+   count returned; *fps over the last second */
+static int frame_times(float* out, int max, int* fps, uint64_t nowNs) {
+	uint32_t count, i, first;
+	int n = 0;
+
+	*fps = 0;
+	if (sFrames == NULL || (count = sFrames->count) < 2) {
+		return 0;
+	}
+	__sync_synchronize();
+	if (nowNs - sFrames->ns[(count - 1) % S30_FRAMES_N] > 1000000000ull) {
+		return 0; // no frames for a second: nothing to show
+	}
+	first = count > (uint32_t)max + 1 ? count - (uint32_t)max - 1 : 0;
+	first = count - first > S30_FRAMES_N ? count - S30_FRAMES_N : first;
+	for (i = first + 1; i < count; i++) {
+		uint64_t a = sFrames->ns[(i - 1) % S30_FRAMES_N], b = sFrames->ns[i % S30_FRAMES_N];
+		out[n++] = (b - a) / 1e6f;
+	}
+	for (i = count; i > 0 && i + S30_FRAMES_N > count; i--) {
+		if (nowNs - sFrames->ns[(i - 1) % S30_FRAMES_N] > 1000000000ull) {
+			break;
+		}
+		(*fps)++;
+	}
+	return n;
+}
+
+static void perf_draw(uint64_t nowMs) {
+	const int x0 = PERF_X + 6, gy = PERF_Y + 6 + 16 + 2, bars = (PERF_W - 12) / 2;
+	float ft[96];
+	int n, fps, i, y;
+	char text[40];
+	float avg = 0, worst = 0;
+
+	n = frame_times(ft, bars, &fps, nowMs * 1000000ull);
+	for (i = 0; i < n; i++) {
+		avg += ft[i];
+		worst = ft[i] > worst ? ft[i] : worst;
+	}
+	avg = n ? avg / n : 0;
+	fill(PERF_X, PERF_Y, PERF_W, PERF_H, 0);
+	draw_box(PERF_X, PERF_Y, PERF_W, PERF_H, 0.6f);
+	// FPS and frame time
+	draw_text("FPS", x0, PERF_Y + 6, 1, argb(0xe0a050, 1.0f));
+	if (n) {
+		snprintf(text, sizeof(text), "%3d %5.1fms", fps, avg);
+	} else {
+		snprintf(text, sizeof(text), "  - ");
+	}
+	draw_text(text, x0 + 4 * 8, PERF_Y + 6, 1, argb(0xffffff, 1.0f));
+	// Frame time graph, newest at the right: bars to PERF_GRAPH_MS; a spike
+	// (over 1.5x the average) in red; a line at the average
+	fill(x0, gy, PERF_W - 12, PERF_GRAPH_H, argb(0x000000, 0.35f));
+	for (i = 0; i < n; i++) {
+		int h = (int)(ft[i] / PERF_GRAPH_MS * PERF_GRAPH_H + 0.5f);
+		int bx = x0 + (bars - n + i) * 2;
+
+		h = h < 1 ? 1 : h > PERF_GRAPH_H ? PERF_GRAPH_H : h;
+		fill(bx, gy + PERF_GRAPH_H - h, 2, h, argb(ft[i] > avg * 1.5f ? 0xe04040 : 0x60d060, 1.0f));
+	}
+	if (n) {
+		int ay = gy + PERF_GRAPH_H - (int)(avg / PERF_GRAPH_MS * PERF_GRAPH_H + 0.5f);
+		if (ay >= gy) {
+			fill(x0, ay, PERF_W - 12, 1, argb(0xffffff, 0.5f));
+		}
+	}
+	(void)worst;
+	// System stats
+	y = gy + PERF_GRAPH_H + 4;
+	for (i = 0; i < PERF_LINES - 1; i++, y += 16) {
+		char label[8];
+
+		snprintf(label, sizeof(label), "%.*s", sPerfLabelLen[i], sPerfLine[i]);
+		draw_text(label, x0, y, 1, argb(0xe0a050, 1.0f));
+		draw_text(sPerfLine[i] + sPerfLabelLen[i], x0 + sPerfLabelLen[i] * 8, y, 1, argb(0xffffff, 1.0f));
+	}
+	wait_vblank();
+	present_rect(PERF_X, PERF_Y, PERF_W, PERF_H);
+}
+
+/* Main loop step: the overlay over an app, every PERF_MS. Returns the time
+   to the next step (ms), or -1 when off. */
+static int perf_frame(uint64_t t) {
+	if (!sPerf || sMenu || !sMaster || sLessee == 0) {
+		return -1;
+	}
+	if (!sPlaneOn || sShowH != BUF_H) {
+		// The plane over the whole screen (set once per app, like the OSD's)
+		fill(0, 0, BUF_W, BUF_H, 0);
+		present_rect(0, 0, BUF_W, BUF_H);
+		set_plane(0, 0, BUF_W, BUF_H);
+		sPerfNext = 0;
+	}
+	if (t < sPerfNext) {
+		return (int)(sPerfNext - t);
+	}
+	if (t >= sPerfSampleAt) {
+		perf_sample();
+		sPerfSampleAt = t + PERF_SAMPLE_MS;
+	}
+	perf_draw(t);
+	sPerfNext = t + PERF_MS;
+	return PERF_MS;
+}
+
 int main(int argc, char** argv) {
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
-	int srv, nl, power, i, timeout;
+	int srv, nl, power, i, timeout, perfWait;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	sBrightFile = argc > 1 ? argv[1] : NULL;
 	brightness_init();
+	perf_init();
 	{
 		// Wake promptly after a vblank (short bursts; blocks otherwise).
 		// musl's sched_setscheduler() is a stub: the system call itself.
@@ -1221,6 +1608,7 @@ int main(int argc, char** argv) {
 		int animating = osd_frame(); // waits for a vblank when drawing
 
 		animating |= brightness_frame(animating);
+		perfWait = perf_frame(now_ms());
 
 		if (t >= sNextLeaseCheck) {
 			check_lease();
@@ -1247,6 +1635,9 @@ int main(int argc, char** argv) {
 		if (sMenu && sRepeatDir != 0) {
 			int r = sRepeatAt > t ? (int)(sRepeatAt - t) : 0; // next slider repeat
 			timeout = r < timeout ? r : timeout;
+		}
+		if (perfWait >= 0 && perfWait < timeout) {
+			timeout = perfWait; // next overlay update
 		}
 		if (poll(p, 4, timeout) <= 0) {
 			continue;

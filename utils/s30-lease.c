@@ -7,6 +7,10 @@
  *
  * Falls back to the real open when the daemon is not running or refuses
  * (then the app is master on its own, as without the shim).
+ *
+ * Frame timing for the daemon's performance overlay: each page flip the app
+ * queues (drmModePageFlip, or an atomic commit that isn't a test) is
+ * timestamped into the shared ring S30_FRAMES_PATH (s30-frames.h).
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -15,10 +19,14 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "s30-frames.h"
 
 #define SOCKET_PATH "/run/s30-display.sock"
 #define CONNECT_TRIES 20 // 50 ms apart: the daemon may still be starting at boot
@@ -105,4 +113,65 @@ int openat(int dirfd, const char* path, int flags, ...) {
 		real_openat = (int (*)(int, const char*, int, ...))dlsym(RTLD_NEXT, "openat");
 	}
 	return real_openat(dirfd, path, flags, mode);
+}
+
+/* ---------------------------------------------------------------------------
+ * Frame timing
+ * ------------------------------------------------------------------------- */
+
+static void frame_mark(void) {
+	static S30Frames* ring;
+	static int tried;
+	struct timespec t;
+	uint32_t i;
+
+	if (!tried) {
+		int fd = open(S30_FRAMES_PATH, O_RDWR | O_CLOEXEC); // not a card: the real open
+
+		tried = 1;
+		if (fd >= 0) {
+			void* m = mmap(NULL, sizeof(S30Frames), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+			ring = m == MAP_FAILED ? NULL : m;
+			close(fd);
+		}
+	}
+	if (ring == NULL) {
+		return;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	i = ring->count;
+	ring->ns[i % S30_FRAMES_N] = (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
+	__sync_synchronize(); // the time before the count that publishes it
+	ring->pid = (uint32_t)getpid();
+	ring->count = i + 1;
+}
+
+int drmModePageFlip(int fd, uint32_t crtc, uint32_t fb, uint32_t flags, void* data) {
+	static int (*real)(int, uint32_t, uint32_t, uint32_t, void*);
+	int r;
+
+	if (real == NULL) {
+		real = (int (*)(int, uint32_t, uint32_t, uint32_t, void*))dlsym(RTLD_NEXT, "drmModePageFlip");
+	}
+	r = real != NULL ? real(fd, crtc, fb, flags, data) : -ENOSYS;
+	if (r == 0) {
+		frame_mark();
+	}
+	return r;
+}
+
+#define ATOMIC_TEST_ONLY 0x0100 // DRM_MODE_ATOMIC_TEST_ONLY
+
+int drmModeAtomicCommit(int fd, void* req, uint32_t flags, void* data) {
+	static int (*real)(int, void*, uint32_t, void*);
+	int r;
+
+	if (real == NULL) {
+		real = (int (*)(int, void*, uint32_t, void*))dlsym(RTLD_NEXT, "drmModeAtomicCommit");
+	}
+	r = real != NULL ? real(fd, req, flags, data) : -ENOSYS;
+	if (r == 0 && !(flags & ATOMIC_TEST_ONLY)) {
+		frame_mark();
+	}
+	return r;
 }
