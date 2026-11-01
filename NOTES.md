@@ -797,10 +797,13 @@ rsync -rt zelda data root@10.42.0.2:/mnt/sd/oot/
   HYP (CONFIG_ARMV7_VIRT off) and the board DTS deletes
   arm,cpu-registers-not-fw-configured (U-Boot sets CNTFRQ and a zero
   CNTVOFF on every core): virtual timer, 149 ns, monotonic across cores.
-- Near-plane depth: NoN clamps depth per pixel; the port clamped per vertex,
-  which pulled whole ground triangles crossing the near plane in front of
-  everything (from exact camera spots). Now only triangles wholly in front
-  of the near plane are clamped (CLIP_NEAR).
+- Near-plane depth: NoN draws what is in front of the near plane (the RDP
+  clamps its depth); the port clamped per vertex, which pulled whole ground
+  triangles crossing the plane in front of everything (from exact camera
+  spots). Now triangles crossing it are split at the plane (tri()), and
+  depth has a near slice, NDC [-1, -1 + 1/64), ordered by -w/z (depth_z):
+  a clamp to one depth instead made the slingshot and the hand fight. The
+  far range is mapped linearly into the rest; probes use depth_ndc.
 - Sun: gSunDL draws a 64x64 i4 texture as three I8 strips (two half-width
   suns side by side in each); replaced by one i4 quad (sSunDL in
   z_kankyo.c, as 2Ship2Harkinian does).
