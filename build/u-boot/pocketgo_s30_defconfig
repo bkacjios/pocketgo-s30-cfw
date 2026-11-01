@@ -45,3 +45,8 @@ CONFIG_FS_EXFAT=y
 # Plugging in USB while off: SPL sees the AXP plug-in power-on flag (reg
 # 0x00 bit 0) and powers back off; only the power key boots
 CONFIG_AXP_DISABLE_BOOT_ON_POWERON=y
+# Boot Linux in non-secure SVC, not HYP: with HYP available the kernel times with
+# the physical arch timer, which leaves the vDSO without a clock (clock_gettime
+# became a ~730 ns system call). Nothing here uses KVM.
+CONFIG_EXPERT=y
+# CONFIG_ARMV7_VIRT is not set

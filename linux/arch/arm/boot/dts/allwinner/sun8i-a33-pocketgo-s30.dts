@@ -26,6 +26,17 @@
 	};
 
 	/*
+	 * U-Boot boots Linux non-secure (PSCI, ARMV7_VIRT off) and sets CNTFRQ
+	 * and a zero CNTVOFF on every core, so the timer registers are
+	 * configured: the kernel then uses the virtual timer, whose counter
+	 * userspace reads through the vDSO (with the secure physical timer
+	 * clock_gettime was a ~730 ns system call).
+	 */
+	timer {
+		/delete-property/ arm,cpu-registers-not-fw-configured;
+	};
+
+	/*
 	 * Speaker amp, fed from the codec's headphone outputs like on stock
 	 * (fex headphone_direct_used, pa_single; stock mixer: "External
 	 * Speaker Switch" on, lineout volume 0). fex audio_pa_ctrl = PH9,

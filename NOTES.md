@@ -767,6 +767,43 @@ rsync -rt zelda data root@10.42.0.2:/mnt/sd/oot/
   frames ~40 ms vs the 48 ms 20 fps budget, so heavy scenes (Epona dust)
   drop frames. Ideas: fewer draws (texture changes force them), cheaper
   per-draw state, offload walk/GL to another core. mesa_glthread had no effect.
+- Renderer performance, OoT and MM (src/s30, kept identical apart from env
+  var prefixes; 2026-11-01). Busy Clock Town went from ~12 to ~20 fps:
+  - Flips are queued, not waited for (wait_flip at the next EndFrame): the
+    next frame's game logic and walk overlap the GPU.
+  - Vertices stream through a ring of 3 VBOs written with unsynchronized
+    glMapBufferRangeEXT (client arrays cost lima ~40% more per draw;
+    glBufferSubData on a buffer the pending job reads flushes the job, ~1 s
+    a frame in a benchmark; orphaning a 4 MiB buffer per frame had the
+    kernel zero it every frame).
+  - Depth probes (sun/lens-flare visibility) are read from the frame before
+    last (two gather targets): reading the last frame stalled until the GPU
+    finished it, which showed as 12-15 ms of "game" time.
+  - Texrects sharing tile and state batch (sBatchTile); load memos use a
+    generation instead of an 8 KiB memset per load; TMEM copies swap u64
+    words; texture hash in 32-bit lanes; face culling per triangle on the
+    CPU (det(x,y,w), so cull changes don't end a batch); 1-cycle draws mask
+    the second combiner cycle.
+  - What's left is mostly lima per draw (~45% of CPU incl. ioctl):
+    ~320 draws/frame in busy Clock Town, most ended by texture loads and
+    combiner changes (counts per cause in the stats line).
+  - Debug env: <GAME>_GFXSTATS=1 (stats + late frames + draws by cause),
+    =2 adds per-draw timers and a glFinish (GPU time, no overlap);
+    <GAME>_PROFILE=1 samples pcs to /tmp/<game>_prof.txt every 500 frames
+    (symbolize the binary with addr2line, libraries from the map lines);
+    <GAME>_NOVBO=1 back to client arrays.
+- clock_gettime was a 730 ns system call: Linux used the secure physical
+  arch timer, so the vDSO had no clock. U-Boot now boots non-secure without
+  HYP (CONFIG_ARMV7_VIRT off) and the board DTS deletes
+  arm,cpu-registers-not-fw-configured (U-Boot sets CNTFRQ and a zero
+  CNTVOFF on every core): virtual timer, 149 ns, monotonic across cores.
+- Near-plane depth: NoN clamps depth per pixel; the port clamped per vertex,
+  which pulled whole ground triangles crossing the near plane in front of
+  everything (from exact camera spots). Now only triangles wholly in front
+  of the near plane are clamped (CLIP_NEAR).
+- Sun: gSunDL draws a 64x64 i4 texture as three I8 strips (two half-width
+  suns side by side in each); replaced by one i4 quad (sSunDL in
+  z_kankyo.c, as 2Ship2Harkinian does).
 - Open: "DMA FAIL"
   for ovl_Demo_Du/Ec, Boss_Mo/Va .bin at boot (overlays are linked in; check);
   one-off "(null)/Audiotable.bin" DMA path and a drmModePageFlip failure seen
