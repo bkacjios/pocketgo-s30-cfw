@@ -6,10 +6,10 @@
  * /dev/dri/card*; the GPU is another card) into a request
  * on this daemon's socket, and the daemon answers with a lease fd for the
  * connector, the CRTC and the primary plane. The daemon keeps an overlay
- * plane for itself and shows OSD messages there (volume, headphones, and
- * external power plugged in or out, watched here from power_supply uevents,
- * with the battery level); the
- * display engine blends it over the app's image, so it costs the app
+ * plane for itself and shows OSD messages there (volume and headphones in a
+ * box centred near the top; external power plugged in or out, watched here
+ * from power_supply uevents, as the battery in the top right, where the
+ * launcher shows it); the display engine blends it over the app's image, so it costs the app
  * nothing.
  *
  * The overlay plane is enabled once per lease and then left on (transparent
@@ -45,8 +45,9 @@
  * Socket messages (SOCK_SEQPACKET, /run/s30-display.sock):
  *   "lease PATH"             PATH being opened; for the display card reply "ok"
  *                            with the lease fd attached, else "fail"
- *   "osd ICON PERCENT"       ICON: speaker, headphones, mute, charging,
- *                            battery; PERCENT 0-100
+ *   "osd ICON PERCENT"       ICON: speaker, headphones, mute (box with a
+ *                            bar), charging, battery (the battery, at
+ *                            PERCENT, with a bolt for charging); PERCENT 0-100
  *
  * Volume changes while the menu is open show the volume box above it (eased
  * and faded the same way).
@@ -110,6 +111,10 @@
 #define BOX_X ((PANEL_H - BOX_W) / 2)
 #define BOX_Y 12
 
+/* The OSD plane outside the menu: the screen's top strip (the box and the
+   battery), drawn in screen coordinates */
+#define STRIP_H (BOX_Y + BOX_H)
+
 /* Menu box: centred */
 #define MENU_W 160
 #define MENU_ROW_H 28
@@ -125,7 +130,7 @@ static uint32_t sFb;         // overlay buffer, panel orientation (BUF_H x BUF_W
 static uint32_t* sPixels;    // the plane's buffer (scanned out)
 static uint32_t sPitch;      // in pixels
 static uint32_t sBack[BUF_W * BUF_H]; // frame being drawn, panel layout, pitch BUF_H
-static int sShowW = BOX_W, sShowH = BOX_H; // part of the buffer the plane shows (landscape, from 0, 0)
+static int sShowW = BUF_W, sShowH = STRIP_H; // part of the buffer the plane shows (landscape, from 0, 0)
 static int sPlaneOn;          // overlay plane enabled (for the current lease)
 static char sIcon[16] = "speaker";
 static float sTarget, sShown; // bar percent: requested, drawn
@@ -278,18 +283,6 @@ static const char* const kMute[16] = {
 	"########...#.#..", "########..#...#.", ".....####.......", "......###.......",
 	".......##.......", "........#.......", "................", "................",
 };
-static const char* const kBattery[16] = {
-	"................", "................", "................", "................",
-	".#############..", ".#...........#..", ".#...........###", ".#...........###",
-	".#...........###", ".#...........###", ".#...........#..", ".#############..",
-	"................", "................", "................", "................",
-};
-static const char* const kCharging[16] = {
-	"................", "................", "................", "................",
-	".#############..", ".#.....##....#..", ".#....##.....###", ".#...#####...###",
-	".#.....##....###", ".#....##.....###", ".#...........#..", ".#############..",
-	"................", "................", "................", "................",
-};
 static const char* const kHeadphones[16] = {
 	"................", ".....######.....", "...##......##...", "..#..........#..",
 	".#............#.", ".#............#.", ".#............#.", "##............##",
@@ -354,16 +347,10 @@ static void draw_osd(int ox, int oy, const char* icon, float percent, float alph
 	int full;
 	float end, frac;
 
-	if (alpha <= 0.0f) {
-		fill(0, 0, BUF_W, BUF_H, 0);
-		return;
-	}
 	percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
 	draw_box(ox, oy, BOX_W, BOX_H, 0.75f * alpha);
 	draw_icon(strcmp(icon, "headphones") == 0 ? kHeadphones
 	          : strcmp(icon, "mute") == 0     ? kMute
-	          : strcmp(icon, "charging") == 0 ? kCharging
-	          : strcmp(icon, "battery") == 0  ? kBattery
 	                                          : kSpeaker,
 	          ox + 10, oy + (BOX_H - 32) / 2, 2, argb(0xffffff, alpha));
 	end = barW * percent / 100.0f;
@@ -382,19 +369,16 @@ static void draw_osd(int ox, int oy, const char* icon, float percent, float alph
 
 static const char* const kBolt[7] = { "...##", "..##.", ".##..", "#####", "..##.", ".##..", "##..." };
 
-static int external_power(int* capacity, int* charging);
-
-/* Battery in a small box in the screen's top right, where the launcher
-   shows it (right edge 10 px in, centred 16 px down): a battery filled to
-   the level (green, yellow, red) with the percentage inside, and a bolt to
-   its left while charging (the battery itself never moves) */
-static void draw_battery(void) {
+/* Battery at `capacity` in a small box in the screen's top right, where the
+   launcher shows it (right edge 10 px in, centred 16 px down): a battery
+   filled to the level (green, yellow, red) with the percentage inside, and
+   a bolt to its left while `charging` (the battery itself never moves) */
+static void draw_battery(int capacity, int charging, float alpha) {
 	const int bw = 42, bh = 18, right = PANEL_H - 10, y = 16 - bh / 2, pad = 5;
-	int capacity, charging, len, x, left, i, j;
+	int len, x, left, i, j;
 	char text[8];
 	uint32_t level;
 
-	external_power(&capacity, &charging);
 	if (capacity < 0) {
 		return; // no fuel gauge
 	}
@@ -402,27 +386,34 @@ static void draw_battery(void) {
 	level = capacity > 50 ? 0x46c85a : capacity > 20 ? 0xebbe28 : 0xe13c32;
 	x = right - 3 - bw;
 	left = charging ? x - 4 - 10 : x;
-	draw_box(left - pad, y - pad, right - left + 2 * pad, bh + 2 * pad, 0.92f);
+	draw_box(left - pad, y - pad, right - left + 2 * pad, bh + 2 * pad, 0.92f * alpha);
 	// Outline only: the empty part shows the box, as translucent as the menu
-	fill(x, y, bw, 1, argb(0xc8c8c8, 1.0f));
-	fill(x, y + bh - 1, bw, 1, argb(0xc8c8c8, 1.0f));
-	fill(x, y + 1, 1, bh - 2, argb(0xc8c8c8, 1.0f));
-	fill(x + bw - 1, y + 1, 1, bh - 2, argb(0xc8c8c8, 1.0f));
-	fill(x + 2, y + 2, (bw - 4) * capacity / 100, bh - 4, argb(level, 1.0f));
-	fill(x + bw, y + 5, 3, bh - 10, argb(0xc8c8c8, 1.0f)); // nub
+	fill(x, y, bw, 1, argb(0xc8c8c8, alpha));
+	fill(x, y + bh - 1, bw, 1, argb(0xc8c8c8, alpha));
+	fill(x, y + 1, 1, bh - 2, argb(0xc8c8c8, alpha));
+	fill(x + bw - 1, y + 1, 1, bh - 2, argb(0xc8c8c8, alpha));
+	fill(x + 2, y + 2, (bw - 4) * capacity / 100, bh - 4, argb(level, alpha));
+	fill(x + bw, y + 5, 3, bh - 10, argb(0xc8c8c8, alpha)); // nub
 	// Percentage inside, shadowed (the digits are font rows 2-11: centred)
 	len = snprintf(text, sizeof(text), "%d%%", capacity);
-	draw_text(text, x + (bw - len * 8) / 2 + 1, y + bh / 2 - 7 + 1, 1, argb(0x000000, 1.0f));
-	draw_text(text, x + (bw - len * 8) / 2, y + bh / 2 - 7, 1, argb(0xffffff, 1.0f));
+	draw_text(text, x + (bw - len * 8) / 2 + 1, y + bh / 2 - 7 + 1, 1, argb(0x000000, alpha));
+	draw_text(text, x + (bw - len * 8) / 2, y + bh / 2 - 7, 1, argb(0xffffff, alpha));
 	if (charging) {
 		for (j = 0; j < 7; j++) {
 			for (i = 0; i < 5; i++) {
 				if (kBolt[j][i] == '#') {
-					fill(left + i * 2, y + 2 + j * 2, 2, 2, argb(0xffffff, 1.0f));
+					fill(left + i * 2, y + 2 + j * 2, 2, 2, argb(0xffffff, alpha));
 				}
 			}
 		}
 	}
+}
+
+static int external_power(int* capacity, int* charging);
+
+/* The OSD shows the battery (sTarget is its level) rather than the box */
+static int osd_is_battery(void) {
+	return strcmp(sIcon, "battery") == 0 || strcmp(sIcon, "charging") == 0;
 }
 
 /* Row 0 of both menus is the brightness slider (NULL) */
@@ -499,12 +490,13 @@ static void draw_menu(void) {
 	const char* const* items = sMenuLauncher ? kSysItems : kAppItems;
 	const int rowH = MENU_ROW_H, count = menu_count(), h = count * rowH + 2 * MENU_PAD;
 	const int y0 = (PANEL_W - h) / 2, top = y0 + MENU_PAD;
-	int i;
+	int i, capacity, charging;
 
 	draw_box(MENU_X, y0, MENU_W, h, 0.92f);
-	draw_battery();
+	external_power(&capacity, &charging);
+	draw_battery(capacity, charging, 1.0f);
 	fill(BOX_X, BOX_Y, BOX_W, BOX_H, 0); // the OSD box above the menu, as osd_frame left it
-	if (sAlpha > 0.0f) {
+	if (sAlpha > 0.0f && !osd_is_battery()) { // the menu shows the battery itself
 		draw_osd(BOX_X, BOX_Y, sIcon, sShown, sAlpha);
 	}
 	for (i = 0; i < count; i++) {
@@ -604,9 +596,9 @@ static void osd_show(const char* icon, int percent) {
 	sOsdUntil = now_ms() + OSD_MS;
 	sDirty = 1;
 	if (!sPlaneOn) {
-		draw_osd(0, 0, sIcon, sShown, 0.0f); // starts transparent, fades in
+		fill(0, 0, BUF_W, STRIP_H, 0); // starts transparent, fades in
 		present();
-		set_plane(BOX_X, BOX_Y, BOX_W, BOX_H);
+		set_plane(0, 0, BUF_W, STRIP_H);
 	}
 }
 
@@ -630,13 +622,18 @@ static int osd_frame(void) {
 		// Above the menu (the plane is the menu's, the whole screen): redraw
 		// and copy in only the box's spot
 		fill(BOX_X, BOX_Y, BOX_W, BOX_H, 0);
-		if (sAlpha > 0.0f) {
+		if (sAlpha > 0.0f && !osd_is_battery()) { // the menu shows the battery itself
 			draw_osd(BOX_X, BOX_Y, sIcon, sShown, sAlpha);
 		}
 		wait_vblank();
 		present_rect(BOX_X, BOX_Y, BOX_W, BOX_H);
 	} else {
-		draw_osd(0, 0, sIcon, sShown, sAlpha);
+		fill(0, 0, BUF_W, STRIP_H, 0);
+		if (sAlpha > 0.0f && osd_is_battery()) {
+			draw_battery((int)sTarget, strcmp(sIcon, "charging") == 0, sAlpha);
+		} else if (sAlpha > 0.0f) {
+			draw_osd(BOX_X, BOX_Y, sIcon, sShown, sAlpha);
+		}
 		present_synced();
 	}
 	sDirty = 0;
@@ -696,7 +693,7 @@ static void menu_open(void) {
 	sAlpha = 0.0f;
 	sOsdUntil = 0;
 	// Move the plane only while it is transparent, then draw the menu: the
-	// plane still sits where the OSD box was until the move takes effect
+	// plane still sits where the OSD strip was until the move takes effect
 	fill(0, 0, BUF_W, BUF_H, 0);
 	present_synced();
 	set_plane(0, 0, BUF_W, BUF_H);
@@ -714,10 +711,10 @@ static void menu_close(int exitApp) {
 	sOsdUntil = 0;
 	sRepeatDir = 0;
 	if (sLessee != 0) {
-		// Back to the (transparent) OSD box before the app runs again
+		// Back to the (transparent) OSD strip before the app runs again
 		fill(0, 0, BUF_W, BUF_H, 0);
 		present_synced();
-		set_plane(BOX_X, BOX_Y, BOX_W, BOX_H);
+		set_plane(0, 0, BUF_W, STRIP_H);
 	}
 	if (sPadFd >= 0) {
 		ioctl(sPadFd, EVIOCGRAB, 0);
@@ -1102,7 +1099,9 @@ static void power_changed(int nl) {
 	online = external_power(&capacity, &charging);
 	if (online != sPowerOnline) {
 		sPowerOnline = online;
-		osd_show(online ? "charging" : "battery", capacity < 0 ? 0 : capacity);
+		if (capacity >= 0) {
+			osd_show(online ? "charging" : "battery", capacity);
+		}
 	}
 }
 

@@ -512,10 +512,15 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   PA anti-pop ramp (reg 0x07 bits 3:2 = 11) and HPCOM 50 ms before HPPAEN;
   the platform `.shutdown` hook mutes, turns the PA off, waits 600 ms for the
   ramp, then drops HPCOM before poweroff/reboot cuts the supply.
-- Blue LED: PL10, active low (`gpio-leds`, function status). Red/green: not
-  found. Tested without effect: AXP CHGLED (0x32 on/blink), AXP GPIO0/GPIO1
-  high/low, PL6, PE17. Red is on whenever USB power is connected (stock too),
-  so it is probably hardware driven by the charger.
+- Blue LED: PL10, active low (`gpio-leds`, function status).
+- Red LED: AXP CHGLED (2026-11-01). Reg 0x32 bit 3 = charger drives it (red
+  while charging); with bit 3 clear, bits 5:4 = 00 float it (LED off).
+- Green LED: shows on stock at some point, driver not found. Stock fex has no
+  LED pins ([leds_para] absent); the stock kernel has `pmu_chgled_func/type`
+  and `arisc_set_led_bln` (LED via the AR100/CPUS). Tested without effect
+  (charger in): CHGLED floating, AXP GPIO0/GPIO1 LDO on and drive low
+  (U-Boot `axp_init()` sets both to input), PL2/PL3/PL4/PL7 high and low,
+  earlier PL6, PE17.
 - Stock `tinyplay`/Alpine tinyalsa 2.0 `tinyplay` play nothing; use `aplay`.
 
 ## Boot splash
