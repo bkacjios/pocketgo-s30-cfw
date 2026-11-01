@@ -64,7 +64,7 @@ patches/                  Changes to the submodules, one folder each, applied
                           (output switching on plug/unplug), volume control
                           named Master
   u-boot/                 0001 DSI LCD, 0002 splash env, 0003 exFAT on 32-bit
-                          ARM, 0004 AXP PEK restart bit
+                          ARM, 0004 AXP PEK restart bit + Voff
   retroarch/              0001 gl2 screen rotation, 0002 NEON asm syntax (clang)
   emulationstation/       0001 install rules + /usr/share resources (AUR),
                           0002 S30 input setup entries, no hotkey prompt
@@ -439,6 +439,13 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   battery is connected, so the device turned off and straight back on.
   U-Boot patch 0004 clears it in SPL `axp_init()`. Verified live: with
   0x36 = 0x59 a long press stays off.
+- Low battery wouldn't boot, even on the charger, until ~5 min of charging
+  (2026-11-01): stock leaves Voff (reg 0x31) at 0x07 = 3.3 V, kept while the
+  battery is connected, so the boot load dipped below it and the AXP cut
+  power. Patch 0004 also sets Voff to 2.9 V (0x03, AXP default) in SPL
+  `axp_init()`. Verified live: 0x31 = 0x03 after reboot. Not yet retested on
+  an empty battery. Linux has no low-battery shutdown yet, so a running
+  device is still hard-cut at Voff (no sync).
 - Plugging in USB while off powers the AXP on. U-Boot
   `CONFIG_AXP_DISABLE_BOOT_ON_POWERON` (defconfig): SPL checks reg 0x00 bit 0
   (power-on by plug-in) and powers back off, so only the power key boots. The

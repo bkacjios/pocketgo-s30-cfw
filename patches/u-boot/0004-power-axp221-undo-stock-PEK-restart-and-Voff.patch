@@ -1,0 +1,61 @@
+diff --git a/drivers/power/axp221.c b/drivers/power/axp221.c
+index f5daa243..16a9bf2a 100644
+--- a/drivers/power/axp221.c
++++ b/drivers/power/axp221.c
+@@ -208,7 +208,7 @@ int axp_set_eldo(int eldo_num, unsigned int mvolt)
+ 
+ int axp_init(void)
+ {
+-	u8 axp_chip_id;
++	u8 axp_chip_id, cfg;
+ 	int ret;
+ 
+ 	ret = pmic_bus_init();
+@@ -234,7 +234,28 @@ int axp_init(void)
+ 	if (ret)
+ 		return ret;
+ 
+-	return 0;
++	/*
++	 * Allwinner firmware (fex pmu_pekoff_func = 1) sets the PEK "restart
++	 * after long-press power-off" bit, and the PMIC keeps it while the
++	 * battery is connected: holding the power key then turns the device
++	 * off and straight back on. Clear it so a long press stays off.
++	 */
++	ret = pmic_bus_clrbits(AXP221_PEK_CTRL, AXP221_PEK_CTRL_OFF_RESTART);
++	if (ret)
++		return ret;
++
++	/*
++	 * Allwinner firmware also raises the power-off voltage to 3.3 V, kept
++	 * while the battery is connected. On a low battery the boot load (CPU,
++	 * panel, backlight) dips below that and the PMIC cuts power, even with
++	 * the charger plugged in. Use the PMIC's 2.9 V default.
++	 */
++	ret = pmic_bus_read(AXP221_VOFF, &cfg);
++	if (ret)
++		return ret;
++
++	cfg = (cfg & ~AXP221_VOFF_MASK) | AXP221_VOFF_2900MV;
++	return pmic_bus_write(AXP221_VOFF, cfg);
+ }
+ 
+ int axp_get_sid(unsigned int *sid)
+diff --git a/include/axp221.h b/include/axp221.h
+index 8a4a3cca..9aeb8e90 100644
+--- a/include/axp221.h
++++ b/include/axp221.h
+@@ -42,8 +42,13 @@
+ #define AXP221_ALDO1_CTRL	0x28
+ #define AXP221_ALDO2_CTRL	0x29
+ #define AXP221_ALDO3_CTRL	0x2a
++#define AXP221_VOFF		0x31
++#define AXP221_VOFF_MASK		0x07
++#define AXP221_VOFF_2900MV		0x03
+ #define AXP221_SHUTDOWN		0x32
+ #define AXP221_SHUTDOWN_POWEROFF	(1 << 7)
++#define AXP221_PEK_CTRL		0x36
++#define AXP221_PEK_CTRL_OFF_RESTART	(1 << 2)
+ #define AXP221_PAGE		0xff
+ 
+ /* Page 1 addresses */
