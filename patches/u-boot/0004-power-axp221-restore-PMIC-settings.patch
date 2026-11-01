@@ -1,5 +1,18 @@
+diff --git a/board/sunxi/board.c b/board/sunxi/board.c
+index 3d1afec7..43a56954 100644
+--- a/board/sunxi/board.c
++++ b/board/sunxi/board.c
+@@ -595,7 +595,7 @@ void sunxi_board_init(void)
+ 		pmic_bus_read(AXP_POWER_STATUS, &boot_reason);
+ 		if (boot_reason & AXP_POWER_STATUS_ALDO_IN) {
+ 			printf("Power on by plug-in, shutting down.\n");
+-			pmic_bus_write(0x32, BIT(7));
++			pmic_bus_setbits(0x32, BIT(7));
+ 		}
+ 	}
+ 
 diff --git a/drivers/power/axp221.c b/drivers/power/axp221.c
-index f5daa243..16a9bf2a 100644
+index f5daa243..3bbfa3eb 100644
 --- a/drivers/power/axp221.c
 +++ b/drivers/power/axp221.c
 @@ -208,7 +208,7 @@ int axp_set_eldo(int eldo_num, unsigned int mvolt)
@@ -11,7 +24,7 @@ index f5daa243..16a9bf2a 100644
  	int ret;
  
  	ret = pmic_bus_init();
-@@ -234,7 +234,28 @@ int axp_init(void)
+@@ -234,7 +234,39 @@ int axp_init(void)
  	if (ret)
  		return ret;
  
@@ -37,15 +50,26 @@ index f5daa243..16a9bf2a 100644
 +		return ret;
 +
 +	cfg = (cfg & ~AXP221_VOFF_MASK) | AXP221_VOFF_2900MV;
-+	return pmic_bus_write(AXP221_VOFF, cfg);
++	ret = pmic_bus_write(AXP221_VOFF, cfg);
++	if (ret)
++		return ret;
++
++	/*
++	 * Writing just the power-off bit (instead of setting it) cleared the
++	 * rest of the register, and the PMIC keeps that while the battery is
++	 * connected: CHGLED forced off. Hand the LED back to the charger and
++	 * re-enable battery monitoring.
++	 */
++	return pmic_bus_setbits(AXP221_SHUTDOWN, AXP221_SHUTDOWN_BAT_MON |
++				AXP221_SHUTDOWN_CHGLED_CHG);
  }
  
  int axp_get_sid(unsigned int *sid)
 diff --git a/include/axp221.h b/include/axp221.h
-index 8a4a3cca..9aeb8e90 100644
+index 8a4a3cca..f18643e5 100644
 --- a/include/axp221.h
 +++ b/include/axp221.h
-@@ -42,8 +42,13 @@
+@@ -42,8 +42,15 @@
  #define AXP221_ALDO1_CTRL	0x28
  #define AXP221_ALDO2_CTRL	0x29
  #define AXP221_ALDO3_CTRL	0x2a
@@ -54,6 +78,8 @@ index 8a4a3cca..9aeb8e90 100644
 +#define AXP221_VOFF_2900MV		0x03
  #define AXP221_SHUTDOWN		0x32
  #define AXP221_SHUTDOWN_POWEROFF	(1 << 7)
++#define AXP221_SHUTDOWN_BAT_MON	(1 << 6)
++#define AXP221_SHUTDOWN_CHGLED_CHG	(1 << 3)
 +#define AXP221_PEK_CTRL		0x36
 +#define AXP221_PEK_CTRL_OFF_RESTART	(1 << 2)
  #define AXP221_PAGE		0xff
