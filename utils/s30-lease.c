@@ -9,7 +9,7 @@
  * (then the app is master on its own, as without the shim).
  *
  * Frame timing for the daemon's performance overlay: each page flip the app
- * queues (drmModePageFlip, or an atomic commit that isn't a test) is
+ * queues (a page flip ioctl, or an atomic commit that isn't a test) is
  * timestamped into the shared ring S30_FRAMES_PATH (s30-frames.h).
  */
 #define _GNU_SOURCE
@@ -25,6 +25,8 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
 
 #include "s30-frames.h"
 
@@ -146,31 +148,25 @@ static void frame_mark(void) {
 	ring->count = i + 1;
 }
 
-int drmModePageFlip(int fd, uint32_t crtc, uint32_t fb, uint32_t flags, void* data) {
-	static int (*real)(int, uint32_t, uint32_t, uint32_t, void*);
+/* The page-flip and atomic ioctls themselves, not libdrm's wrappers: SDL3
+   dlopens libdrm and looks them up with dlsym on its handle, which skips this
+   shim, but libdrm's own ioctl calls into libc still come here. */
+int ioctl(int fd, int req, ...) {
+	static int (*real)(int, int, ...);
+	va_list ap;
+	void* arg;
 	int r;
 
+	va_start(ap, req);
+	arg = va_arg(ap, void*);
+	va_end(ap);
 	if (real == NULL) {
-		real = (int (*)(int, uint32_t, uint32_t, uint32_t, void*))dlsym(RTLD_NEXT, "drmModePageFlip");
+		real = (int (*)(int, int, ...))dlsym(RTLD_NEXT, "ioctl");
 	}
-	r = real != NULL ? real(fd, crtc, fb, flags, data) : -ENOSYS;
-	if (r == 0) {
-		frame_mark();
-	}
-	return r;
-}
-
-#define ATOMIC_TEST_ONLY 0x0100 // DRM_MODE_ATOMIC_TEST_ONLY
-
-int drmModeAtomicCommit(int fd, void* req, uint32_t flags, void* data) {
-	static int (*real)(int, void*, uint32_t, void*);
-	int r;
-
-	if (real == NULL) {
-		real = (int (*)(int, void*, uint32_t, void*))dlsym(RTLD_NEXT, "drmModeAtomicCommit");
-	}
-	r = real != NULL ? real(fd, req, flags, data) : -ENOSYS;
-	if (r == 0 && !(flags & ATOMIC_TEST_ONLY)) {
+	r = real(fd, req, arg);
+	if (r == 0 && (req == (int)DRM_IOCTL_MODE_PAGE_FLIP ||
+	               (req == (int)DRM_IOCTL_MODE_ATOMIC &&
+	                !(((struct drm_mode_atomic*)arg)->flags & DRM_MODE_ATOMIC_TEST_ONLY)))) {
 		frame_mark();
 	}
 	return r;
