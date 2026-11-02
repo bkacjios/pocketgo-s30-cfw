@@ -39,7 +39,7 @@ build/            build.sh, kernel config, U-Boot board files,
 linux/            Board devicetree, panel and gamepad drivers
 patches/          Patches to the submodules, one folder each: linux,
                   u-boot, retroarch, emulationstation
-launcher/         s30-launcher (file browser) and joystick calibration
+launcher/         s30-launcher (file browser)
 utils/            Small system tools (volume daemon, splash, FEL reboot, ...)
 tools/            Firmware decoding and host-side helpers
 external/         Submodules: linux, u-boot, retroarch, emulationstation,

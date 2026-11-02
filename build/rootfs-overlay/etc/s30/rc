@@ -86,7 +86,8 @@ for app in /usr/share/s30/apps/*.sh; do
 	[ -e "/mnt/sd/apps/${app##*/}" ] || cp "$app" /mnt/sd/apps/
 done
 
-# Joystick calibration (saved by s30-joycal), applied by the gamepad driver
+# Joystick calibration (saved by s30-display, System > Calibrate stick),
+# applied by the gamepad driver
 if [ -f "$HOME/.config/joystick.cal" ]; then
 	for f in /sys/bus/i2c/drivers/pocketgo-s30-gamepad/*/calibration; do
 		cat "$HOME/.config/joystick.cal" > "$f"

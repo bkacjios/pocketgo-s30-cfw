@@ -25,12 +25,12 @@
  * works when the daemon is not involved.
  *
  * System menu: the power key (grabbed, so apps never see it) opens a menu
- * over whoever holds the lease: a brightness slider (D-pad left/right; the
- * level is saved to the file given as argument and restored at start), then
- * Resume / Sleep / Exit game over an app, Sleep /
- * Reboot / Shut down / Cancel over the launcher, with the battery (level, and a
- * bolt while charging) in a small box in the screen's top right, where the
- * launcher shows it. That process is frozen (SIGSTOP) and
+ * over whoever holds the lease: Resume / System / Exit game over an app; the
+ * System page (straight away over the launcher) has a brightness slider
+ * (D-pad left/right; the level is saved to the file given as argument and
+ * restored at start), the performance overlay switch, the stick calibration,
+ * Sleep, Reboot and Shut down. The battery (level, and a bolt while charging)
+ * shows in a small box in the screen's top right, where the launcher shows it. That process is frozen (SIGSTOP) and
  * the gamepad grabbed while the menu is open; Exit sends SIGTERM, then
  * SIGKILL if it hasn't gone after EXIT_GRACE_MS. The
  * menu uses the same overlay plane (the display engine blends only one
@@ -57,9 +57,12 @@
 #define _GNU_SOURCE // struct ucred
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
+#include <math.h>
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -140,7 +143,7 @@ static int sDirty;            // needs a redraw
 static uint64_t sOsdUntil, sNextLeaseCheck;
 static pid_t sAppPid;         // process holding the lease
 static int sMenu, sMenuSel;   // system menu open, selected item
-static int sMenuPage;         // 0: main, 1: settings
+static int sMenuPage;         // 0: app, 1: system, 2: stick calibration
 static int sPerf;             // performance overlay on
 static char sPerfFile[320];   // where sPerf is saved ("" if nowhere)
 static uint64_t sPerfNext;    // next overlay update (0: now)
@@ -333,7 +336,7 @@ static void draw_text(const char* text, int x0, int y0, int scale, uint32_t argb
 	int gx, gy;
 
 	for (; *text != '\0'; text++, x0 += 8 * scale) {
-		const unsigned char* g = kOsdFont[(*text < 0x20 || *text > 0x7e ? '?' : *text) - 0x20];
+		const unsigned char* g = kOsdFont[(*text < 0x20 || *text > 0x7f ? '?' : *text) - 0x20];
 		for (gy = 0; gy < 16; gy++) {
 			for (gx = 0; gx < 8; gx++) {
 				if (g[gy] & (0x80 >> gx)) {
@@ -421,21 +424,22 @@ static int osd_is_battery(void) {
 	return strcmp(sIcon, "battery") == 0 || strcmp(sIcon, "charging") == 0;
 }
 
-/* Row 0 of both main menus opens the settings page: the brightness slider
-   (NULL), the performance overlay switch, back */
-enum { APP_SETTINGS, APP_RESUME, APP_SLEEP, APP_EXIT };
-static const char* const kAppItems[] = { "Settings", "Resume", "Sleep", "Exit game" };
-enum { SYS_SETTINGS, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_CANCEL };
-static const char* const kSysItems[] = { "Settings", "Sleep", "Reboot", "Shut down", "Cancel" };
-enum { SET_BRIGHTNESS, SET_PERF, SET_BACK };
-static const char* const kSetItems[] = { NULL, "Overlay", "Back" };
+/* In an app the menu opens on the app page, whose System row opens the
+   system page; over the launcher it opens on the system page, where the last
+   row closes the menu instead of going back. The system page: the brightness
+   slider (NULL), the performance overlay switch, the stick calibration (its
+   own screen, page 2), sleep, reboot, power off. */
+enum { APP_RESUME, APP_SYSTEM, APP_EXIT };
+static const char* const kAppItems[] = { "Resume", "System", "Exit game" };
+enum { SYS_BRIGHTNESS, SYS_PERF, SYS_CALIBRATE, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_BACK };
+static const char* const kSysItems[] = { NULL, "Overlay", "Calibrate stick", "Sleep", "Reboot", "Shut down", "Back" };
 
 static int menu_count(void) {
-	return sMenuPage ? 3 : sMenuLauncher ? 5 : 4;
+	return sMenuPage ? 7 : 3;
 }
 
 static int on_brightness_row(void) {
-	return sMenuPage == 1 && sMenuSel == SET_BRIGHTNESS;
+	return sMenuPage == 1 && sMenuSel == SYS_BRIGHTNESS;
 }
 
 static int brightness_min(void);
@@ -469,7 +473,7 @@ static void draw_brightness_row(int y, int selected) {
 	}
 }
 
-/* The B button, 14x14 at 1x: a round button, the letter (6x8) cut in dark */
+/* A face button, 14x14 at 1x: a round button, the letter (6x8) cut in dark */
 static const char* const kButton[14] = {
 	"....######....", "..##########..", ".############.", ".############.", "##############",
 	"##############", "##############", "##############", "##############", "##############",
@@ -477,15 +481,15 @@ static const char* const kButton[14] = {
 };
 static const char* const kLetterB[8] = { "#####.", "##..##", "##..##", "#####.", "##..##", "##..##", "##..##", "#####." };
 
-static void draw_button_b(int x0, int y0) {
+static void draw_button(int x0, int y0, const char* const* letter) {
 	int x, y;
 
 	for (y = 0; y < 14; y++) {
 		for (x = 0; x < 14; x++) {
 			if (kButton[y][x] == '#') {
 				int lx = x - 4, ly = y - 3; // the letter's cell
-				int letter = lx >= 0 && lx < 6 && ly >= 0 && ly < 8 && kLetterB[ly][lx] == '#';
-				put(x0 + x, y0 + y, argb(letter ? 0x101018 : 0xc8c8c8, 1.0f));
+				int cut = lx >= 0 && lx < 6 && ly >= 0 && ly < 8 && letter[ly][lx] == '#';
+				put(x0 + x, y0 + y, argb(cut ? 0x101018 : 0xc8c8c8, 1.0f));
 			}
 		}
 	}
@@ -499,7 +503,7 @@ static int menu_row_y(int i) {
 }
 
 static void draw_menu(void) {
-	const char* const* items = sMenuPage ? kSetItems : sMenuLauncher ? kSysItems : kAppItems;
+	const char* const* items = sMenuPage ? kSysItems : kAppItems;
 	const int rowH = MENU_ROW_H, count = menu_count(), h = count * rowH + 2 * MENU_PAD;
 	const int y0 = (PANEL_W - h) / 2, top = y0 + MENU_PAD;
 	int i, capacity, charging;
@@ -523,19 +527,587 @@ static void draw_menu(void) {
 			char label[32];
 			int len, x;
 
-			if (sMenuPage && i == SET_PERF) {
+			if (sMenuPage && i == SYS_PERF) {
 				snprintf(label, sizeof(label), "%s: %s", items[i], sPerf ? "On" : "Off");
+			} else if (sMenuPage && i == SYS_BACK && sMenuLauncher) {
+				snprintf(label, sizeof(label), "Close");
 			} else {
 				snprintf(label, sizeof(label), "%s", items[i]);
 			}
 			len = (int)strlen(label);
 			x = MENU_X + (MENU_W - len * 8) / 2;
 			draw_text(label, x, y + (rowH - 16) / 2, 1, argb(0xffffff, 1.0f));
-			if (sMenuPage ? i == SET_BACK : sMenuLauncher ? i == SYS_CANCEL : i == APP_RESUME) {
-				draw_button_b(x - 6 - 14, y + (rowH - 14) / 2); // what B does
+			if (sMenuPage ? i == SYS_BACK : i == APP_RESUME) {
+				draw_button(x - 6 - 14, y + (rowH - 14) / 2, kLetterB); // what B does
 			}
 		}
 	}
+}
+
+static void present_synced(void);
+static void menu_redraw(void);
+
+/* ---------------------------------------------------------------------------
+ * Stick calibration (System > Calibrate stick), drawn over the whole screen
+ *
+ * 1. Centre: the stick rests for CAL_REST_MS; its average is the zero point.
+ * 2. Rotate: the user turns the stick around its edge (CAL_TURNS turns); the
+ *    furthest point in each of CAL_BINS directions is kept. Done after the
+ *    turns once 3/4 of the directions have been reached.
+ * 3. Edges: the polygon through those points (the mesh the plot shows) gives
+ *    how far the stick reaches in each of CAL_EDGES directions, wherever its
+ *    shape: the driver scales each sample by 127 over the edge in its
+ *    direction, so every direction reaches full deflection, as Dolphin does.
+ * 4. Test: the corrected stick live; A saves, X redoes, B leaves it unchanged.
+ *
+ * The gamepad driver takes "cx cy m00 m01 m10 m11 deadzone e0 .. e31" (M,
+ * the identity here, in Q12; edges in 1/16 counts from +x towards +y) from
+ * sysfs; the result is also saved to CAL_FILE, which /etc/s30/rc loads at
+ * boot. While calibrating, the driver is set to identity (raw values). The
+ * rest point moves a few counts after the stick has been moved (about 5 on
+ * the test unit), so the deadzone is wider than that. The plot shows the mesh
+ * and the raw stick; the test adds the corrected stick, which should reach
+ * the ring evenly all round.
+ * ------------------------------------------------------------------------- */
+
+#define CAL_FILE "/mnt/sd/home/.config/joystick.cal"
+#define CAL_SYSFS_GLOB "/sys/bus/i2c/drivers/pocketgo-s30-gamepad/*/calibration"
+#define CAL_IDENTITY "128 128 4096 0 0 4096 0" // no deadzone: raw values
+#define CAL_DEADZONE 10 // out of 127
+#define CAL_EDGES 32 // as the driver's table
+#define CAL_BINS 64
+#define CAL_TURNS 3.0
+#define CAL_REST_MS 1000
+#define CAL_MIN_R 20 // raw counts from the centre: a direction counts as reached
+#define CAL_LOG "/tmp/s30-joycal.log" // the last calibration's raw samples, for diagnosis
+
+/* Plot: the stick's full range (+-128) over radius CAL_R around (CAL_X, CAL_Y) */
+#define CAL_X 150
+#define CAL_Y 172
+#define CAL_R 118
+#define CAL_TEXT_X 300
+
+#define CAL_BG 0x101018
+#define CAL_DISC 0x181826
+#define CAL_GRID 0x262638
+#define CAL_RING 0x484866
+#define CAL_ACCENT 0x8060e0
+#define CAL_DIM 0x8888a0
+#define CAL_EDGE 0xb4a0ff // the mesh's outline
+#define CAL_FIXED 0x60e0a0 // the corrected stick's dot
+
+enum { CAL_CENTER, CAL_ROTATE, CAL_TEST };
+
+static struct {
+	int phase;
+	char sysfs[256], previous[512];
+	FILE* log; // CAL_LOG
+	uint64_t start;
+	int rx, ry; // raw stick, 0-255
+	double cx, cy; // centre (raw)
+	uint64_t restSince; // centre: start of the current still window
+	double sumX, sumY;
+	int samples, minX, maxX, minY, maxY;
+	double binR[CAL_BINS], binX[CAL_BINS], binY[CAL_BINS]; // edge per direction, relative to the centre
+	double turns, lastAng;
+	int haveAng, filled;
+	int edge[CAL_EDGES]; // reach per direction, 1/16 counts, as the driver takes it
+} sCal;
+
+static uint32_t sCalBg[BUF_W * BUF_H]; // the plot's static parts, as in sBack
+
+static int cal_write(const char* path, const char* text) {
+	FILE* f = fopen(path, "w");
+	int ok;
+
+	if (f == NULL) {
+		return 0;
+	}
+	ok = fputs(text, f) >= 0;
+	return fclose(f) == 0 && ok;
+}
+
+/* How far the polygon through the reached directions' edge points goes from
+   the centre in direction `a` (radians); 0 if it doesn't cross it */
+static double cal_reach(double a) {
+	const double ux = cos(a), uy = sin(a);
+	double px[CAL_BINS], py[CAL_BINS], best = 0;
+	int n = 0, i;
+
+	for (i = 0; i < CAL_BINS; i++) {
+		if (sCal.binR[i] > CAL_MIN_R) {
+			px[n] = sCal.binX[i];
+			py[n] = sCal.binY[i];
+			n++;
+		}
+	}
+	for (i = 0; i < n; i++) { // the ray against each side
+		double ex = px[(i + 1) % n] - px[i], ey = py[(i + 1) % n] - py[i];
+		double den = ux * ey - uy * ex, t, s;
+
+		if (fabs(den) < 1e-9) {
+			continue;
+		}
+		t = (px[i] * ey - py[i] * ex) / den;   // along the ray
+		s = (px[i] * uy - py[i] * ux) / den;   // along the side
+		if (t > best && s >= 0 && s <= 1) {
+			best = t;
+		}
+	}
+	return best;
+}
+
+/* The driver's output for raw (x, y), with the edges found (sCal.edge) */
+static void cal_corrected(int x, int y, double out[2]) {
+	const double dx = x - sCal.cx, dy = y - sCal.cy, a = atan2(dy, dx);
+	double pos = (a < 0 ? a + 2 * M_PI : a) / (2 * M_PI) * CAL_EDGES, f = pos - floor(pos);
+	int i = (int)pos % CAL_EDGES;
+	double e = (sCal.edge[i] * (1 - f) + sCal.edge[(i + 1) % CAL_EDGES] * f) / 16;
+	double ox = dx * 127 / e, oy = dy * 127 / e, r = sqrt(ox * ox + oy * oy);
+
+	if (r <= CAL_DEADZONE) {
+		ox = oy = 0;
+	} else { // rescaled past the deadzone, as the driver
+		ox *= (r - CAL_DEADZONE) * 127 / (127 - CAL_DEADZONE) / r;
+		oy *= (r - CAL_DEADZONE) * 127 / (127 - CAL_DEADZONE) / r;
+	}
+	out[0] = ox < -128 ? -128 : ox > 127 ? 127 : ox;
+	out[1] = oy < -128 ? -128 : oy > 127 ? 127 : oy;
+}
+
+/* Back to step 1 */
+static void cal_restart(void) {
+	memset(&sCal.restSince, 0, sizeof(sCal) - offsetof(typeof(sCal), restSince));
+	sCal.phase = CAL_CENTER;
+	sCal.cx = sCal.cy = 128;
+	sCal.minX = sCal.minY = 255;
+}
+
+/* --- Drawing: anti-aliased, blended over what sBack holds (opaque here) --- */
+
+static void blend(int x, int y, uint32_t rgb, float a) {
+	uint32_t* p;
+
+	if (a <= 0.0f || x < 0 || x >= BUF_W || y < 0 || y >= BUF_H) {
+		return;
+	}
+	p = &sBack[(BUF_W - 1 - x) * BUF_H + y];
+	*p = (*p & 0xff000000) | mix(rgb, *p & 0xffffff, a > 1.0f ? 1.0f : a);
+}
+
+static float clamp01(float v) {
+	return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+}
+
+/* Disc of radius r, or a ring of width w around radius r if w > 0 */
+static void cal_circle(float cx, float cy, float r, float w, uint32_t rgb, float a) {
+	const float out = r + (w > 0 ? w / 2 : 0) + 1;
+	int x, y;
+
+	for (y = (int)(cy - out); y <= (int)(cy + out) + 1; y++) {
+		for (x = (int)(cx - out); x <= (int)(cx + out) + 1; x++) {
+			float d = sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy));
+			blend(x, y, rgb, a * clamp01(w > 0 ? w / 2 + 0.5f - fabsf(d - r) : r + 0.5f - d));
+		}
+	}
+}
+
+/* Stick offset from the centre (counts) to the plot */
+static void cal_plot(double dx, double dy, float out[2]) {
+	out[0] = CAL_X + (float)(dx * CAL_R / 128);
+	out[1] = CAL_Y + (float)(dy * CAL_R / 128);
+}
+
+/* One-pixel line, Xiaolin Wu's */
+static void cal_line(float x0, float y0, float x1, float y1, uint32_t rgb, float a) {
+	int steep = fabsf(y1 - y0) > fabsf(x1 - x0);
+	float t, g;
+	int x;
+
+	if (steep) {
+		t = x0, x0 = y0, y0 = t;
+		t = x1, x1 = y1, y1 = t;
+	}
+	if (x0 > x1) {
+		t = x0, x0 = x1, x1 = t;
+		t = y0, y0 = y1, y1 = t;
+	}
+	g = x1 - x0 < 1e-3f ? 0.0f : (y1 - y0) / (x1 - x0);
+	for (x = (int)lroundf(x0); x <= (int)lroundf(x1); x++) {
+		float y = y0 + g * (x - x0), f = y - floorf(y);
+		int yi = (int)floorf(y);
+
+		if (steep) {
+			blend(yi, x, rgb, a * (1 - f));
+			blend(yi + 1, x, rgb, a * f);
+		} else {
+			blend(x, yi, rgb, a * (1 - f));
+			blend(x, yi + 1, rgb, a * f);
+		}
+	}
+}
+
+/* The edge mesh, centred on the plot: the polygon through the furthest point
+   reached in each direction, filled with 4x4 coverage per pixel, outlined.
+   Directions not reached for more than 1/8 turn go through the centre. */
+static void cal_mesh(uint32_t rgb, float a, uint32_t edgeRgb) {
+	enum { SUB = 4, MAXV = CAL_BINS * 2 };
+	static float cov[CAL_R * 2 + 16][CAL_R * 2 + 16]; // around the plot centre
+	const int ox = CAL_X - CAL_R - 8, oy = CAL_Y - CAL_R - 8, size = CAL_R * 2 + 16;
+	float vx[MAXV], vy[MAXV], c[2];
+	int n = 0, i, gap = 0, first = -1, sy, x, y;
+
+	cal_plot(0, 0, c);
+	for (i = 0; i < CAL_BINS; i++) {
+		if (sCal.binR[i] > CAL_MIN_R) {
+			first = first < 0 ? i : first;
+		}
+	}
+	if (first < 0) {
+		return;
+	}
+	for (i = 0; i < CAL_BINS; i++) {
+		int b = (first + i) % CAL_BINS;
+		float p[2];
+
+		if (sCal.binR[b] <= CAL_MIN_R) {
+			gap++;
+			continue;
+		}
+		if (gap > CAL_BINS / 8) {
+			vx[n] = c[0], vy[n] = c[1], n++;
+		}
+		gap = 0;
+		cal_plot(sCal.binX[b], sCal.binY[b], p);
+		vx[n] = p[0], vy[n] = p[1], n++;
+	}
+	if (gap + first > CAL_BINS / 8) { // the wrap back to the first point
+		vx[n] = c[0], vy[n] = c[1], n++;
+	}
+	if (n < 3) {
+		return;
+	}
+	memset(cov, 0, sizeof(cov));
+	// Each sub-row: the even-odd spans between edge crossings, added to the
+	// pixels they cover (fractional at the ends)
+	for (sy = 0; sy < size * SUB; sy++) {
+		const float py = oy + (sy + 0.5f) / SUB;
+		float xs[MAXV];
+		int nx = 0, j;
+
+		for (i = 0; i < n; i++) {
+			j = (i + 1) % n;
+			if ((vy[i] <= py) != (vy[j] <= py)) {
+				xs[nx++] = vx[i] + (py - vy[i]) / (vy[j] - vy[i]) * (vx[j] - vx[i]) - ox;
+			}
+		}
+		for (i = 1; i < nx; i++) { // insertion sort: few crossings
+			float t = xs[i];
+			for (j = i; j > 0 && xs[j - 1] > t; j--) {
+				xs[j] = xs[j - 1];
+			}
+			xs[j] = t;
+		}
+		for (i = 0; i + 1 < nx; i += 2) {
+			float x0 = xs[i] < 0 ? 0 : xs[i], x1 = xs[i + 1] > size ? size : xs[i + 1];
+
+			for (x = (int)x0; x < size && x < x1; x++) {
+				float l = x0 > x ? x0 : x, r = x1 < x + 1 ? x1 : x + 1;
+				cov[sy / SUB][x] += (r - l) / SUB;
+			}
+		}
+	}
+	for (y = 0; y < size; y++) {
+		for (x = 0; x < size; x++) {
+			if (cov[y][x] > 0) {
+				blend(ox + x, oy + y, rgb, a * clamp01(cov[y][x]));
+			}
+		}
+	}
+	for (i = 0; i < n; i++) {
+		cal_line(vx[i], vy[i], vx[(i + 1) % n], vy[(i + 1) % n], edgeRgb, 1.0f);
+	}
+}
+
+/* The B/A/X buttons' letters, 6x8, for draw_button */
+static const char* const kLetterA[8] = { ".####.", "##..##", "##..##", "##..##", "######", "##..##", "##..##", "##..##" };
+static const char* const kLetterX[8] = { "##..##", "##..##", ".####.", "..##..", "..##..", ".####.", "##..##", "##..##" };
+
+static void draw_button(int x0, int y0, const char* const* letter);
+
+/* "[button] label" at (x, y); returns the x after it */
+static int cal_hint(int x, int y, const char* const* letter, const char* label) {
+	draw_button(x, y + 1, letter);
+	draw_text(label, x + 14 + 6, y, 1, argb(0xffffff, 1.0f));
+	return x + 14 + 6 + (int)strlen(label) * 8 + 16;
+}
+
+/* Horizontal progress bar, like the brightness slider's */
+static void cal_bar(int x, int y, int w, float f) {
+	fill(x, y, w, 6, argb(0x2c2c40, 1.0f));
+	fill(x, y, (int)(w * clamp01(f)), 6, argb(CAL_ACCENT, 1.0f));
+}
+
+/* The static parts: background, plot disc and its full-deflection ring, title */
+static void cal_draw_bg(void) {
+	fill(0, 0, BUF_W, BUF_H, argb(CAL_BG, 1.0f));
+	cal_circle(CAL_X, CAL_Y, CAL_R + 6, 0, CAL_DISC, 1.0f);
+	cal_circle(CAL_X, CAL_Y, CAL_R * 127 / 128.0f, 1.5f, CAL_RING, 1.0f);
+	draw_text("Stick calibration", CAL_TEXT_X, 24, 1, argb(0xffffff, 1.0f));
+	fill(CAL_TEXT_X, 46, BUF_W - CAL_TEXT_X - 16, 1, argb(CAL_GRID, 1.0f));
+	memcpy(sCalBg, sBack, sizeof(sCalBg));
+}
+
+/* Steps, the current one's instructions, the buttons */
+static void cal_draw_text(uint64_t now) {
+	static const char* const kSteps[3] = { "Centre", "Rotate", "Test" };
+	const uint32_t white = argb(0xffffff, 1.0f), dim = argb(CAL_DIM, 1.0f);
+	const int w = BUF_W - CAL_TEXT_X - 16;
+	char line[32];
+	int i, y = 60, x;
+
+	for (i = 0; i < 3; i++, y += 22) {
+		snprintf(line, sizeof(line), "%d  %s", i + 1, kSteps[i]);
+		if (i == sCal.phase) {
+			fill(CAL_TEXT_X - 6, y - 3, w + 12, 22, argb(CAL_ACCENT, 1.0f));
+		}
+		draw_text(line, CAL_TEXT_X, y, 1, i <= sCal.phase ? white : dim);
+	}
+	y += 14;
+	if (sCal.phase == CAL_CENTER) {
+		draw_text("Let go of the", CAL_TEXT_X, y, 1, white);
+		draw_text("stick", CAL_TEXT_X, y + 18, 1, white);
+		cal_bar(CAL_TEXT_X, y + 46, w,
+		        sCal.restSince != 0 ? (float)(now - sCal.restSince) / CAL_REST_MS : 0.0f);
+	} else if (sCal.phase == CAL_ROTATE) {
+		draw_text("Roll the stick", CAL_TEXT_X, y, 1, white);
+		draw_text("around its edge", CAL_TEXT_X, y + 18, 1, white);
+		snprintf(line, sizeof(line), "Turns %.1f / %.0f", fabs(sCal.turns) < CAL_TURNS ? fabs(sCal.turns) : CAL_TURNS,
+		         CAL_TURNS);
+		draw_text(line, CAL_TEXT_X, y + 46, 1, dim);
+		cal_bar(CAL_TEXT_X, y + 66, w, (float)(fabs(sCal.turns) / CAL_TURNS));
+		snprintf(line, sizeof(line), "Directions %d%%", sCal.filled * 100 / CAL_BINS);
+		draw_text(line, CAL_TEXT_X, y + 82, 1, dim);
+		cal_bar(CAL_TEXT_X, y + 102, w, (float)sCal.filled / (CAL_BINS * 3 / 4));
+	} else {
+		draw_text("The stick should", CAL_TEXT_X, y, 1, white);
+		draw_text("reach the circle", CAL_TEXT_X, y + 18, 1, white);
+		draw_text("evenly all round", CAL_TEXT_X, y + 36, 1, white);
+		cal_circle(CAL_TEXT_X + 5, y + 72, 4.5f, 0, CAL_FIXED, 1.0f);
+		draw_text("corrected", CAL_TEXT_X + 18, y + 64, 1, dim);
+		cal_circle(CAL_TEXT_X + 5, y + 92, 4.5f, 0, 0xffffff, 1.0f);
+		draw_text("raw", CAL_TEXT_X + 18, y + 84, 1, dim);
+	}
+	x = CAL_TEXT_X;
+	if (sCal.phase == CAL_TEST) {
+		x = cal_hint(x, BUF_H - 52, kLetterA, "Save");
+		cal_hint(x, BUF_H - 52, kLetterX, "Redo");
+	}
+	cal_hint(CAL_TEXT_X, BUF_H - 30, kLetterB, "Cancel");
+}
+
+/* The volume box over the calibration: drawn as over the menu, then its
+   translucent pixels blended over the calibration under them, so the frozen
+   app doesn't show through */
+static void cal_draw_osd(void) {
+	static uint32_t under[BOX_W * BOX_H];
+	int x, y;
+
+	for (y = 0; y < BOX_H; y++) {
+		for (x = 0; x < BOX_W; x++) {
+			under[y * BOX_W + x] = sBack[(BUF_W - 1 - (BOX_X + x)) * BUF_H + BOX_Y + y];
+		}
+	}
+	draw_osd(BOX_X, BOX_Y, sIcon, sShown, sAlpha);
+	for (y = 0; y < BOX_H; y++) {
+		for (x = 0; x < BOX_W; x++) {
+			uint32_t* p = &sBack[(BUF_W - 1 - (BOX_X + x)) * BUF_H + BOX_Y + y];
+			uint32_t b = under[y * BOX_W + x];
+
+			*p = (b & 0xff000000) | mix(*p & 0xffffff, b & 0xffffff, (*p >> 24) / 255.0f);
+		}
+	}
+}
+
+static void cal_draw(uint64_t now) {
+	float p[2];
+
+	memcpy(sBack, sCalBg, sizeof(sBack));
+	if (sCal.phase != CAL_CENTER) {
+		cal_mesh(CAL_ACCENT, 0.45f, CAL_EDGE);
+	}
+	cal_plot(sCal.rx - sCal.cx, sCal.ry - sCal.cy, p); // raw, around the centre found (128 until then)
+	cal_circle(p[0], p[1], 4.5f, 0, 0xffffff, 1.0f);
+	if (sCal.phase == CAL_TEST) { // corrected, as the driver will report it
+		double o[2];
+
+		cal_corrected(sCal.rx, sCal.ry, o);
+		cal_plot(o[0], o[1], p);
+		cal_circle(p[0], p[1], 4.5f, 0, CAL_FIXED, 1.0f);
+	}
+	cal_draw_text(now);
+	if (sAlpha > 0.0f && !osd_is_battery()) { // volume changes, as over the menu
+		cal_draw_osd();
+	}
+}
+
+/* --- Steps --- */
+
+static void cal_update(uint64_t now) {
+	const double dx = sCal.rx - sCal.cx, dy = sCal.ry - sCal.cy, r = sqrt(dx * dx + dy * dy), ang = atan2(dy, dx);
+	int i;
+
+	if (sCal.log != NULL) { // ms, step, raw x, raw y, centre
+		fprintf(sCal.log, "%llu %d %d %d %.1f %.1f\n", (unsigned long long)(now - sCal.start), sCal.phase, sCal.rx,
+		        sCal.ry, sCal.cx, sCal.cy);
+	}
+	if (sCal.phase == CAL_CENTER) {
+		// CAL_REST_MS of samples within a few counts of each other
+		sCal.minX = sCal.rx < sCal.minX ? sCal.rx : sCal.minX;
+		sCal.maxX = sCal.rx > sCal.maxX ? sCal.rx : sCal.maxX;
+		sCal.minY = sCal.ry < sCal.minY ? sCal.ry : sCal.minY;
+		sCal.maxY = sCal.ry > sCal.maxY ? sCal.ry : sCal.maxY;
+		if (sCal.maxX - sCal.minX > 4 || sCal.maxY - sCal.minY > 4 || sCal.restSince == 0) {
+			sCal.sumX = sCal.sumY = 0;
+			sCal.samples = 0;
+			sCal.minX = sCal.maxX = sCal.rx;
+			sCal.minY = sCal.maxY = sCal.ry;
+			sCal.restSince = now;
+		}
+		sCal.sumX += sCal.rx;
+		sCal.sumY += sCal.ry;
+		sCal.samples++;
+		if (now - sCal.restSince >= CAL_REST_MS) {
+			sCal.cx = lround(sCal.sumX / sCal.samples); // whole counts, as the driver takes it
+			sCal.cy = lround(sCal.sumY / sCal.samples);
+			sCal.phase = CAL_ROTATE;
+		}
+	} else if (sCal.phase == CAL_ROTATE) {
+		int b = (int)((ang + M_PI) / (2 * M_PI) * CAL_BINS) % CAL_BINS;
+		double maxR = 0;
+
+		for (i = 0; i < CAL_BINS; i++) {
+			maxR = sCal.binR[i] > maxR ? sCal.binR[i] : maxR;
+		}
+		if (r > sCal.binR[b]) {
+			sCal.binR[b] = r;
+			sCal.binX[b] = dx;
+			sCal.binY[b] = dy;
+		}
+		// Count turns made near the edge
+		if (r > 0.6 * maxR && r > CAL_MIN_R) {
+			if (sCal.haveAng) {
+				double d = ang - sCal.lastAng;
+				d = d > M_PI ? d - 2 * M_PI : d < -M_PI ? d + 2 * M_PI : d;
+				sCal.turns += d / (2 * M_PI);
+			}
+			sCal.lastAng = ang;
+			sCal.haveAng = 1;
+		} else {
+			sCal.haveAng = 0;
+		}
+		sCal.filled = 0;
+		for (i = 0; i < CAL_BINS; i++) {
+			sCal.filled += sCal.binR[i] > CAL_MIN_R;
+		}
+		if (sCal.filled >= CAL_BINS * 3 / 4 && fabs(sCal.turns) >= CAL_TURNS) {
+			for (i = 0; i < CAL_EDGES; i++) {
+				double e = cal_reach(i * 2 * M_PI / CAL_EDGES) * 16;
+				sCal.edge[i] = e < 16 ? 16 : e > 256 * 16 ? 256 * 16 : (int)lround(e);
+			}
+			sCal.phase = CAL_TEST;
+		}
+	}
+}
+
+/* Opens the calibration from the system page: the driver to raw values */
+static void cal_open(void) {
+	struct input_absinfo ax, ay;
+	glob_t g;
+	FILE* f;
+
+	if (sPadFd < 0 || glob(CAL_SYSFS_GLOB, 0, NULL, &g) != 0) {
+		fprintf(stderr, "s30-display: calibration: no gamepad calibration attribute\n");
+		return;
+	}
+	snprintf(sCal.sysfs, sizeof(sCal.sysfs), "%s", g.gl_pathv[0]);
+	globfree(&g);
+	sCal.previous[0] = '\0';
+	f = fopen(sCal.sysfs, "r");
+	if (f != NULL) {
+		if (fgets(sCal.previous, sizeof(sCal.previous), f) == NULL) {
+			sCal.previous[0] = '\0';
+		}
+		fclose(f);
+	}
+	cal_write(sCal.sysfs, CAL_IDENTITY);
+	sCal.rx = ioctl(sPadFd, EVIOCGABS(ABS_X), &ax) == 0 ? ax.value : 128;
+	sCal.ry = ioctl(sPadFd, EVIOCGABS(ABS_Y), &ay) == 0 ? ay.value : 128;
+	cal_restart();
+	sCal.log = fopen(CAL_LOG, "w");
+	sCal.start = now_ms();
+	sMenuPage = 2;
+	cal_draw_bg();
+}
+
+/* Leaves it: `save` the fit (test step), else the driver as it was */
+static void cal_close(int save) {
+	char text[512];
+	int len, i;
+
+	len = snprintf(text, sizeof(text), "%d %d 4096 0 0 4096 %d", (int)lround(sCal.cx), (int)lround(sCal.cy),
+	               CAL_DEADZONE);
+	for (i = 0; i < CAL_EDGES; i++) {
+		len += snprintf(text + len, sizeof(text) - len, " %d", sCal.edge[i]);
+	}
+	snprintf(text + len, sizeof(text) - len, "\n");
+	if (save) {
+		save = cal_write(sCal.sysfs, text) && cal_write(CAL_FILE, text);
+		printf("s30-display: calibration %s: %s", save ? "saved" : "save FAILED", text);
+	}
+	if (!save) {
+		cal_write(sCal.sysfs, sCal.previous[0] != '\0' ? sCal.previous : "128 128 4096 0 0 4096");
+	}
+	if (sCal.log != NULL) {
+		fprintf(sCal.log, "# %s %s", save ? "saved" : "not saved", text);
+		fclose(sCal.log);
+		sCal.log = NULL;
+	}
+	sMenuPage = 1;
+}
+
+static void cal_input(const struct input_event* ev) {
+	if (ev->type == EV_ABS) {
+		if (ev->code == ABS_X) {
+			sCal.rx = ev->value;
+		} else if (ev->code == ABS_Y) {
+			sCal.ry = ev->value;
+		}
+	} else if (ev->type == EV_KEY && ev->value == 1) {
+		if (ev->code == BTN_SOUTH) { // B: cancel
+			cal_close(0);
+			menu_redraw();
+		} else if (ev->code == BTN_EAST && sCal.phase == CAL_TEST) { // A: save
+			cal_close(1);
+			menu_redraw();
+		} else if (ev->code == BTN_NORTH && sCal.phase == CAL_TEST) { // X: redo
+			cal_restart();
+		}
+	}
+}
+
+/* A frame while calibrating (paced by the vblank); whether it drew */
+static int cal_frame(void) {
+	uint64_t now;
+
+	if (!sMenu || sMenuPage != 2) {
+		return 0;
+	}
+	now = now_ms();
+	cal_update(now);
+	cal_draw(now);
+	present_synced();
+	return 1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -645,7 +1217,9 @@ static int osd_frame(void) {
 	if (sShown - sTarget < 0.2f && sTarget - sShown < 0.2f) {
 		sShown = sTarget;
 	}
-	if (sMenu) {
+	if (sMenu && sMenuPage == 2) {
+		// The calibration redraws every frame: it draws the box itself
+	} else if (sMenu) {
 		// Above the menu (the plane is the menu's, the whole screen): redraw
 		// and copy in only the box's spot
 		fill(BOX_X, BOX_Y, BOX_W, BOX_H, 0);
@@ -717,8 +1291,8 @@ static void menu_open(void) {
 	}
 	kill(sAppPid, SIGSTOP);
 	sMenu = 1;
-	sMenuPage = 0;
-	sMenuSel = sMenuLauncher ? SYS_CANCEL : APP_RESUME;
+	sMenuPage = sMenuLauncher; // the launcher has no app page
+	sMenuSel = sMenuLauncher ? SYS_BACK : APP_RESUME;
 	sAlpha = 0.0f;
 	sOsdUntil = 0;
 	// Move the plane only while it is transparent, then draw the menu: the
@@ -734,6 +1308,9 @@ static void menu_open(void) {
 static void menu_close(int exitApp) {
 	if (!sMenu) {
 		return;
+	}
+	if (sMenuPage == 2) {
+		cal_close(0); // the driver back as it was
 	}
 	sMenu = 0;
 	sAlpha = 0.0f; // the OSD box goes with the menu
@@ -800,38 +1377,51 @@ static void menu_redraw(void) {
 
 static void perf_save(void);
 
+/* B, or the system page's last row: the app page, or out of the menu */
+static void menu_back(void) {
+	sRepeatDir = 0;
+	if (sMenuPage && !sMenuLauncher) {
+		sMenuPage = 0;
+		sMenuSel = APP_SYSTEM;
+		menu_redraw();
+	} else {
+		menu_close(0);
+	}
+}
+
 static void menu_confirm(void) {
-	if (sMenuPage) {
-		if (sMenuSel == SET_PERF) {
+	if (!sMenuPage) {
+		if (sMenuSel == APP_SYSTEM) {
+			sMenuPage = 1;
+			sMenuSel = SYS_BRIGHTNESS;
+			menu_redraw();
+		} else {
+			menu_close(sMenuSel == APP_EXIT);
+		}
+		return;
+	}
+	switch (sMenuSel) {
+		case SYS_PERF:
 			sPerf = !sPerf;
 			perf_save();
 			menu_redraw();
-		} else if (sMenuSel == SET_BACK) {
-			sMenuPage = 0;
-			sMenuSel = 0;
-			menu_redraw();
-		}
-		return; // the brightness slider: left/right only
-	}
-	if (sMenuSel == 0) {
-		sMenuPage = 1; // settings
-		sMenuSel = SET_BRIGHTNESS;
-		menu_redraw();
-		return;
-	}
-	if ((sMenuLauncher && sMenuSel == SYS_SLEEP) || (!sMenuLauncher && sMenuSel == APP_SLEEP)) {
-		system_sleep();
-		menu_close(0);
-		return;
-	}
-	if (!sMenuLauncher) {
-		menu_close(sMenuSel == APP_EXIT);
-		return;
-	}
-	menu_close(0);
-	if (sMenuSel != SYS_CANCEL) {
-		run_system(sMenuSel == SYS_REBOOT ? "reboot" : "poweroff");
-	}
+			break;
+		case SYS_CALIBRATE:
+			cal_open(); // drawn by cal_frame
+			break;
+		case SYS_SLEEP:
+			system_sleep();
+			menu_close(0);
+			break;
+		case SYS_REBOOT:
+		case SYS_POWEROFF:
+			menu_close(0); // the app runs again, so init's SIGTERM reaches it
+			run_system(sMenuSel == SYS_REBOOT ? "reboot" : "poweroff");
+			break;
+		case SYS_BACK:
+			menu_back();
+			break;
+	} // the brightness slider: left/right only
 }
 
 /* ---------------------------------------------------------------------------
@@ -974,6 +1564,10 @@ static void menu_input(void) {
 	int i, redraw = 0;
 
 	for (i = 0; n > 0 && i < (int)(n / sizeof(ev[0])); i++) {
+		if (sMenuPage == 2) {
+			cal_input(&ev[i]);
+			continue;
+		}
 		if (ev[i].type != EV_KEY) {
 			continue;
 		}
@@ -1004,14 +1598,7 @@ static void menu_input(void) {
 				menu_confirm();
 				return;
 			case BTN_SOUTH: // B: back
-				if (sMenuPage) {
-					sMenuPage = 0;
-					sMenuSel = 0;
-					sRepeatDir = 0;
-					menu_redraw();
-				} else {
-					menu_close(0);
-				}
+				menu_back();
 				return;
 		}
 	}
@@ -1230,7 +1817,7 @@ static void handle_client(int c) {
 }
 
 /* ---------------------------------------------------------------------------
- * Performance overlay (Settings > Overlay), like MangoHud: FPS and frame
+ * Performance overlay (System > Overlay), like MangoHud: FPS and frame
  * times of the app on screen (from the page flips libs30lease.so marks in the
  * S30_FRAMES_PATH ring), CPU, GPU, temperatures, memory, battery. A box at
  * the left edge; the plane covers the whole screen while it is on.
@@ -1239,7 +1826,7 @@ static void handle_client(int c) {
 #define PERF_MS 100         // redraw (FPS and the graph)
 #define PERF_SAMPLE_MS 1000 // system stats
 #define PERF_X 4
-#define PERF_W 176
+#define PERF_W 192 // 22 characters (the TEMP line) and margins
 #define PERF_GRAPH_H 28
 #define PERF_LINES 7
 #define PERF_H (6 + 16 + PERF_GRAPH_H + 4 + (PERF_LINES - 1) * 16 + 6)
@@ -1248,7 +1835,7 @@ static void handle_client(int c) {
 
 static S30Frames* sFrames;
 static char sGpuFreq[300], sPmicTemp[300];
-static char sPerfLine[PERF_LINES - 1][40]; // system stat lines, label first
+static char sPerfLine[PERF_LINES - 1][80]; // system stat lines, label first (with PERF_* colours)
 static int sPerfLabelLen[PERF_LINES - 1];
 static uint64_t sPerfSampleAt;
 
@@ -1391,6 +1978,34 @@ static long meminfo(const char* key) {
 	return v;
 }
 
+/* Colour switches inside the stat lines (perf_text) */
+#define PERF_WHITE "\x01"
+#define PERF_GREEN "\x02"
+#define PERF_YELLOW "\x03"
+#define PERF_RED "\x04"
+#define PERF_CYAN "\x05"
+static const uint32_t kPerfColours[] = { 0, 0xffffff, 0x60d060, 0xe0c040, 0xe04040, 0x60c0e0 };
+
+/* Green below `warn`, yellow below `hot`, red from there */
+static const char* perf_level(double v, double warn, double hot) {
+	return v < warn ? PERF_GREEN : v < hot ? PERF_YELLOW : PERF_RED;
+}
+
+/* draw_text with the PERF_* colour switches, starting in `rgb` */
+static void perf_text(const char* text, int x, int y, uint32_t rgb) {
+	char one[2] = { 0, 0 };
+
+	for (; *text != '\0'; text++) {
+		if ((unsigned char)*text < sizeof(kPerfColours) / sizeof(kPerfColours[0])) {
+			rgb = kPerfColours[(unsigned char)*text];
+			continue;
+		}
+		one[0] = *text;
+		draw_text(one, x, y, 1, argb(rgb, 1.0f));
+		x += 8;
+	}
+}
+
 /* The system stat lines, once a second */
 static void perf_sample(void) {
 	char path[340], buf[64];
@@ -1407,9 +2022,11 @@ static void perf_sample(void) {
 		snprintf(sPerfLine[n] + l_, sizeof(sPerfLine[n]) - l_, __VA_ARGS__);                   \
 		sPerfLabelLen[n++] = l_;                                                               \
 	} while (0)
-	LINE("CPU ", "%3d%% %4ldMHz", total, read_long("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") / 1000);
-	LINE("    ", "%3d %3d %3d %3d", core[0], core[1], core[2], core[3]);
-	LINE("GPU ", "%4ldMHz", sGpuFreq[0] ? read_long(sGpuFreq) / 1000000 : 0);
+	LINE("CPU ", "%s%3d%% " PERF_CYAN "%4ldMHz", perf_level(total, 50, 80), total,
+	     read_long("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") / 1000);
+	LINE("    ", "%s%3d %s%3d %s%3d %s%3d", perf_level(core[0], 50, 80), core[0], perf_level(core[1], 50, 80), core[1],
+	     perf_level(core[2], 50, 80), core[2], perf_level(core[3], 50, 80), core[3]);
+	LINE("GPU ", PERF_CYAN "%4ldMHz", sGpuFreq[0] ? read_long(sGpuFreq) / 1000000 : 0);
 	if (sPmicTemp[0]) {
 		long raw, ofs, scale;
 		snprintf(path, sizeof(path), "%s_raw", sPmicTemp);
@@ -1421,11 +2038,13 @@ static void perf_sample(void) {
 		pmic = (raw + ofs) * scale; // millidegrees
 	}
 	if (soc > -1000000 && soc != -1) {
-		LINE("TEMP", " SoC %2ldC PMU %2ldC", soc / 1000, pmic / 1000);
+		LINE("TEMP", " SoC %s%2ld" OSD_DEGREE "C" PERF_WHITE " PMU %s%2ld" OSD_DEGREE "C", perf_level(soc / 1000, 60, 75),
+		     soc / 1000, perf_level(pmic / 1000, 60, 75), pmic / 1000);
 	} else {
-		LINE("TEMP", " PMU %2ldC", pmic / 1000);
+		LINE("TEMP", " PMU %s%2ld" OSD_DEGREE "C", perf_level(pmic / 1000, 60, 75), pmic / 1000);
 	}
-	LINE("RAM ", "%3ld/%3ldMB", (memTotal - memAvail) / 1024, memTotal / 1024);
+	LINE("RAM ", "%s%3ld" PERF_WHITE "/%3ldMB", perf_level(memTotal - memAvail, memTotal * 0.7, memTotal * 0.9),
+	     (memTotal - memAvail) / 1024, memTotal / 1024);
 	external_power(&capacity, &charging);
 	d = opendir(POWER_SUPPLY);
 	while (d != NULL && (e = readdir(d)) != NULL) {
@@ -1442,7 +2061,8 @@ static void perf_sample(void) {
 	if (d != NULL) {
 		closedir(d);
 	}
-	LINE("BAT ", "%3d%% %ld.%02ldV %+ldmA", capacity, v / 1000000, v % 1000000 / 10000, ma);
+	LINE("BAT ", "%s%3d%%" PERF_WHITE " %ld.%02ldV %s%+ldmA", capacity > 50 ? PERF_GREEN : capacity > 20 ? PERF_YELLOW : PERF_RED,
+	     capacity, v / 1000000, v % 1000000 / 10000, ma > 0 ? PERF_GREEN : PERF_WHITE, ma);
 #undef LINE
 }
 
@@ -1497,7 +2117,7 @@ static void perf_draw(uint64_t nowMs) {
 	} else {
 		snprintf(text, sizeof(text), "  - ");
 	}
-	draw_text(text, x0 + 4 * 8, PERF_Y + 6, 1, argb(0xffffff, 1.0f));
+	draw_text(text, x0 + 4 * 8, PERF_Y + 6, 1, argb(0x60c0e0, 1.0f));
 	// Frame time graph, newest at the right: bars to PERF_GRAPH_MS; a spike
 	// (over 1.5x the average) in red; a line at the average
 	fill(x0, gy, PERF_W - 12, PERF_GRAPH_H, argb(0x000000, 0.35f));
@@ -1522,7 +2142,7 @@ static void perf_draw(uint64_t nowMs) {
 
 		snprintf(label, sizeof(label), "%.*s", sPerfLabelLen[i], sPerfLine[i]);
 		draw_text(label, x0, y, 1, argb(0xe0a050, 1.0f));
-		draw_text(sPerfLine[i] + sPerfLabelLen[i], x0 + sPerfLabelLen[i] * 8, y, 1, argb(0xffffff, 1.0f));
+		perf_text(sPerfLine[i] + sPerfLabelLen[i], x0 + sPerfLabelLen[i] * 8, y, 0xffffff);
 	}
 	wait_vblank();
 	present_rect(PERF_X, PERF_Y, PERF_W, PERF_H);
@@ -1565,6 +2185,7 @@ int main(int argc, char** argv) {
 		// Wake promptly after a vblank (short bursts; blocks otherwise).
 		// musl's sched_setscheduler() is a stub: the system call itself.
 		struct sched_param sp = { .sched_priority = 1 };
+
 		syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &sp);
 	}
 	for (i = 0; i < 4 && sFd < 0; i++) { // the KMS card (the GPU has its own)
@@ -1608,6 +2229,7 @@ int main(int argc, char** argv) {
 		int animating = osd_frame(); // waits for a vblank when drawing
 
 		animating |= brightness_frame(animating);
+		animating |= cal_frame();
 		perfWait = perf_frame(now_ms());
 
 		if (t >= sNextLeaseCheck) {

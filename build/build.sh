@@ -231,15 +231,15 @@ ensure_sysroot() {
 	done
 }
 
-# Device programs. Launcher apps (launcher/): filebrowser.c, the boot UI that
-# starts RetroArch, OoT and other apps, and joycal.c, the joystick
-# calibration; ui.c is shared. SDL2 (KMS), text in utils/osd_font.h. Utilities (utils/):
-# s30-fel, s30-volumed, s30-splash, s30-keyheld, s30-display and its preload
-# libs30lease.so. Output: $WORK/{launcher,joycal,s30-*}.bin, $WORK/libs30lease.so
+# Device programs. The launcher (launcher/): filebrowser.c, the boot UI that
+# starts RetroArch, OoT and other apps, with ui.c. SDL2 (KMS), text in
+# utils/osd_font.h. Utilities (utils/): s30-fel, s30-volumed, s30-splash,
+# s30-keyheld, s30-display (with the system menu and stick calibration) and its
+# preload libs30lease.so, s30-screenshot (the screen's KMS planes to a PPM). Output: $WORK/{launcher,s30-*}.bin, $WORK/libs30lease.so
 step_launcher() {
 	local app
 	ensure_sysroot
-	for app in filebrowser:launcher joycal:joycal; do
+	for app in filebrowser:launcher; do
 		"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/${app#*:}.bin" \
 			"$PROJECT/launcher/${app%%:*}.c" "$PROJECT/launcher/ui.c" \
 			-I"$WORK/sysroot/usr/include/SDL2" -lSDL2 -lm
@@ -253,10 +253,12 @@ step_launcher() {
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-splash.bin" "$PROJECT/utils/s30-splash.c"
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-keyheld.bin" "$PROJECT/utils/s30-keyheld.c"
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-display.bin" "$PROJECT/utils/s30-display.c" \
+		-I"$WORK/sysroot/usr/include/libdrm" -ldrm -lm
+	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-screenshot.bin" "$PROJECT/utils/s30-screenshot.c" \
 		-I"$WORK/sysroot/usr/include/libdrm" -ldrm
 	"$WORK/bin/armv7-clang" -O2 -Wall -fPIC -shared -o "$WORK/libs30lease.so" "$PROJECT/utils/s30-lease.c"
 	llvm-strip "$WORK/s30-fel.bin" "$WORK/s30-volumed.bin" "$WORK/s30-splash.bin" \
-		"$WORK/s30-keyheld.bin" "$WORK/s30-display.bin" "$WORK/libs30lease.so"
+		"$WORK/s30-keyheld.bin" "$WORK/s30-display.bin" "$WORK/s30-screenshot.bin" "$WORK/libs30lease.so"
 }
 
 # RetroArch, cross-compiled with clang for armv7 musl against an Alpine
@@ -346,8 +348,6 @@ step_initramfs() {
 		install -m 0755 "$WORK/retroarch.bin" "$root/usr/bin/retroarch"
 	[ -f "$WORK/launcher.bin" ] &&
 		install -m 0755 "$WORK/launcher.bin" "$root/usr/bin/s30-launcher"
-	[ -f "$WORK/joycal.bin" ] &&
-		install -m 0755 "$WORK/joycal.bin" "$root/usr/bin/s30-joycal"
 	[ -f "$WORK/s30-fel.bin" ] &&
 		install -m 0755 "$WORK/s30-fel.bin" "$root/usr/bin/s30-fel"
 	[ -f "$WORK/s30-volumed.bin" ] &&
@@ -356,6 +356,8 @@ step_initramfs() {
 		install -m 0755 "$WORK/s30-splash.bin" "$root/usr/bin/s30-splash"
 	[ -f "$WORK/s30-display.bin" ] &&
 		install -m 0755 "$WORK/s30-display.bin" "$root/usr/bin/s30-display"
+	[ -f "$WORK/s30-screenshot.bin" ] &&
+		install -m 0755 "$WORK/s30-screenshot.bin" "$root/usr/bin/s30-screenshot"
 	[ -d "$WORK/emulationstation-root" ] &&
 		cp -r "$WORK/emulationstation-root/." "$root/"
 	# EmulationStation theme (submodule external/es-theme-carbon)

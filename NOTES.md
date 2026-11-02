@@ -11,8 +11,8 @@ leaving the stock firmware in SPI flash untouched (remove the card = stock).
 
 - Boots standalone from SD (verified on a FAT32 card): U-Boot splash (stock
   PocketGo logo) -> kernel logo -> splash with progress bar -> launcher
-  (s30-launcher: RetroArch, Ocarina of Time, Super Mario 64, joystick
-  calibration; power key = system menu). See "Standalone SD card
+  (s30-launcher: RetroArch, Ocarina of Time, Super Mario 64; power key =
+  system menu, with the joystick calibration under System). See "Standalone SD card
   boot" and "Linux system".
 - Since 2026-10-29: BusyBox init (rootfs-overlay), kernel-owned headphone
   jack, system volume daemon, boot splash, quieter amp pops, OoT audio fixed
@@ -80,7 +80,7 @@ build/
   fel.cmd / fel-ram.cmd   Boot scripts (fel.scr is also /boot/boot.scr on SD)
   splash/logo.bmp         U-Boot splash (stock logo, 320x480 panel-native)
   u-boot/                 defconfig + board devicetree
-launcher/                 Launcher (filebrowser.c) and joystick calibration
+launcher/                 Launcher (filebrowser.c)
 utils/                    s30-fel (reboot into FEL), s30-volumed (volume keys,
                           jack), s30-display (DRM lease broker + OSD) with its
                           preload libs30lease.so
