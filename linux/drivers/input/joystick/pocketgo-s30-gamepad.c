@@ -10,11 +10,16 @@
  * As mounted, A is the vertical axis (low = up) and B the horizontal one
  * (high = right), matching ABS_Y and ABS_X directly.
  *
- * Stick calibration (sysfs "calibration", written by the calibration app):
- * "cx cy m00 m01 m10 m11 [deadzone]", reported = 128 + M * (raw - c) per
- * sample, M in Q12 fixed point (4096 = 1.0), clamped to 0-255. The default
- * (128 128 4096 0 0 4096 8) passes raw values through apart from the
- * deadzone; the calibration app sets deadzone 0 to read raw values.
+ * Stick calibration (sysfs "calibration", written by the calibration in
+ * s30-display): "cx cy m00 m01 m10 m11 [deadzone [e0 .. e31]]", v = M *
+ * (raw - c) per sample, M in Q12 fixed point (4096 = 1.0). Without the edge
+ * table v is reported as is; with it, e0..e31 are how far v reaches (in 1/16
+ * raw counts) in 32 directions, from +x (right) towards +y (down), and v is
+ * scaled by 127 over the edge in its direction (interpolated between the two
+ * nearest), so a stick of any shape reaches full deflection all round.
+ * Reported = 128 + v, clamped to 0-255. The default (128 128 4096 0 0 4096 8)
+ * passes raw values through apart from the deadzone; the calibration sets
+ * deadzone 0 and no edges to read raw values.
  *
  * Before calibration the raw samples are smoothed (each output the average of
  * the new sample and the previous output, about 20 ms of lag at the 10 ms
@@ -36,6 +41,7 @@
 #define S30_GAMEPAD_POLL_MS	10
 #define S30_DEADZONE		8
 #define S30_GAMEPAD_MAX_KEYS	32
+#define S30_EDGES		32	/* directions in the edge table */
 
 struct s30_gamepad_key {
 	struct gpio_desc *gpiod;
@@ -47,10 +53,43 @@ struct s30_gamepad {
 	struct input_dev *input;
 	struct mutex cal_lock;
 	int cal[7];		/* cx cy m00 m01 m10 m11 deadzone */
+	int edge[S30_EDGES];	/* reach per direction, 1/16 counts (0: no table) */
 	int fx, fy;		/* smoothed raw stick, 1/16 units (-1: none yet) */
 	unsigned int nkeys;
 	struct s30_gamepad_key keys[] __counted_by(nkeys);
 };
+
+/*
+ * Direction of (x, y) in 1/65536 turns from +x towards +y: per octant,
+ * atan(z) / 2pi ~ z / 8 + 0.0435 z (1 - z) for z = min / max (error about
+ * 0.0006 turn, 1/50 of a table step)
+ */
+static u32 s30_turn(s64 x, s64 y)
+{
+	s64 ax = abs(x), ay = abs(y), lo = min(ax, ay), hi = max(ax, ay);
+	s64 z, a;
+
+	if (hi == 0)
+		return 0;
+	z = div64_s64(lo << 16, hi);		/* 0..65536 */
+	a = z / 8 + div64_s64(2848 * z * (65536 - z), 65536LL * 65536);
+	if (ay > ax)
+		a = 16384 - a;			/* from the y axis */
+	if (x < 0)
+		a = 32768 - a;
+	if (y < 0)
+		a = 65536 - a;
+	return (u32)a & 0xffff;
+}
+
+/* The edge table's reach in the direction of (x, y), 1/16 counts */
+static int s30_edge(const int *edge, int x, int y)
+{
+	u32 pos = s30_turn(x, y) * S30_EDGES;	/* Q16 table index */
+	u32 i = pos >> 16, f = pos & 0xffff;
+
+	return (edge[i] * (65536 - f) + edge[(i + 1) % S30_EDGES] * f) >> 16;
+}
 
 static void s30_gamepad_poll(struct input_dev *input)
 {
@@ -62,7 +101,7 @@ static void s30_gamepad_poll(struct input_dev *input)
 	ret = i2c_master_recv(gp->client, buf, sizeof(buf));
 	if (ret == sizeof(buf) && (u8)(buf[0] + buf[1]) == 0xff &&
 	    (u8)(buf[2] + buf[3]) == 0xff) {
-		int dx, dy, x, y, r, dz;
+		int dx, dy, vx, vy, x, y, r, dz;
 
 		if (gp->fx < 0) {
 			gp->fx = buf[2] * 16;
@@ -74,8 +113,18 @@ static void s30_gamepad_poll(struct input_dev *input)
 		mutex_lock(&gp->cal_lock);
 		dx = gp->fx - gp->cal[0] * 16;
 		dy = gp->fy - gp->cal[1] * 16;
-		x = (gp->cal[2] * dx + gp->cal[3] * dy) / (4096 * 16);
-		y = (gp->cal[4] * dx + gp->cal[5] * dy) / (4096 * 16);
+		vx = (gp->cal[2] * dx + gp->cal[3] * dy) / 4096; /* 1/16 counts */
+		vy = (gp->cal[4] * dx + gp->cal[5] * dy) / 4096;
+		if (gp->edge[0]) {
+			int e = s30_edge(gp->edge, vx, vy);
+
+			/* out to the clamp below, beyond the edge */
+			x = clamp(vx * 127 / e, -255, 255);
+			y = clamp(vy * 127 / e, -255, 255);
+		} else {
+			x = vx / 16;
+			y = vy / 16;
+		}
 		dz = gp->cal[6];
 		mutex_unlock(&gp->cal_lock);
 
@@ -109,11 +158,15 @@ static ssize_t calibration_show(struct device *dev,
 {
 	struct s30_gamepad *gp = i2c_get_clientdata(to_i2c_client(dev));
 	ssize_t len;
+	int i;
 
 	mutex_lock(&gp->cal_lock);
-	len = sysfs_emit(buf, "%d %d %d %d %d %d %d\n", gp->cal[0], gp->cal[1],
+	len = sysfs_emit(buf, "%d %d %d %d %d %d %d", gp->cal[0], gp->cal[1],
 			 gp->cal[2], gp->cal[3], gp->cal[4], gp->cal[5],
 			 gp->cal[6]);
+	for (i = 0; gp->edge[0] && i < S30_EDGES; i++)
+		len += sysfs_emit_at(buf, len, " %d", gp->edge[i]);
+	len += sysfs_emit_at(buf, len, "\n");
 	mutex_unlock(&gp->cal_lock);
 	return len;
 }
@@ -123,14 +176,19 @@ static ssize_t calibration_store(struct device *dev,
 				 const char *buf, size_t count)
 {
 	struct s30_gamepad *gp = i2c_get_clientdata(to_i2c_client(dev));
-	int c[7], i, n;
+	int c[7 + S30_EDGES] = { 0 }, i, n, used;
+	const char *p = buf;
 
-	n = sscanf(buf, "%d %d %d %d %d %d %d", &c[0], &c[1], &c[2], &c[3],
-		   &c[4], &c[5], &c[6]);
+	for (n = 0; n < (int)ARRAY_SIZE(c) && sscanf(p, "%d%n", &c[n], &used) == 1; n++)
+		p += used;
 	if (n == 6)
 		c[6] = S30_DEADZONE;
-	else if (n != 7 || c[6] < 0 || c[6] > 64)
+	else if ((n != 7 && n != (int)ARRAY_SIZE(c)) || c[6] < 0 || c[6] > 64)
 		return -EINVAL;
+	/* edges between 1 and 256 counts */
+	for (i = 7; i < n; i++)
+		if (c[i] < 16 || c[i] > 256 * 16)
+			return -EINVAL;
 	/* centre within the raw range, matrix entries within +-16.0 */
 	if (c[0] < 0 || c[0] > 255 || c[1] < 0 || c[1] > 255)
 		return -EINVAL;
@@ -139,7 +197,8 @@ static ssize_t calibration_store(struct device *dev,
 			return -EINVAL;
 
 	mutex_lock(&gp->cal_lock);
-	memcpy(gp->cal, c, sizeof(c));
+	memcpy(gp->cal, c, sizeof(gp->cal));
+	memcpy(gp->edge, &c[7], sizeof(gp->edge)); /* zeros: no table */
 	mutex_unlock(&gp->cal_lock);
 	return count;
 }
