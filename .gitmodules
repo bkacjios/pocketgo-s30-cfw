@@ -26,3 +26,7 @@
 	path = ports/mm
 	url = https://github.com/bkacjios/mm-s30.git
 	shallow = true
+[submodule "ports/tmc"]
+	path = ports/tmc
+	url = https://github.com/bkacjios/tmc.git
+	shallow = true

@@ -42,6 +42,8 @@ external/                 Submodules, pinned: linux (v7.3), u-boot (v2026.10),
                           retroarch (v1.22.2). Built in worktrees under $WORK.
 ports/oot/                Submodule: Ocarina of Time port (bkacjios/oot-s30).
 ports/mm/                 Submodule: Majora's Mask port (bkacjios/mm-s30).
+ports/tmc/                Submodule: The Minish Cap PC port (bkacjios/tmc),
+                          `make pc-s30` (docs/pc-s30.md there).
                           Other ports/ checkouts are not in this repo.
 s30-build/                $WORK: build trees (git worktrees of external/*,
                           patched there; sysroot) and outputs (boot/, rootfs.sqfs,
@@ -655,7 +657,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # once
 make -f Makefile.s30 extract    # ROM -> extracted/gc-us, build/gc-us (12 s)
 make -f Makefile.s30 assets     # ARM asset segments -> data/*.bin, build_assets/assets (1.5 min)
 make -f Makefile.s30 -j$(nproc) # zelda
-rsync -rt zelda data root@10.42.0.2:/mnt/sd/oot/
+rsync -rt zelda data root@10.42.0.2:/mnt/sd/home/ports/oot/
 ```
 
 - Game code: arm-none-eabi-gcc (needs `-fno-toplevel-reorder`) against the
@@ -744,7 +746,7 @@ rsync -rt zelda data root@10.42.0.2:/mnt/sd/oot/
   Frame pacing follows the game's R_UPDATE_RATE (S30Display_SetUpdateRate
   from Graph_TaskSet00): 3 vblanks (20 fps) in play, 2 in the pause menu,
   1 on the N64 logo/title/opening; a fixed 3 ran those at 1/3 and 2/3 speed.
-  Debug env from the launcher: /mnt/sd/oot/oot.env (VAR=value lines, sourced
+  Debug env from the launcher: /mnt/sd/home/ports/oot/oot.env (VAR=value lines, sourced
   by "Ocarina of Time.sh"), e.g. OOT_GFXSTATS=1 (stats every 100 frames in
   /tmp/frontend.log; adds a glFinish per frame).
   Debug env: OOT_FAST (no 20 fps cap), OOT_SHOT=N (/tmp/oot_shot.ppm),
@@ -822,7 +824,7 @@ rsync -rt zelda data root@10.42.0.2:/mnt/sd/oot/
 - Build: `make -j$(nproc) S30_CC=$PWD/../../s30-build/bin/armv7-clang
   S30_CXX=$PWD/../../s30-build/bin/armv7-clang++` with `baserom.us.z64`
   (Super Mario 64 (USA), sha1 9bef1128...) in the repo; output
-  `build/us_pc/sm64.us.f3dex2e`, stripped to `/mnt/sd/sm64/sm64`. Launcher
+  `build/us_pc/sm64.us.f3dex2e`, stripped to `/mnt/sd/home/ports/sm64/sm64`. Launcher
   entry "Super Mario 64.sh" (default in /usr/share/s30/apps).
 - Saves/config: SDL pref path `~/.local/share/sm64pc` (the fork had
   hardcoded /mnt/extsd paths).
