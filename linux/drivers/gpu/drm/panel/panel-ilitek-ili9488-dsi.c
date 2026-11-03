@@ -147,7 +147,9 @@ static const struct drm_display_mode ili9488_mode = {
 	 * PLL-MIPI to an N/K/M combination (0x90c00d1d for "288 MHz") that
 	 * garbles the picture. 12.375 MHz = 297 MHz / 24 bpp / 1 lane, so
 	 * PLL-MIPI runs at x1 of the 297 MHz PLL-video, like stock firmware
-	 * and U-Boot do (61.8 Hz).
+	 * and U-Boot do. With stock's 524 lines that is 61.8 Hz; 16 more
+	 * lines of vertical front porch make it 59.99 Hz, the N64/NTSC
+	 * rate the ports pace to (verified on the panel).
 	 */
 	.clock		= 12375,
 
@@ -157,14 +159,44 @@ static const struct drm_display_mode ili9488_mode = {
 	.htotal		= 382,
 
 	.vdisplay	= 480,
-	.vsync_start	= 480 + 22,
-	.vsync_end	= 480 + 22 + 4,
-	.vtotal		= 524,
+	.vsync_start	= 480 + 38,
+	.vsync_end	= 480 + 38 + 4,
+	.vtotal		= 540,
 
 	.width_mm	= 49,
 	.height_mm	= 74,
 	.type		= DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
 };
+
+/*
+ * Other refresh rates, for apps that pace to them: the same clock and lines,
+ * and the vertical front porch lengthened or shortened (the back porch and
+ * sync stay). 61.8 Hz is the stock timing, 59.77 Hz the GBA's 59.73, 50 Hz
+ * PAL.
+ */
+static const u16 ili9488_rate_vtotals[] = { 524, 542, 648 };
+
+static int ili9488_add_rates(struct drm_connector *connector)
+{
+	int i, n = 0;
+
+	for (i = 0; i < ARRAY_SIZE(ili9488_rate_vtotals); i++) {
+		struct drm_display_mode *mode = drm_mode_duplicate(connector->dev, &ili9488_mode);
+		int back = ili9488_mode.vtotal - ili9488_mode.vsync_end;
+		int sync = ili9488_mode.vsync_end - ili9488_mode.vsync_start;
+
+		if (!mode)
+			break;
+		mode->vtotal = ili9488_rate_vtotals[i];
+		mode->vsync_end = mode->vtotal - back;
+		mode->vsync_start = mode->vsync_end - sync;
+		mode->type = DRM_MODE_TYPE_DRIVER;
+		drm_mode_set_name(mode);
+		drm_mode_probed_add(connector, mode);
+		n++;
+	}
+	return n;
+}
 
 static int ili9488_get_modes(struct drm_panel *panel,
 			     struct drm_connector *connector)
@@ -175,7 +207,7 @@ static int ili9488_get_modes(struct drm_panel *panel,
 	connector->display_info.height_mm = ili9488_mode.height_mm;
 	drm_connector_set_panel_orientation(connector, ctx->orientation);
 
-	return drm_connector_helper_get_modes_fixed(connector, &ili9488_mode);
+	return drm_connector_helper_get_modes_fixed(connector, &ili9488_mode) + ili9488_add_rates(connector);
 }
 
 static enum drm_panel_orientation ili9488_get_orientation(struct drm_panel *panel)

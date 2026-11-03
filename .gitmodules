@@ -30,3 +30,7 @@
 	path = ports/tmc
 	url = https://github.com/bkacjios/tmc.git
 	shallow = true
+[submodule "ports/sf64"]
+	path = ports/sf64
+	url = https://github.com/bkacjios/sf64-s30.git
+	shallow = true

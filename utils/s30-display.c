@@ -560,6 +560,10 @@ static void menu_redraw(void);
  *    direction, so every direction reaches full deflection, as Dolphin does.
  * 4. Test: the corrected stick live; A saves, X redoes, B leaves it unchanged.
  *
+ * With a calibration already in the driver, it opens on that one instead
+ * (CAL_CURRENT): its edges as the mesh and the corrected stick live, as in the
+ * test; X starts a new calibration, B goes back.
+ *
  * The gamepad driver takes "cx cy m00 m01 m10 m11 deadzone e0 .. e31" (M,
  * the identity here, in Q12; edges in 1/16 counts from +x towards +y) from
  * sysfs; the result is also saved to CAL_FILE, which /etc/s30/rc loads at
@@ -595,8 +599,9 @@ static void menu_redraw(void);
 #define CAL_DIM 0x8888a0
 #define CAL_EDGE 0xb4a0ff // the mesh's outline
 #define CAL_FIXED 0x60e0a0 // the corrected stick's dot
+#define CAL_DEADZONE_RGB 0xe08060
 
-enum { CAL_CENTER, CAL_ROTATE, CAL_TEST };
+enum { CAL_CENTER, CAL_ROTATE, CAL_TEST, CAL_CURRENT };
 
 static struct {
 	int phase;
@@ -657,12 +662,19 @@ static double cal_reach(double a) {
 	return best;
 }
 
+/* The stick's reach in direction `a` (radians), in counts, from sCal.edge
+   (interpolated as the driver does) */
+static double cal_edge_at(double a) {
+	double pos = (a < 0 ? a + 2 * M_PI : a) / (2 * M_PI) * CAL_EDGES, f = pos - floor(pos);
+	int i = (int)pos % CAL_EDGES;
+
+	return (sCal.edge[i] * (1 - f) + sCal.edge[(i + 1) % CAL_EDGES] * f) / 16;
+}
+
 /* The driver's output for raw (x, y), with the edges found (sCal.edge) */
 static void cal_corrected(int x, int y, double out[2]) {
 	const double dx = x - sCal.cx, dy = y - sCal.cy, a = atan2(dy, dx);
-	double pos = (a < 0 ? a + 2 * M_PI : a) / (2 * M_PI) * CAL_EDGES, f = pos - floor(pos);
-	int i = (int)pos % CAL_EDGES;
-	double e = (sCal.edge[i] * (1 - f) + sCal.edge[(i + 1) % CAL_EDGES] * f) / 16;
+	double e = cal_edge_at(a);
 	double ox = dx * 127 / e, oy = dy * 127 / e, r = sqrt(ox * ox + oy * oy);
 
 	if (r <= CAL_DEADZONE) {
@@ -681,6 +693,33 @@ static void cal_restart(void) {
 	sCal.phase = CAL_CENTER;
 	sCal.cx = sCal.cy = 128;
 	sCal.minX = sCal.minY = 255;
+}
+
+/* Loads the driver's calibration (`text`, as sysfs shows it) into sCal for
+   showing, the edges as the mesh's points. Returns 0 if it has no edges (not
+   calibrated). */
+static int cal_load(const char* text) {
+	int v[7 + CAL_EDGES], n, used, i;
+
+	for (n = 0; n < 7 + CAL_EDGES && sscanf(text, "%d%n", &v[n], &used) == 1; n++) {
+		text += used;
+	}
+	if (n != 7 + CAL_EDGES) {
+		return 0;
+	}
+	cal_restart();
+	sCal.cx = v[0];
+	sCal.cy = v[1];
+	memcpy(sCal.edge, &v[7], sizeof(sCal.edge));
+	for (i = 0; i < CAL_BINS; i++) { // each bin's middle direction, as cal_update bins them
+		double a = (i + 0.5) * 2 * M_PI / CAL_BINS - M_PI, e = cal_edge_at(a);
+
+		sCal.binR[i] = e;
+		sCal.binX[i] = e * cos(a);
+		sCal.binY[i] = e * sin(a);
+	}
+	sCal.phase = CAL_CURRENT;
+	return 1;
 }
 
 /* --- Drawing: anti-aliased, blended over what sBack holds (opaque here) --- */
@@ -853,6 +892,9 @@ static void cal_draw_bg(void) {
 	fill(0, 0, BUF_W, BUF_H, argb(CAL_BG, 1.0f));
 	cal_circle(CAL_X, CAL_Y, CAL_R + 6, 0, CAL_DISC, 1.0f);
 	cal_circle(CAL_X, CAL_Y, CAL_R * 127 / 128.0f, 1.5f, CAL_RING, 1.0f);
+	// Cross through the centre, out to the ring
+	cal_line(CAL_X - CAL_R, CAL_Y, CAL_X + CAL_R, CAL_Y, CAL_GRID, 1.0f);
+	cal_line(CAL_X, CAL_Y - CAL_R, CAL_X, CAL_Y + CAL_R, CAL_GRID, 1.0f);
 	draw_text("Stick calibration", CAL_TEXT_X, 24, 1, argb(0xffffff, 1.0f));
 	fill(CAL_TEXT_X, 46, BUF_W - CAL_TEXT_X - 16, 1, argb(CAL_GRID, 1.0f));
 	memcpy(sCalBg, sBack, sizeof(sCalBg));
@@ -866,6 +908,19 @@ static void cal_draw_text(uint64_t now) {
 	char line[32];
 	int i, y = 60, x;
 
+	if (sCal.phase == CAL_CURRENT) {
+		draw_text("Current", CAL_TEXT_X, y, 1, white);
+		y += 36;
+		draw_text("The stick as it", CAL_TEXT_X, y, 1, white);
+		draw_text("is calibrated", CAL_TEXT_X, y + 18, 1, white);
+		cal_circle(CAL_TEXT_X + 5, y + 54, 4.5f, 0, CAL_FIXED, 1.0f);
+		draw_text("corrected", CAL_TEXT_X + 18, y + 46, 1, dim);
+		cal_circle(CAL_TEXT_X + 5, y + 74, 4.5f, 0, 0xffffff, 1.0f);
+		draw_text("raw", CAL_TEXT_X + 18, y + 66, 1, dim);
+		cal_hint(CAL_TEXT_X, BUF_H - 52, kLetterX, "Recalibrate");
+		cal_hint(CAL_TEXT_X, BUF_H - 30, kLetterB, "Back");
+		return;
+	}
 	for (i = 0; i < 3; i++, y += 22) {
 		snprintf(line, sizeof(line), "%d  %s", i + 1, kSteps[i]);
 		if (i == sCal.phase) {
@@ -936,9 +991,12 @@ static void cal_draw(uint64_t now) {
 	if (sCal.phase != CAL_CENTER) {
 		cal_mesh(CAL_ACCENT, 0.45f, CAL_EDGE);
 	}
+	// The deadzone, in the corrected stick's scale (where the driver applies it)
+	cal_circle(CAL_X, CAL_Y, CAL_DEADZONE * CAL_R / 128.0f, 0, CAL_DEADZONE_RGB, 0.35f);
+	cal_circle(CAL_X, CAL_Y, CAL_DEADZONE * CAL_R / 128.0f, 1.0f, CAL_DEADZONE_RGB, 1.0f);
 	cal_plot(sCal.rx - sCal.cx, sCal.ry - sCal.cy, p); // raw, around the centre found (128 until then)
 	cal_circle(p[0], p[1], 4.5f, 0, 0xffffff, 1.0f);
-	if (sCal.phase == CAL_TEST) { // corrected, as the driver will report it
+	if (sCal.phase >= CAL_TEST) { // corrected, as the driver will report it
 		double o[2];
 
 		cal_corrected(sCal.rx, sCal.ry, o);
@@ -1043,7 +1101,9 @@ static void cal_open(void) {
 	cal_write(sCal.sysfs, CAL_IDENTITY);
 	sCal.rx = ioctl(sPadFd, EVIOCGABS(ABS_X), &ax) == 0 ? ax.value : 128;
 	sCal.ry = ioctl(sPadFd, EVIOCGABS(ABS_Y), &ay) == 0 ? ay.value : 128;
-	cal_restart();
+	if (!cal_load(sCal.previous)) {
+		cal_restart();
+	}
 	sCal.log = fopen(CAL_LOG, "w");
 	sCal.start = now_ms();
 	sMenuPage = 2;
@@ -1090,7 +1150,7 @@ static void cal_input(const struct input_event* ev) {
 		} else if (ev->code == BTN_EAST && sCal.phase == CAL_TEST) { // A: save
 			cal_close(1);
 			menu_redraw();
-		} else if (ev->code == BTN_NORTH && sCal.phase == CAL_TEST) { // X: redo
+		} else if (ev->code == BTN_NORTH && sCal.phase >= CAL_TEST) { // X: redo, or recalibrate
 			cal_restart();
 		}
 	}
@@ -2066,6 +2126,13 @@ static void perf_sample(void) {
 #undef LINE
 }
 
+/* Age of a frame stamped at t: 0 if it is newer than now (nowNs comes from a
+   millisecond clock, so a frame marked in the same millisecond is ahead of
+   it; unsigned, the difference would wrap and the frame look ancient) */
+static uint64_t frame_age(uint64_t t, uint64_t nowNs) {
+	return t > nowNs ? 0 : nowNs - t;
+}
+
 /* Frame intervals (ms) of the app on screen, newest last, into out[max];
    count returned; *fps over the last second */
 static int frame_times(float* out, int max, int* fps, uint64_t nowNs) {
@@ -2077,7 +2144,7 @@ static int frame_times(float* out, int max, int* fps, uint64_t nowNs) {
 		return 0;
 	}
 	__sync_synchronize();
-	if (nowNs - sFrames->ns[(count - 1) % S30_FRAMES_N] > 1000000000ull) {
+	if (frame_age(sFrames->ns[(count - 1) % S30_FRAMES_N], nowNs) > 1000000000ull) {
 		return 0; // no frames for a second: nothing to show
 	}
 	first = count > (uint32_t)max + 1 ? count - (uint32_t)max - 1 : 0;
@@ -2087,7 +2154,7 @@ static int frame_times(float* out, int max, int* fps, uint64_t nowNs) {
 		out[n++] = (b - a) / 1e6f;
 	}
 	for (i = count; i > 0 && i + S30_FRAMES_N > count; i--) {
-		if (nowNs - sFrames->ns[(i - 1) % S30_FRAMES_N] > 1000000000ull) {
+		if (frame_age(sFrames->ns[(i - 1) % S30_FRAMES_N], nowNs) > 1000000000ull) {
 			break;
 		}
 		(*fps)++;

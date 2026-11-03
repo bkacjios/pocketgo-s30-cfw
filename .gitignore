@@ -9,6 +9,7 @@
 !/ports/oot
 !/ports/mm
 !/ports/tmc
+!/ports/sf64
 # Old U-Boot checkout kept for reference (not built)
 /u-boot/
 /testing.tar.gz

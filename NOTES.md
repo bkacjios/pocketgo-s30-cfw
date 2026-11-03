@@ -44,6 +44,10 @@ ports/oot/                Submodule: Ocarina of Time port (bkacjios/oot-s30).
 ports/mm/                 Submodule: Majora's Mask port (bkacjios/mm-s30).
 ports/tmc/                Submodule: The Minish Cap PC port (bkacjios/tmc),
                           `make pc-s30` (docs/pc-s30.md there).
+ports/sf64/               Submodule: Star Fox 64 port (bkacjios/sf64-s30).
+n64/                      Shared N64 platform library for ports/oot, mm, sf64
+                          (display, renderer, audio, input; n64/README.md
+                          has the API and the porting checklist).
                           Other ports/ checkouts are not in this repo.
 s30-build/                $WORK: build trees (git worktrees of external/*,
                           patched there; sysroot) and outputs (boot/, rootfs.sqfs,
@@ -837,6 +841,57 @@ rsync -rt zelda data root@10.42.0.2:/mnt/sd/home/ports/oot/
   kmsdrm (window 320x480). The user played it; no rendering issues reported
   yet. Exits cleanly on SIGTERM (saves config).
 
+## Shared N64 library (n64/) (2026-11-03)
+
+- OoT, MM and SF64 link `n64/` (`n64.mk`) instead of per-port copies of
+  src/s30/{display,gfx,input,audio}.c and the mixer. Started from MM's
+  copies (the newest: replacement textures, motion blur, audio lock,
+  overlap-safe interleave). Each game: `S30Gfx_Configure` (ucode, segment
+  table, float or s15.16 Mtx, texture element sizes, env prefix), a button
+  map (src/s30/buttons.c), its audio update (`S30Audio_Init`), its own Acmd
+  macro header over `s30_mixer.h`.
+- F3DEX (SF64) is translated per command to F3DEX2 (`f3dex_to_f3dex2`):
+  opcodes, matrix flags (F3DEX2 inverts push), geometry bits (cull,
+  smooth), movemem/moveword indices, NUML and light colour offsets,
+  othermode shift/len.
+- Texture addresses below 16 MiB are rejected as unresolved (was below
+  0x10000000: SF64's segments live at 0x01000000-0x0FFFFFFF).
+- n64.mk must not `-include` its .d files (they became the default goal);
+  the port includes them after its first target.
+- Verified on the device after the move: SF64 (title, 3D, audio), OoT
+  (runs), MM (Clock Town, map overhaul, D-pad items).
+
+## Star Fox 64 port (ports/sf64, submodule) (2026-11-03)
+
+- Fork of sonicdcer/sf64 (bkacjios/sf64-s30, master); sf64-dc used only as a
+  reference. Build: README.md there (`make -f Makefile.s30 extract assets`,
+  then the build); Torch from sf64-dc's build (same commit; Torch's own
+  cmake fails on newer CMake). Card: /mnt/sd/home/ports/sf64, launcher
+  "Star Fox 64.sh", test: tools/s30/run-test.sh SECONDS.
+- Asset segments are mapped at their segmented addresses (0x0N000000; the
+  game's SEGMENTED_TO_VIRTUAL and K0/physical macros are identities);
+  overlays linked in, .data/.bss in ovl_<name>_* sections reset on load.
+- Pitfalls found: F3DEX negative opcodes in a u8 switch; libultra
+  sinf/cosf (big-endian doubles) gave 0; Mtx halves (Matrix_ToMtx writes
+  u.i/u.f, guMtxF2L packed words); texture byte order per array type
+  (per-segment table, segments share addresses); audio: AudioCmd views,
+  0x7FFFFFFF note-pointer check, relocation threshold, BE sound fonts.
+  All in n64/README.md's checklist.
+
+## Panel refresh modes (2026-11-03)
+
+- The panel driver lists 59.99 Hz (preferred, vtotal 540), 61.82 Hz (stock
+  timing, 524), 59.77 Hz (GBA, 542) and 49.99 Hz (PAL, 648): same 12.375
+  MHz clock and lines, vertical front porch changed. All measured on the
+  panel. N64 ports now run exactly 20 fps (was 20.6, 3% fast).
+- Apps pick one by rate (`S30Display_SetRefresh`; `<PREFIX>_REFRESH`
+  overrides, `<PREFIX>_REFRESHTEST=1` prints the measured rate). U-Boot
+  keeps 524 lines (the kernel reprograms TCON at bind).
+- FPS overlay (s30-display): a frame stamped in the same millisecond as
+  the overlay's clock wrapped `now - t` and showed "-"; fixed (frame_age).
+- Card backups in /mnt/sd/boot: zImage.pre60 (61.8 Hz), zImage.60only,
+  rootfs.sqfs.pre-fps, uInitrd.pre-fps.
+
 ## Next session
 
 - Test Sleep on hardware: panel off/on, wake on power key, audio after
@@ -849,5 +904,8 @@ rsync -rt zelda data root@10.42.0.2:/mnt/sd/home/ports/oot/
   get_modes after the connector is registered (drm_mode_object_add WARN);
   fix by creating it before registration (sun6i-dsi bind has no panel yet).
 - OoT: comb filter still disabled; D-pad item slots; performance (paused).
+- Shared library next: libultra stand-ins (OoT/MM reimpl.c vs SF64 ultra.c)
+  and the asset builders (pc_tools/make_assets.py diverged per port).
+- TMC (SDL3) and RetroArch could pick the 59.77 / 50 Hz modes.
 - Remaining U-Boot -> kernel blink (~60 ms): sun4i-drm resets TCON and
   clears the backend at bind (accepted as is).

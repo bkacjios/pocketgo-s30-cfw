@@ -1,0 +1,44 @@
+# n64 — shared N64 platform library for the PocketGo S30 ports
+
+Used by `ports/oot`, `ports/mm` and `ports/sf64` (each `Makefile.s30` includes
+`n64.mk` and links `$(N64LIB_OBJS)`). Game-independent: no game headers.
+
+| File | Header | What |
+|---|---|---|
+| `src/display.c` | `s30_display.h` | KMS/GBM/EGL on the DRM lease, landscape framebuffer rotated onto the portrait panel, 2D layer, frame pacing, refresh mode (`S30Display_SetRefresh`), screenshots, motion blur / pause background / VisMono helpers |
+| `src/gfx.c` | `s30_gfx.h` | The RSP/RDP renderer (GLES2): F3DEX2 + S2DEX, F3DEX translated to F3DEX2 (`f3dex_to_f3dex2`), TMEM, combiner shaders, texture cache, replacement textures, depth probes |
+| `src/audio.c` | `s30_audio.h` | ALSA output; the game's audio update runs on its thread (`S30Audio_Init(update)`) |
+| `src/mixer.c` | `s30_mixer.h` | The audio microcode (aspMain) in software; each game redirects its own Acmd macros to the `a*Impl` functions |
+| `src/input.c` | `s30_input.h` | The S30 gamepad as an N64 controller, with the game's button map |
+
+A game configures the renderer once (`S30Gfx_Configure`): microcode, its
+segment table, `Mtx` format (float or s15.16), how its texture data is stored
+(u64 words, or a callback giving each array's element size) and the prefix of
+its debug variables (`<PREFIX>_GFXSTATS`, `_GFXTRACE`, `_SHOT`, `_REFRESH`,
+`_REFRESHTEST`, `_NOAUDIO`, ...).
+
+## Porting checklist (little-endian, 32-bit pointers at 0x40000000+)
+
+Bugs every N64 port here has hit. Check each in a new game before its first run:
+
+- **Address tests:** `ptr < 0x7FFFFFFF` / `>= K0BASE` (KSEG0) checks, e.g. the
+  audio's `AUDIO_RELOCATED_ADDRESS_START` and "is this note pointer valid":
+  real pointers here are 0x40000000 and up.
+- **K0/physical conversions** (`K0_TO_PHYS`, `OS_K0_TO_PHYSICAL`, ...): make
+  them identity, or resolve them through the segment table.
+- **Unions that pack bytes into words:** `AudioCmd` (`op`/`arg0..2` and
+  `asSbyte`/`asUbyte`/`asUShort` views) read the wrong byte on little-endian.
+- **Bitfields** read from N64 data or written as a byte (`Sample`, `StereoData`):
+  list them in reverse under the little-endian build.
+- **Big-endian data loaded from the ROM:** sound fonts, samples, ADPCM books and
+  loops, envelopes, the sequence/font table; swap at load (track shared
+  structures so they are swapped once) or at read.
+- **libultra code that takes floats/doubles apart** (sinf/cosf): use the C
+  library's.
+- **`Mtx`:** the game's own code and `guMtxF2L` must agree on where the
+  integer and fraction halves go (`u.i`/`u.f`).
+- **Negative opcode constants** (F3DEX `G_IMMFIRST - n`): `switch` on a `u8`
+  needs `case (u8)G_X`.
+- **Single-threaded waits:** anything that blocks on a message another N64
+  thread would send (save, timers, controller) needs that thread or a direct
+  call.
