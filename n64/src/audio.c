@@ -71,6 +71,16 @@ int S30Audio_Underruns(void) {
     return sUnderruns;
 }
 
+// Paced mode: the frames kept queued, as silence (at the start and after an
+// underrun, which empties the queue)
+static void prefill(void) {
+    static const int16_t silence[2 * PACED_LATENCY];
+
+    if (sPeriodNs != 0) {
+        snd_pcm_writei(sPcm, silence, PACED_LATENCY);
+    }
+}
+
 static void write_frames(const int16_t* samples, int32_t frames) {
     int32_t done = 0;
 
@@ -81,10 +91,16 @@ static void write_frames(const int16_t* samples, int32_t frames) {
         snd_pcm_sframes_t written = snd_pcm_writei(sPcm, samples + 2 * done, frames - done);
 
         if (written < 0) {
-            // Underrun (-EPIPE) or suspend: recover and drop the rest
+            // Underrun (-EPIPE; also the process stopped, as under the system
+            // menu) or suspend: recover, and in paced mode queue the latency
+            // again, else the game's AI length reads short of it from then on
+            // and the music stutters
             sUnderruns++;
-            snd_pcm_recover(sPcm, written, 1);
-            return;
+            if (snd_pcm_recover(sPcm, written, 1) < 0) {
+                return;
+            }
+            prefill();
+            continue;
         }
         done += written;
     }
@@ -116,10 +132,8 @@ static void wait_tick(void) {
 
 static void* audio_thread(void* arg) {
     (void)arg;
-    if (sPeriodNs != 0 && sPcm != NULL) {
-        static const int16_t silence[2 * PACED_LATENCY];
-
-        write_frames(silence, PACED_LATENCY);
+    if (sPcm != NULL) {
+        prefill();
     }
     for (;;) {
         int32_t frames;
