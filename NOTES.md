@@ -45,7 +45,8 @@ ports/mm/                 Submodule: Majora's Mask port (bkacjios/mm-s30).
 ports/tmc/                Submodule: The Minish Cap PC port (bkacjios/tmc),
                           `make pc-s30` (docs/pc-s30.md there).
 ports/sf64/               Submodule: Star Fox 64 port (bkacjios/sf64-s30).
-n64/                      Shared N64 platform library for ports/oot, mm, sf64
+ports/mk64/               Submodule: Mario Kart 64 port (bkacjios/mk64-s30).
+n64/                      Shared N64 platform library for ports/oot, mm, sf64, mk64
                           (display, renderer, audio, input; n64/README.md
                           has the API and the porting checklist).
                           Other ports/ checkouts are not in this repo.
@@ -877,6 +878,42 @@ rsync -rt zelda data root@10.42.0.2:/mnt/sd/home/ports/oot/
   (per-segment table, segments share addresses); audio: AudioCmd views,
   0x7FFFFFFF note-pointer check, relocation threshold, BE sound fonts.
   All in n64/README.md's checklist.
+
+## Mario Kart 64 port (ports/mk64, submodule) (2026-11-04)
+
+- Fork of n64decomp/mk64 (bkacjios/mk64-s30, master). Build: README.md
+  there (`make -f Makefile.s30 extract assets`, then the build). Card:
+  /mnt/sd/home/ports/mk64 (`mk64`, `data/mk64.dat`), launcher "Mario Kart
+  64.sh" (tools/s30/mario-kart-64.sh). Played through menus and races on the
+  device; ghosts aren't saved (no Controller Pak).
+- Data: one file, mk64.dat, with the ROM's data segments at the game's ROM
+  addresses (tools/s30/make_rom.py). Texture/sound data assembled big-endian
+  (ROM bytes); C data (course display lists, vertices, paths, common/menu
+  data) compiled little-endian, MIO0-compressed where the N64's is. `--verify`
+  builds everything big-endian and finds it in the ROM: the native layout is
+  the N64's, which the game's hard-coded segment offsets need.
+- Texture byte order: RAM is N64 order (elem 1) except the native segments'
+  u16/u32 arrays, registered where each segment is loaded and dropped when
+  DMA or a decoder overwrites that memory (not on allocation: the game
+  allocates over the startup logo while drawing it). CPU code that writes
+  pixels (menu recolouring, the red shell palette) writes N64 order.
+- Segment 0 is the image base (0x40000000) and SEGMENT_NUMBER2 keeps 4 bits:
+  the game reaches its own RAM as offset + segment 0 (KSEG0 on the N64; it
+  indexed past the 16-entry table and got 0 by luck).
+- Audio: 26800 Hz (ALSA plug, hardware side pinned to 32 kHz) and clock-paced
+  updates (S30Audio_Configure) so the game's AI-length buffer sizing works;
+  256-frame periods (the codec reports position per period). The microcode is
+  Mario Kart's (mupen64plus-rsp-hle alist_process_nead_mk is the reference):
+  envelope mixer (wet from the panned dry, flags invert), no reverb ramp,
+  8-byte DMA rounding, byte-wise DMEM moves.
+- Renderer additions: F3DEX 0.95 (G_QUAD, old G_CULLDL), the default lookat
+  (reflective logo), copy-mode alpha compare and coverage-times-alpha discard
+  (HUD cutouts, item sprites), S30Gfx_FrameCopy (the jumbotron copies the
+  last frame on the GPU).
+- Debug env (mk64.env): MK64_GFXSTATS, MK64_GFXTRACE=frame, MK64_AUDIODBG
+  (queue, underruns, notes by kind), MK64_AUDIODUMP (/tmp/mk64_audio.raw),
+  MK64_AUDIOMASK. Crashes: crash.log beside the binary.
+- Open: the jumbotron in split screen assumes the 1P widescreen layout.
 
 ## Panel refresh modes (2026-11-03)
 

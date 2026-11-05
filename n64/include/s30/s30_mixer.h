@@ -44,6 +44,20 @@ void aResampleZohImpl(unsigned short pitch, unsigned short startFract);
 void aUnkCmd3Impl(unsigned short a1, unsigned short a2, unsigned short a3);
 void aUnkCmd19Impl(unsigned char f, unsigned short count, unsigned short out_addr, unsigned short in_addr);
 
+// The Mario Kart 64 microcode: its envelope mixer (the wet sends taken from
+// the dry ones, no reverb ramp: aEnvSetup1Impl with rampReverb 0), a
+// repeating DMEM copy, and a halving downsampler
+void aEnvMixerEuImpl(unsigned short dmemIn, unsigned short count, unsigned char swapReverb, unsigned char negLeft,
+                     unsigned char negRight, unsigned short dryLeft, unsigned short dryRight, unsigned short wetLeft,
+                     unsigned short wetRight);
+// Load/save rounded as the RSP's DMA does (count up to 8 bytes, address down
+// to 8), not to 16
+void aLoadBuffer8Impl(const void* source_addr, unsigned short dest_addr, unsigned short nbytes);
+void aSaveBuffer8Impl(unsigned short source_addr, void* dest_addr, unsigned short nbytes);
+void aDMEMMove4Impl(unsigned short in_addr, unsigned short out_addr, unsigned short nbytes);
+void aDMEMMove2Impl(unsigned char times, unsigned short in_addr, unsigned short out_addr, unsigned short count);
+void aDownsampleHalfImpl(unsigned short count, unsigned short in_addr, unsigned short out_addr);
+
 // <prefix>_AUDIODBG counters: ADPCM decodes, envelope mixes, their peaks
 extern int gS30MixDbg[4];
 

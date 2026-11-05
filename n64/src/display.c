@@ -450,6 +450,48 @@ static void copy_frame(GLuint* tex, GLuint* fbo) {
     blit(sDisp.fboTex);
 }
 
+/* A rectangle of the 3D image (x0, y0)-(x1, y1), framebuffer pixels from the
+   top left, drawn into *tex (w x h, created with its *fbo on first use) with
+   its top row first, as texture data is laid out */
+void S30Display_CopyRect(GLuint* tex, GLuint* fbo, int w, int h, float x0, float y0, float x1, float y1) {
+    float u0 = x0 / S30_FB_W, u1 = x1 / S30_FB_W;
+    float vTop = 1.0f - y0 / S30_FB_H, vBottom = 1.0f - y1 / S30_FB_H;
+    // Target row 0 (NDC y -1) is the source's top
+    GLfloat quad[] = { -1, -1, u0, vTop, 1, -1, u1, vTop, -1, 1, u0, vBottom, 1, 1, u1, vBottom };
+
+    if (*fbo == 0) {
+        glGenTextures(1, tex);
+        glBindTexture(GL_TEXTURE_2D, *tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenFramebuffers(1, fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *tex, 0);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
+    sDisp.bound = 0;
+    glViewport(0, 0, w, h);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glDisable(GL_BLEND);
+    glUseProgram(sDisp.blitProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, sDisp.fboTex);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glVertexAttribPointer(sDisp.blitPos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), quad);
+    glVertexAttribPointer(sDisp.blitUv, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), quad + 2);
+    glEnableVertexAttribArray(sDisp.blitPos);
+    glEnableVertexAttribArray(sDisp.blitUv);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray(sDisp.blitPos);
+    glDisableVertexAttribArray(sDisp.blitUv);
+}
+
 void S30Display_SaveBackground(void) {
     copy_frame(&sDisp.bgTex, &sDisp.bgFbo);
 }

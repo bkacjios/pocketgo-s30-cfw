@@ -175,7 +175,7 @@ static void on_sigusr2(int sig) {
 }
 
 static void flush(void);
-static int sWide;  // this frame is widescreen
+// sWide: this frame is widescreen (declared above frame_copies)
 static int sHadBg; // an S2DEX background was drawn this frame
 static void aux_sync(const u8* src, u32 bytes);
 
@@ -503,6 +503,7 @@ enum {
     SF_COPY = 1 << 5,         // copy mode: texel 0 only
     SF_DBG_ALPHA = 1 << 6,    // debug: output alpha as grey
     SF_3POINT = 1 << 7,       // N64 3-point bilinear filter (textures are GL_NEAREST)
+    SF_CVG_ALPHA = 1 << 8,    // antialiased coverage times alpha: no coverage, no write (depth either)
 };
 
 typedef struct {
@@ -643,6 +644,10 @@ static Shader* get_shader(u32 w0, u32 w1, u32 flags) {
     if (flags & SF_TEX_EDGE) {
         strcat(fs, "  if (ca < 0.5) discard;\n");
     }
+    if (flags & SF_CVG_ALPHA) {
+        // Coverage (8 levels) times alpha rounds to none below 1/8
+        strcat(fs, "  if (ca < 0.125) discard;\n");
+    }
     if (flags & SF_ALPHA_THRESH) {
         // uBlend.a arrives clamped to >= 1/255: lima miscompiles a max()
         // in this compare and discards every fragment
@@ -728,6 +733,10 @@ typedef struct {
     const void* src;
     void* pixels; // freed once uploaded
     int w, h, rgb565;
+    // A copy of the last frame instead of pixels (S30Gfx_FrameCopy): the
+    // N64 screen rectangle, copied at the start of the next frame
+    int frame, frameX, frameY, framePending;
+    GLuint frameFbo;
     TexEntry entry;
 } TexOverride;
 
@@ -764,6 +773,62 @@ void S30Gfx_TextureOverride(const void* src, int w, int h, int rgb565, void* pix
     }
 }
 
+void S30Gfx_FrameCopy(const void* dst, int x, int y, int w, int h) {
+    TexOverride* o;
+    int i;
+
+    for (i = 0; i < sTexOverrideCount; i++) {
+        if (sTexOverrides[i].src == dst) {
+            break;
+        }
+    }
+    if (i == TEX_OVERRIDE_MAX) {
+        return; // full
+    }
+    o = &sTexOverrides[i];
+    o->frame = 1;
+    o->frameX = x;
+    o->frameY = y;
+    o->w = w;
+    o->h = h;
+    o->framePending = 1;
+    o->src = dst;
+    if (i == sTexOverrideCount) {
+        sTexOverrideCount++;
+    }
+}
+
+static int sWide;
+
+/* Pending S30Gfx_FrameCopy: the last frame's rectangles into their textures
+   (before this frame draws over it). Widescreen frames show more of the world
+   at the sides: the N64 rectangle is where that picture is now. */
+static void frame_copies(void) {
+    int i, copied = 0;
+
+    for (i = 0; i < sTexOverrideCount; i++) {
+        TexOverride* o = &sTexOverrides[i];
+        float x0 = o->frameX, x1 = o->frameX + o->w;
+
+        if (!o->frame || !o->framePending) {
+            continue;
+        }
+        o->framePending = 0;
+        if (sWide) {
+            x0 = SCREEN_W / 2 + (x0 - SCREEN_W / 2) * WIDE_XSCALE;
+            x1 = SCREEN_W / 2 + (x1 - SCREEN_W / 2) * WIDE_XSCALE;
+        }
+        S30Display_CopyRect(&o->entry.tex, &o->frameFbo, o->w, o->h, (x0 + WIDE_PAD) * FB_SCALE,
+                            o->frameY * FB_SCALE, (x1 + WIDE_PAD) * FB_SCALE, (o->frameY + o->h) * FB_SCALE);
+        o->entry.mipmapped = 0;
+        copied = 1;
+    }
+    if (copied) {
+        S30Display_Unbind();
+        gl_cache_reset();
+    }
+}
+
 /* The replacement for a tile, if its TMEM was loaded from a replaced texture */
 static TexEntry* tex_override(const Tile* t, int w, int h) {
     const u8* src = sTmemSrc[t->tmem & 511];
@@ -775,7 +840,11 @@ static TexEntry* tex_override(const Tile* t, int w, int h) {
         if (o->src != src) {
             continue;
         }
-        if (o->entry.tex == 0) {
+        if (o->frame) {
+            if (o->entry.tex == 0) {
+                return NULL; // not copied yet
+            }
+        } else if (o->entry.tex == 0) {
             glGenTextures(1, &o->entry.tex);
             glBindTexture(GL_TEXTURE_2D, o->entry.tex);
             if (o->rgb565) {
@@ -1489,6 +1558,11 @@ static void apply_state(void) {
         flags |= SF_FILL;
     } else if (cyc == G_CYC_COPY) {
         flags |= SF_COPY;
+        // Copy mode has alpha compare too: the classic cutout sprite (Mario
+        // Kart 64's HUD digits)
+        if ((l & 3) == G_AC_THRESHOLD) {
+            flags |= SF_ALPHA_THRESH;
+        }
     } else {
         if (cyc == G_CYC_2CYCLE) {
             flags |= SF_2CYC;
@@ -1504,6 +1578,10 @@ static void apply_state(void) {
         }
         if ((l & CVG_X_ALPHA) && (l & ALPHA_CVG_SEL)) {
             flags |= SF_TEX_EDGE;
+        } else if ((l & CVG_X_ALPHA) && (l & AA_EN)) {
+            // Blended with coverage from alpha (Mario Kart 64's item and
+            // smoke sprites): transparent texels write no depth
+            flags |= SF_CVG_ALPHA;
         }
         // Last blender cycle reads memory with (1 - a): alpha blending
         if ((l & FORCE_BL) && m2a == 1) {
@@ -2632,6 +2710,12 @@ static int f3dex_to_f3dex2(u32* pw0, u32* pw1) {
             w0 = ((u32)G_MODIFYVTX << 24) | (w0 & 0xFFFFFF);
             break;
         case F3DEX_CULLDL:
+            if (sCfg.ucode == S30_UCODE_F3DEX_OLD) { // vertex index * 40, end + 1
+                u32 v0 = (w0 & 0xFFFF) / 40, v1 = (w1 & 0xFFFF) / 40;
+                w0 = ((u32)G_CULLDL << 24) | (v0 * 2);
+                w1 = (v1 > 0 ? v1 - 1 : 0) * 2;
+                break;
+            }
             w0 = ((u32)G_CULLDL << 24) | (w0 & 0xFFFFFF);
             break;
         case F3DEX_BRANCH_Z:
@@ -2649,7 +2733,17 @@ static int f3dex_to_f3dex2(u32* pw0, u32* pw1) {
         case F3DEX_RDPHALF_2:
             w0 = (u32)G_RDPHALF_2 << 24;
             break;
-        default: // LINE3D, LOAD_UCODE, unknown
+        case F3DEX_LINE3D:
+            if (sCfg.ucode == S30_UCODE_F3DEX_OLD) {
+                // G_QUAD: v3, v0, v1, v2 (* 2) in w1, as triangles v0 v1 v2
+                // and v0 v2 v3
+                u32 a = (w1 >> 16) & 0xFF, b = (w1 >> 8) & 0xFF, c = w1 & 0xFF, d = w1 >> 24;
+                w0 = ((u32)G_TRI2 << 24) | (a << 16) | (b << 8) | c;
+                w1 = (a << 16) | (c << 8) | d;
+                break;
+            }
+            return 0;
+        default: // LOAD_UCODE, unknown
             return 0;
     }
     *pw0 = w0;
@@ -2665,7 +2759,7 @@ static void walk(Gfx* dl, int depth) {
         u32 w0 = dl->words.w0, w1 = dl->words.w1;
         u8 cmd;
 
-        if (sCfg.ucode == S30_UCODE_F3DEX && !f3dex_to_f3dex2(&w0, &w1)) {
+        if (sCfg.ucode != S30_UCODE_F3DEX2 && !f3dex_to_f3dex2(&w0, &w1)) {
             continue;
         }
         cmd = w0 >> 24;
@@ -3020,6 +3114,7 @@ void pc_process_displaylist(void* displayList) {
         sTGame += t0 - sTLast;
     }
 
+    frame_copies(); // the last frame, sWide still its
     S30Display_BeginFrame();
     sFrame++;
     sWide = !sHadBg;
@@ -3030,6 +3125,12 @@ void pc_process_displaylist(void* displayList) {
         rsp.p[i][i] = 1.0f;
     }
     rsp.mvTop = 0;
+    // The microcode's default lookat (each task starts from its data): a
+    // game that never sends gSPLookAt (Mario Kart 64's reflective logo)
+    // texgens against X (1, 0, 0) and Y (0, 1, 0)
+    memset(rsp.lookat, 0, sizeof(rsp.lookat));
+    rsp.lookat[0][0] = 1.0f;
+    rsp.lookat[1][1] = 1.0f;
     rsp.mvpDirty = 1;
     rsp.lightsDirty = 1;
     rsp.vpX = 0;

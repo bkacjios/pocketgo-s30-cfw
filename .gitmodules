@@ -34,3 +34,7 @@
 	path = ports/sf64
 	url = https://github.com/bkacjios/sf64-s30.git
 	shallow = true
+[submodule "ports/mk64"]
+	path = ports/mk64
+	url = https://github.com/bkacjios/mk64-s30.git
+	shallow = true

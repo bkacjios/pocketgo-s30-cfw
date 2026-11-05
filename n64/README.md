@@ -1,14 +1,14 @@
 # n64 — shared N64 platform library for the PocketGo S30 ports
 
-Used by `ports/oot`, `ports/mm` and `ports/sf64` (each `Makefile.s30` includes
+Used by `ports/oot`, `ports/mm`, `ports/sf64` and `ports/mk64` (each `Makefile.s30` includes
 `n64.mk` and links `$(N64LIB_OBJS)`). Game-independent: no game headers.
 
 | File | Header | What |
 |---|---|---|
 | `src/display.c` | `s30_display.h` | KMS/GBM/EGL on the DRM lease, landscape framebuffer rotated onto the portrait panel, 2D layer, frame pacing, refresh mode (`S30Display_SetRefresh`), screenshots, motion blur / pause background / VisMono helpers |
 | `src/gfx.c` | `s30_gfx.h` | The RSP/RDP renderer (GLES2): F3DEX2 + S2DEX, F3DEX translated to F3DEX2 (`f3dex_to_f3dex2`), TMEM, combiner shaders, texture cache, replacement textures, depth probes |
-| `src/audio.c` | `s30_audio.h` | ALSA output; the game's audio update runs on its thread (`S30Audio_Init(update)`) |
-| `src/mixer.c` | `s30_mixer.h` | The audio microcode (aspMain) in software; each game redirects its own Acmd macros to the `a*Impl` functions |
+| `src/audio.c` | `s30_audio.h` | ALSA output; the game's audio update runs on its thread (`S30Audio_Init(update)`); `S30Audio_Configure`: the game's sample rate, clock-paced updates for AI-length buffer sizing |
+| `src/mixer.c` | `s30_mixer.h` | The audio microcode (aspMain) in software; each game redirects its own Acmd macros to the `a*Impl` functions (Mario Kart's variants: `aEnvMixerEuImpl`, `aLoadBuffer8Impl`, ...) |
 | `src/input.c` | `s30_input.h` | The S30 gamepad as an N64 controller, with the game's button map |
 
 A game configures the renderer once (`S30Gfx_Configure`): microcode, its
@@ -42,3 +42,14 @@ Bugs every N64 port here has hit. Check each in a new game before its first run:
 - **Single-threaded waits:** anything that blocks on a message another N64
   thread would send (save, timers, controller) needs that thread or a direct
   call.
+- **Segment 0 as KSEG0:** code that reaches RAM as `(addr & 0xFFFFFF) +
+  segment 0` (Mario Kart) needs segment 0 at the image base and the segment
+  number masked to 4 bits.
+- **Audio rate and pacing:** check the game's output frequency (Mario Kart:
+  26800 Hz) and whether it sizes buffers from `osAiGetLength`; if so, use
+  `S30Audio_Configure` (paced updates) or tempo and pitch drift.
+- **Microcode semantics:** each game's audio microcode differs (envelope
+  mixer, DMA rounding); check the Acmd mapping against mupen64plus-rsp-hle's
+  alist for that game.
+- **CPU-written textures:** RAM is read in N64 byte order; code that builds
+  or recolours pixels/palettes with native u16 stores must swap.

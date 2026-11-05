@@ -818,3 +818,91 @@ void aInterleaveImpl(u16 outAddr, u16 inL, u16 inR, u16 count) {
 void aInterleaveSetBufferImpl(u16 inL, u16 inR) {
     aInterleaveImpl(rspa.out, inL, inR, rspa.nbytes);
 }
+
+/* ---- The SM64 EU / Mario Kart 64 microcode's own commands ---- */
+
+/* Envelope mixer of the Mario Kart 64 microcode (mupen64plus-rsp-hle's
+   ENVMIXER_MK): each sample to the dry left/right at their volumes, the
+   flags inverting either (XOR -1), and the wet left/right sends taken from
+   those at the reverb volume. count is in samples (the command's 8 bits),
+   rounded up to 8. */
+void aEnvMixerEuImpl(u16 dmemIn, u16 count, u8 swapReverb, u8 negLeft, u8 negRight, u16 dryLeft, u16 dryRight,
+                     u16 wetLeft, u16 wetRight) {
+    s16* in = BUF_S16(dmemIn);
+    s16* dry[2] = { BUF_S16(dryLeft), BUF_S16(dryRight) };
+    s16* wet[2] = { BUF_S16(wetLeft), BUF_S16(wetRight) };
+    s16 xors[2] = { negLeft ? -1 : 0, negRight ? -1 : 0 };
+    u16 vols[2] = { rspa.vol[0], rspa.vol[1] };
+    u16 volWet = rspa.vol_wet;
+    int n = ROUND_UP_8(count);
+
+    (void)swapReverb; // not in this microcode
+    while (n > 0) {
+        for (int i = 0; i < 8; i++) {
+            s32 x = *in++;
+
+            for (int j = 0; j < 2; j++) {
+                s16 d = (s16)((x * vols[j]) >> 16) ^ xors[j];
+
+                *dry[j] = clamp16(*dry[j] + d);
+                dry[j]++;
+                *wet[j] = clamp16(*wet[j] + (s16)((d * volWet) >> 16));
+                wet[j]++;
+            }
+        }
+        vols[0] += rspa.rate[0];
+        vols[1] += rspa.rate[1];
+        n -= 8;
+    }
+    gS30MixDbg[1]++;
+    gS30MixDbg[3] = vols[0] > gS30MixDbg[3] ? vols[0] : gS30MixDbg[3];
+}
+
+/* times x count bytes (count rounded up to 32) from in to out, 32 at a time
+   going up: with out = in + count it repeats the first count bytes */
+void aDMEMMove2Impl(u8 times, u16 in_addr, u16 out_addr, u16 count) {
+    u8* in = BUF_U8(in_addr);
+    u8* out = BUF_U8(out_addr);
+    int n = times * ROUND_UP_32(count);
+
+    for (int i = 0; i < n; i += 32) {
+        memcpy(out + i, in + i, 32);
+    }
+}
+
+/* Every other sample: count output samples (rounded up to 8) */
+void aDownsampleHalfImpl(u16 count, u16 in_addr, u16 out_addr) {
+    s16* in = BUF_S16(in_addr);
+    s16* out = BUF_S16(out_addr);
+    int n = ROUND_UP_8(count);
+
+    for (int i = 0; i < n; i++) {
+        out[i] = in[2 * i];
+    }
+}
+
+/* Buffer load/save with the RSP DMA's own rounding (the count up to 8 bytes,
+   the DRAM address down to 8): the Mario Kart 64 microcode's LOADBUFF and
+   SAVEBUFF. Its reverb chunks aren't multiples of 16 bytes. The decoders
+   read the copy in DMEM. */
+void aLoadBuffer8Impl(const void* source_addr, u16 dest_addr, u16 nbytes) {
+    memcpy(BUF_U8(dest_addr & ~3), (const u8*)((uintptr_t)source_addr & ~(uintptr_t)7), ROUND_UP_8(nbytes));
+    bufPtr = rspa.buf;
+}
+
+void aSaveBuffer8Impl(u16 source_addr, void* dest_addr, u16 nbytes) {
+    memcpy((u8*)((uintptr_t)dest_addr & ~(uintptr_t)7), BUF_U8(source_addr & ~3), ROUND_UP_8(nbytes));
+}
+
+/* DMEM move of the Mario Kart 64 microcode: the count up to 4 bytes, copied
+   going up a byte at a time (the ADPCM loop moves samples down over
+   themselves) */
+void aDMEMMove4Impl(u16 in_addr, u16 out_addr, u16 nbytes) {
+    u8* in = BUF_U8(in_addr);
+    u8* out = BUF_U8(out_addr);
+    int n = (nbytes + 3) & ~3;
+
+    for (int i = 0; i < n; i++) {
+        out[i] = in[i];
+    }
+}

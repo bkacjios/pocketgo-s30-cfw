@@ -10,6 +10,9 @@
 typedef enum {
     S30_UCODE_F3DEX2, // Ocarina of Time, Majora's Mask (with S2DEX backgrounds)
     S30_UCODE_F3DEX,  // Star Fox 64
+    // F3DEX 0.95 (Mario Kart 64): F3DEX with G_QUAD where LINE3D is, the old
+    // G_CULLDL vertex encoding, and texrects ending in RDPHALF_CONT (0xB2)
+    S30_UCODE_F3DEX_OLD,
 } S30Ucode;
 
 typedef struct {
@@ -48,6 +51,12 @@ void flush_texture_cache_external(void);
 // powers of 2; RGBA8888, or RGB565 if `rgb565`) instead, at their own
 // resolution. `pixels` is malloc'd and handed over: freed once on the GPU.
 void S30Gfx_TextureOverride(const void* src, int w, int h, int rgb565, void* pixels);
+
+// A texture loaded from `dst` draws the N64 screen rectangle (x, y, w, h) of
+// the frame shown last instead (copied on the GPU at the start of the next
+// frame): a game copying its framebuffer into a texture (Mario Kart 64's
+// jumbotron). Call again for each new copy.
+void S30Gfx_FrameCopy(const void* dst, int x, int y, int w, int h);
 
 // Depth tests against the z-buffer (sun, lens flare): whether a point at N64
 // screen pixel (x, y) and NDC depth z passes. Results lag one frame (call i of

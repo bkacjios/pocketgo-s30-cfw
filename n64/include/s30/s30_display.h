@@ -28,6 +28,10 @@ void S30Display_Bind2D(void);
 // as the 3D image. Both change GL state.
 void S30Display_SaveBackground(void);
 void S30Display_RestoreBackground(void);
+// A rectangle of the 3D image ((x0, y0)-(x1, y1), framebuffer pixels from the
+// top left) into *tex, w x h, top row first (created with *fbo on first use).
+// Changes GL state.
+void S30Display_CopyRect(GLuint* tex, GLuint* fbo, int w, int h, float x0, float y0, float x1, float y1);
 // VisMono: desaturates the 3D image (2D composited in) toward prim/env (RGBA,
 // RGB in 0..1). Changes GL state.
 void S30Display_VisMono(const float prim[4], const float env[4]);
