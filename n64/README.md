@@ -1,7 +1,7 @@
 # n64 — shared N64 platform library for the PocketGo S30 ports
 
-Used by `ports/oot`, `ports/mm`, `ports/sf64` and `ports/mk64` (each `Makefile.s30` includes
-`n64.mk` and links `$(N64LIB_OBJS)`). Game-independent: no game headers.
+Used by `ports/oot`, `ports/mm`, `ports/sf64`, `ports/mk64` and `ports/ssb` (each
+`Makefile.s30` includes `n64.mk` and links `$(N64LIB_OBJS)`). Game-independent: no game headers.
 
 | File | Header | What |
 |---|---|---|
@@ -10,6 +10,8 @@ Used by `ports/oot`, `ports/mm`, `ports/sf64` and `ports/mk64` (each `Makefile.s
 | `src/audio.c` | `s30_audio.h` | ALSA output; the game's audio update runs on its thread (`S30Audio_Init(update)`); `S30Audio_Configure`: the game's sample rate, clock-paced updates for AI-length buffer sizing |
 | `src/mixer.c` | `s30_mixer.h` | The audio microcode (aspMain) in software; each game redirects its own Acmd macros to the `a*Impl` functions (Mario Kart's variants: `aEnvMixerEuImpl`, `aLoadBuffer8Impl`, ...) |
 | `src/input.c` | `s30_input.h` | The S30 gamepad as an N64 controller, with the game's button map |
+| `src/app.c` | `s30_app.h` | Crash reports (`crash.log`; `kill -QUIT` prints where each N64 thread is), fatal errors, the save path (`$XDG_DATA_HOME/<game>/`) |
+| `src/os.c` | `s30_os.h` | libultra's OS: threads (one N64 thread on the CPU at a time, by priority), message queues and events, time and timers, VI retrace, the RCP task queue (`S30Os_RunRcp` on the main thread), controllers, a Controller Pak in controller 1 (`pakPath`: a 32 KB image; libultra's own pak code talks to an emulated PIF, `__osSiRawStartDma`), no Rumble Pak or Voice Recognition Unit, PI DMA from a ROM image, EEPROM/SRAM saves (written whole, fsync'd, only when they change), the AI. Opt-in: `N64LIB_OS := 1`, used by every port; a port that builds a libultra piece of its own (`_Printf`, `__sinf`, its `osAiSetNextBuffer`) overrides the weak one here |
 
 A game configures the renderer once (`S30Gfx_Configure`): microcode, its
 segment table, `Mtx` format (float or s15.16), how its texture data is stored

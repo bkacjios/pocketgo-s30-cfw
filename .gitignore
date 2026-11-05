@@ -11,6 +11,7 @@
 !/ports/tmc
 !/ports/sf64
 !/ports/mk64
+!/ports/ssb
 # Old U-Boot checkout kept for reference (not built)
 /u-boot/
 /testing.tar.gz

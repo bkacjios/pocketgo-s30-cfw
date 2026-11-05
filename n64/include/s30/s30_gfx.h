@@ -76,6 +76,8 @@ int S30Gfx_DepthVisible(float x, float y, float z);
 
 // The value of the debug environment variable <prefix>_<name>, or NULL
 const char* S30_Getenv(const char* name);
+// /tmp/<prefix, lower case>_<name>, malloc'd (debug output files)
+const char* S30_TmpPath(const char* name);
 // Set by S30Gfx_Configure (also used by the display and input)
 void S30_SetEnvPrefix(const char* prefix);
 

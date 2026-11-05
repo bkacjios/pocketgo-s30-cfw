@@ -47,16 +47,27 @@ const char* S30_Getenv(const char* name) {
     return getenv(var);
 }
 
-/* /tmp/<prefix>_shot.ppm<suffix> */
-static const char* shot_path(const char* suffix) {
-    static char path[64];
-    int i, n = snprintf(path, sizeof(path), "/tmp/%s", sEnvPrefix);
+const char* S30_TmpPath(const char* name) {
+    char* path = malloc(strlen(sEnvPrefix) + strlen(name) + 7);
+    int i, n = sprintf(path, "/tmp/%s", sEnvPrefix);
 
     for (i = 5; i < n; i++) {
         path[i] = (char)tolower((unsigned char)path[i]);
     }
-    snprintf(path + n, sizeof(path) - n, "_shot.ppm%s", suffix);
+    sprintf(path + n, "_%s", name);
     return path;
+}
+
+/* /tmp/<prefix>_shot.ppm<suffix> */
+static const char* shot_path(const char* suffix) {
+    static const char* shot;
+    static const char* tmp;
+
+    if (shot == NULL) {
+        shot = S30_TmpPath("shot.ppm");
+        tmp = S30_TmpPath("shot.ppm.tmp");
+    }
+    return suffix[0] == '\0' ? shot : tmp;
 }
 
 static int sVblanksPerFrame = 3;

@@ -10,7 +10,8 @@
 # with $(N64LIB_INCLUDES).
 
 N64LIB ?= ../../n64
-N64LIB_SRCS := $(wildcard $(N64LIB)/src/*.c)
+# os.c (libultra's OS, s30_os.h) only for ports that set N64LIB_OS := 1
+N64LIB_SRCS := $(filter-out $(if $(filter 1,$(N64LIB_OS)),,$(N64LIB)/src/os.c),$(wildcard $(N64LIB)/src/*.c))
 N64LIB_OBJS := $(patsubst $(N64LIB)/src/%.c,$(BUILD_DIR)/n64/%.o,$(N64LIB_SRCS))
 N64LIB_INCLUDES := -I$(N64LIB)/include/s30
 N64LIB_LIBS := -lGLESv2 -lEGL -lgbm -ldrm -lasound -lpthread -lm

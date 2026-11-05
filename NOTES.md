@@ -941,8 +941,10 @@ rsync -rt zelda data root@10.42.0.2:/mnt/sd/home/ports/oot/
   get_modes after the connector is registered (drm_mode_object_add WARN);
   fix by creating it before registration (sun6i-dsi bind has no panel yet).
 - OoT: comb filter still disabled; D-pad item slots; performance (paused).
-- Shared library next: libultra stand-ins (OoT/MM reimpl.c vs SF64 ultra.c)
-  and the asset builders (pc_tools/make_assets.py diverged per port).
+- Shared library next: the asset builders (pc_tools/make_assets.py diverged
+  per port); OoT/MM's DmaMgr and AudioRom (src/linux/reimpl.c) and MM's flash
+  save (src/code/sys_flashrom.c) could move to n64/src/os.c (an S30_SAVE_FLASH
+  type). All ports run on n64/src/os.c.
 - TMC (SDL3) and RetroArch could pick the 59.77 / 50 Hz modes.
 - Remaining U-Boot -> kernel blink (~60 ms): sun4i-drm resets TCON and
   clears the backend at bind (accepted as is).
