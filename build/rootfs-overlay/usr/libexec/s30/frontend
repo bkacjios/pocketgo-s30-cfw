@@ -11,6 +11,9 @@ exec >>/tmp/frontend.log 2>&1
 if [ -x /usr/bin/s30-launcher ]; then
 	s30-launcher /mnt/sd/apps
 else
+	# The boot splash to black (the launcher does this once its window is
+	# up); dd stops at the end of the framebuffer (No space left on device)
+	dd if=/dev/zero of=/dev/fb0 bs=64k 2>/dev/null
 	retroarch -c "$HOME/.config/retroarch/retroarch.cfg"
 fi
 # init respawns at once: don't spin if it keeps failing

@@ -326,6 +326,68 @@ step_emulationstation() {
 	ls -l "$WORK/emulationstation-root/usr/bin/emulationstation"
 }
 
+# Mesa for the S30 only: the lima GPU driver (and kmsro for the sun4i-drm
+# display) with EGL, GBM and GLES 2, no LLVM. Alpine's mesa-dri-gallium is
+# one libgallium with every driver, linked to libLLVM (145 MB): loading it
+# took 3.5 s of the launcher's start at boot (squashfs reads and
+# decompression, musl relocates the whole library). The same release as
+# Alpine's (its headers are in the sysroot), checked against Alpine 3.24's
+# sha512. Build tools (meson, mako, PyYAML) in a venv under $WORK.
+# Output: installed under $WORK/mesa-root, which replaces Alpine's mesa
+# packages in the rootfs (build/packages excludes them).
+MESA_VERSION=26.1.6
+MESA_SHA512=6746b73f5b87e8ff3723eee586b4b5f033dbe6d13cd0309d743b7fa484c350268859ec8ff21aadcbca7a04070cdaa7828146dd28dde4b1935bb879891d687f0b
+step_mesa() {
+	local dir="$WORK/mesa-src" src="$WORK/mesa-src/mesa-$MESA_VERSION" sr="$WORK/sysroot" venv="$WORK/mesa-venv"
+	local tarball="$WORK/mesa-src/mesa-$MESA_VERSION.tar.xz"
+	ensure_sysroot
+	mkdir -p "$dir"
+	[ -f "$tarball" ] || curl -fsSL -o "$tarball" "https://archive.mesa3d.org/mesa-$MESA_VERSION.tar.xz"
+	echo "$MESA_SHA512  $tarball" | sha512sum -c --quiet
+	[ -d "$src" ] || tar -xJf "$tarball" -C "$dir"
+	if [ ! -x "$venv/bin/meson" ]; then
+		python3 -m venv "$venv"
+		"$venv/bin/pip" install --quiet meson mako pyyaml packaging
+	fi
+	cat > "$dir/cross.ini" <<-EOF
+	[binaries]
+	c = '$WORK/bin/armv7-clang'
+	cpp = '$WORK/bin/armv7-clang++'
+	ar = '$(command -v llvm-ar)'
+	strip = '$(command -v llvm-strip)'
+	pkg-config = 'pkg-config'
+	[built-in options]
+	# The wrapper's -fuse-ld=lld is unused in compile-only checks, which
+	# meson runs with -Werror=unused-command-line-argument
+	c_args = ['-Qunused-arguments']
+	cpp_args = ['-Qunused-arguments']
+	[properties]
+	sys_root = '$sr'
+	pkg_config_libdir = '$sr/usr/lib/pkgconfig:$sr/usr/share/pkgconfig'
+	[host_machine]
+	system = 'linux'
+	cpu_family = 'arm'
+	cpu = 'armv7'
+	endian = 'little'
+	EOF
+	rm -rf "$src/build"
+	PKG_CONFIG_SYSROOT_DIR="$sr" PATH="$venv/bin:$PATH" \
+	meson setup "$src/build" "$src" --cross-file "$dir/cross.ini" \
+		--prefix=/usr --buildtype=release -Db_ndebug=true -Dstrip=true \
+		-Dplatforms= -Dgallium-drivers=lima -Dvulkan-drivers= -Dvulkan-layers= \
+		-Dllvm=disabled -Dglx=disabled -Dglvnd=disabled -Dopengl=true -Dgles1=disabled -Dgles2=enabled \
+		-Degl=enabled -Dgbm=enabled -Dshader-cache=enabled -Dzstd=disabled -Dxmlconfig=disabled \
+		-Dexpat=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
+		-Dgallium-va=disabled -Dgallium-rusticl=false -Dvideo-codecs= -Dmicrosoft-clc=disabled \
+		-Dspirv-tools=disabled -Dbuild-tests=false -Dtools= -Dallow-kcmp=enabled
+	PATH="$venv/bin:$PATH" meson compile -C "$src/build" -j "$JOBS"
+	rm -rf "$WORK/mesa-root"
+	DESTDIR="$WORK/mesa-root" PATH="$venv/bin:$PATH" meson install -C "$src/build" --no-rebuild --quiet
+	# Headers and pkg-config files are the sysroot's (Alpine's mesa-dev)
+	rm -rf "$WORK/mesa-root/usr/include" "$WORK/mesa-root/usr/lib/pkgconfig" "$WORK/mesa-root/usr/share"
+	du -sh "$WORK/mesa-root"
+}
+
 # Root filesystem for build.sh fel: rootfs.sqfs (minirootfs + packages +
 # rootfs-overlay) goes to /s30 on the SD card; uInitrd is a small loader (busybox,
 # musl, s30-loader as /init) that mounts it with a tmpfs overlay.
@@ -360,6 +422,9 @@ step_initramfs() {
 		install -m 0755 "$WORK/s30-screenshot.bin" "$root/usr/bin/s30-screenshot"
 	[ -d "$WORK/emulationstation-root" ] &&
 		cp -r "$WORK/emulationstation-root/." "$root/"
+	# Mesa (build.sh mesa), in place of Alpine's (build/packages excludes it)
+	[ -d "$WORK/mesa-root" ] &&
+		cp -r "$WORK/mesa-root/." "$root/"
 	# EmulationStation theme (submodule external/es-theme-carbon)
 	if [ -f "$PROJECT/external/es-theme-carbon/carbon.xml" ]; then
 		mkdir -p "$root/etc/emulationstation/themes/carbon"
@@ -523,8 +588,9 @@ case "${1:-all}" in
 	retroarch) step_retroarch ;;
 	emulationstation) step_emulationstation ;;
 	launcher) step_launcher ;;
+	mesa) step_mesa ;;
 	fel) step_fel ;;
 	sdcard) step_sdcard "${2:-}" "${3:-}" ;;
 	all) step_deps; step_linux; step_uboot; step_rootfs; step_image ;;
-	*) echo "usage: $0 [deps|linux|uboot|rootfs|image|initramfs|retroarch|emulationstation|launcher|fel|sdcard /dev/sdX [format]|all]" >&2; exit 2 ;;
+	*) echo "usage: $0 [deps|linux|uboot|rootfs|image|initramfs|retroarch|emulationstation|launcher|mesa|fel|sdcard /dev/sdX [format]|all]" >&2; exit 2 ;;
 esac

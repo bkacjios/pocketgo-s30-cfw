@@ -95,10 +95,10 @@ if [ -f "$HOME/.config/joystick.cal" ]; then
 fi
 
 s30-splash 100
-# Then black: fbcon shows /dev/fb0 again whenever an app (KMS) exits, so the
-# splash would come back between apps. dd stops at the end of the
-# framebuffer (No space left on device).
-dd if=/dev/zero of=/dev/fb0 bs=64k 2>/dev/null
+# The splash stays until the frontend's window is up: the launcher clears
+# /dev/fb0 then (fbcon shows it again whenever an app exits, so the splash
+# must not come back between apps); without the launcher,
+# /usr/libexec/s30/frontend clears it
 
 # Boot finished: blue status LED on
 for led in /sys/class/leds/*:status; do echo 1 > "$led/brightness"; done

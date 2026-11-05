@@ -51,6 +51,22 @@ static SDL_Texture* make_glyphs(void) {
     return t;
 }
 
+/* /dev/fb0 to black, once the window is up (it hides fbcon). The boot splash
+   stays there until then (etc/s30/rc leaves it, so the screen isn't black
+   while the launcher starts); fbcon shows fb0 again whenever a KMS app exits,
+   so it must not stay. Writes until the end of the framebuffer (ENOSPC). */
+static void clear_fbcon(void) {
+    static const char zero[64 * 1024];
+    int fd = open("/dev/fb0", O_WRONLY | O_CLOEXEC);
+
+    if (fd < 0) {
+        return;
+    }
+    while (write(fd, zero, sizeof(zero)) > 0) {
+    }
+    close(fd);
+}
+
 bool ui_video_open(void) {
     // KMS only (no Wayland/X probing), GLES2 renderer (Mesa's desktop GL on
     // the Mali-400 has no render targets)
@@ -70,6 +86,14 @@ bool ui_video_open(void) {
         fprintf(stderr, "ui: renderer: %s\n", SDL_GetError());
         return false;
     }
+    // The window's first frame never shows (SDL's KMS backend sets the mode
+    // with it, and the panel stays black until the next flip): a black one,
+    // so the menu's first frame (ui_present) is the second and shows at once
+    // instead of at the next redraw (up to 2 s, at boot and after an app)
+    SDL_SetRenderDrawColor(gUiRenderer, 0, 0, 0, 255);
+    SDL_RenderClear(gUiRenderer);
+    SDL_RenderPresent(gUiRenderer);
+    clear_fbcon();
     sCanvas = SDL_CreateTexture(gUiRenderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, UI_W, UI_H);
     sGlyphs = make_glyphs();
     if (sCanvas == NULL || sGlyphs == NULL) {

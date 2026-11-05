@@ -12,16 +12,21 @@ dropbear
 openssh-sftp-server
 rsync
 busybox-extras
-mesa-dri-gallium
+# Mesa: our own build (build.sh mesa: lima, EGL/GBM/GLES 2, no LLVM) in place
+# of Alpine's, whose one libgallium has every driver and links libLLVM
+!mesa
+!mesa-dri-gallium
+!mesa-egl
+!mesa-gbm
+!mesa-gles
+!llvm22-libs
+!spirv-tools
 # RetroArch itself is built by build.sh retroarch (patched for screen
 # rotation); these are its runtime libraries, udevd for joypad detection,
 # core info files and cores.
 eudev
 eudev-libs
 alsa-lib
-mesa-egl
-mesa-gbm
-mesa-gles
 libstdc++
 libretro-core-info
 # RetroArch menu assets (Ozone/XMB/GLUI themes, fonts, sounds) in
