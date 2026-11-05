@@ -43,6 +43,10 @@ typedef struct {
     // 0: osCreateThread/osStartThread/... do nothing (ports that run the
     // game's loops themselves); 1: the game's threads run, scheduled as above
     int threads;
+    // 1 (with threads 0): no thread to wait for, so a receive from an empty
+    // queue or a send to a full one fails at once (-1), as does one on a NULL
+    // queue (OoT and MM wait for their scheduler that way, and go on)
+    int noWait;
     // 1: osCreateViManager starts the VI's 60 Hz retrace messages
     int vi;
     // 1: osAiGetLength is the audio queued (for games that size their frames

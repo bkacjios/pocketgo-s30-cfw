@@ -73,6 +73,12 @@ int S30Gfx_DepthVisible(float x, float y, float z);
 #define S30_MARK_VISMONO 0x564D4F4Eu      // "VMON": VisMono, desaturate the frame (prim/env colors)
 #define S30_MARK_MBLUR_BLEND 0x4D424C42u  // "MBLB": motion blur, previous frame over this one at prim alpha
 #define S30_MARK_MBLUR_SAVE 0x4D424C53u   // "MBLS": motion blur, save this frame for the next
+#define S30_MARK_FB_READ 0x46425244u      // "FBRD": the frame so far into RAM (S30Gfx_ReadFrame)
+
+// For S30_MARK_FB_READ: where the next one writes the frame drawn so far, as
+// the N64's 320x240 RGBA16 framebuffer (game code reading the framebuffer:
+// MM's Pictograph Box). Call it as the display list is built.
+void S30Gfx_ReadFrame(void* dst);
 
 // The value of the debug environment variable <prefix>_<name>, or NULL
 const char* S30_Getenv(const char* name);

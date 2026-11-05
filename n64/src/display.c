@@ -507,6 +507,11 @@ void S30Display_SaveBackground(void) {
     copy_frame(&sDisp.bgTex, &sDisp.bgFbo);
 }
 
+void S30Display_ReadFrame(unsigned char* rgba) {
+    S30Display_Bind3D();
+    glReadPixels(0, 0, S30_FB_W, S30_FB_H, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+}
+
 void S30Display_RestoreBackground(void) {
     S30Display_Bind3D();
     if (sDisp.bgFbo != 0) {

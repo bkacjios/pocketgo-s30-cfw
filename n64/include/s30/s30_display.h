@@ -27,6 +27,9 @@ void S30Display_Bind2D(void);
 // Pause background: copies the 3D image (2D composited in) / draws the copy
 // as the 3D image. Both change GL state.
 void S30Display_SaveBackground(void);
+// The 3D frame so far, S30_FB_W x S30_FB_H RGBA bytes, bottom row first
+// (stalls until the GPU has drawn it)
+void S30Display_ReadFrame(unsigned char* rgba);
 void S30Display_RestoreBackground(void);
 // A rectangle of the 3D image ((x0, y0)-(x1, y1), framebuffer pixels from the
 // top left) into *tex, w x h, top row first (created with *fbo on first use).

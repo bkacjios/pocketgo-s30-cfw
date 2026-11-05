@@ -496,10 +496,13 @@ static void queue_changed(OSMesgQueue* mq) {
 }
 
 static int32_t send_mesg(OSMesgQueue* mq, OSMesg msg, int32_t flag, int jam) {
+    if (mq == NULL && sConfig.noWait) {
+        return -1;
+    }
     pthread_mutex_lock(&sLock);
     cpu_check();
     while (mq->validCount >= mq->msgCount) {
-        if (flag != OS_MESG_BLOCK) {
+        if (flag != OS_MESG_BLOCK || sConfig.noWait) {
             pthread_mutex_unlock(&sLock);
             return -1;
         }
@@ -526,10 +529,13 @@ int32_t osJamMesg(OSMesgQueue* mq, OSMesg msg, int32_t flag) {
 }
 
 int32_t osRecvMesg(OSMesgQueue* mq, OSMesg* msg, int32_t flag) {
+    if (mq == NULL && sConfig.noWait) {
+        return -1;
+    }
     pthread_mutex_lock(&sLock);
     cpu_check();
     while (mq->validCount == 0) {
-        if (flag != OS_MESG_BLOCK) {
+        if (flag != OS_MESG_BLOCK || sConfig.noWait) {
             pthread_mutex_unlock(&sLock);
             return -1;
         }
@@ -1332,6 +1338,9 @@ int32_t osEPiLinkHandle(OSPiHandle* handle) {
 
 int32_t osPiStartDma(OSIoMesg* mb, int32_t pri, int32_t direction, uint32_t devAddr, void* vAddr, uint32_t nbytes,
                      OSMesgQueue* mq) {
+    if (sConfig.romPath == NULL) {
+        return -1; // no ROM image: as with no PI manager running
+    }
     if (direction == OS_READ) {
         rom_read(devAddr, vAddr, nbytes);
     }
@@ -1344,6 +1353,8 @@ int32_t osPiStartDma(OSIoMesg* mb, int32_t pri, int32_t direction, uint32_t devA
 int32_t osEPiStartDma(OSPiHandle* handle, OSIoMesg* mb, int32_t direction) {
     if (handle != NULL && handle->type == DEVICE_TYPE_SRAM) {
         sram_access(mb->devAddr, mb->dramAddr, mb->size, direction);
+    } else if (sConfig.romPath == NULL) {
+        return -1; // no ROM image: as with no PI manager running
     } else if (direction == OS_READ) {
         rom_read(mb->devAddr, mb->dramAddr, mb->size);
     }

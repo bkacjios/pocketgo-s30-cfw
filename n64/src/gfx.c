@@ -467,7 +467,10 @@ static const char* color_src(int in) {
         case IN_PRIM: return "vPrim.rgb";
         case IN_SHADE: return "vShade.rgb";
         case IN_ENV: return "vEnv.rgb";
-        case IN_NOISE: return "vec3(fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453))";
+        // The RDP's noise, new every frame: a random texture (texture unit 2,
+        // S30Gfx_Init) at the pixel, offset per frame. A sin() hash needs more
+        // than the Mali-400's 16-bit fragment floats.
+        case IN_NOISE: return "vec3(texture2D(uNoiseTex, gl_FragCoord.xy / 64.0 + uNoise).r)";
         case IN_COMBINED_A: return "vec3(ca)";
         case IN_TEX0_A: return "vec3(t0.a)";
         case IN_TEX1_A: return "vec3(t1.a)";
@@ -509,9 +512,10 @@ enum {
 typedef struct {
     u32 w0, w1, flags;
     GLuint prog;
-    GLint uPrim, uEnv, uFog, uBlend, uFill, uPrimLod, uTexSize0, uTexSize1;
+    GLint uPrim, uEnv, uFog, uBlend, uFill, uPrimLod, uTexSize0, uTexSize1, uNoise;
     float cur[5][4]; // last uploaded prim, env, fog, blend, fill
     float curLod;
+    u32 curNoise; // the frame its noise offset is for
     float curSize[2][2];
     int usesTex[2];
 } Shader;
@@ -606,7 +610,7 @@ static Shader* get_shader(u32 w0, u32 w1, u32 flags) {
              "varying vec4 vPrim; varying vec4 vEnv;\n"
              "uniform sampler2D uTex0; uniform sampler2D uTex1;\n"
              "uniform vec4 uFog; uniform vec4 uBlend;\n"
-             "uniform vec4 uFill; uniform float uPrimLod;\n"
+             "uniform vec4 uFill; uniform float uPrimLod; uniform vec2 uNoise; uniform sampler2D uNoiseTex;\n"
              "uniform vec2 uTexSize0; uniform vec2 uTexSize1;\n"
              /* N64 RDP bilinear: blend 3 texels (the triangle of the 2x2 quad
                 the sample falls in), from nearest-filtered fetches */
@@ -701,12 +705,15 @@ static Shader* get_shader(u32 w0, u32 w1, u32 flags) {
         memset(sh->curSize, 0xFF, sizeof(sh->curSize));
         glUniform1i(glGetUniformLocation(p, "uTex0"), 0);
         glUniform1i(glGetUniformLocation(p, "uTex1"), 1);
+        glUniform1i(glGetUniformLocation(p, "uNoiseTex"), 2);
         sh->uPrim = glGetUniformLocation(p, "uPrim");
         sh->uEnv = glGetUniformLocation(p, "uEnv");
         sh->uFog = glGetUniformLocation(p, "uFog");
         sh->uBlend = glGetUniformLocation(p, "uBlend");
         sh->uFill = glGetUniformLocation(p, "uFill");
         sh->uPrimLod = glGetUniformLocation(p, "uPrimLod");
+        sh->uNoise = glGetUniformLocation(p, "uNoise");
+        sh->curNoise = 0xFFFFFFFF;
         sh->uTexSize0 = glGetUniformLocation(p, "uTexSize0");
         sh->uTexSize1 = glGetUniformLocation(p, "uTexSize1");
     }
@@ -770,6 +777,37 @@ void S30Gfx_TextureOverride(const void* src, int w, int h, int rgb565, void* pix
     __sync_synchronize(); // the entry before the count that publishes it (the renderer may be another thread)
     if (i == sTexOverrideCount) {
         sTexOverrideCount++;
+    }
+}
+
+/* S30Gfx_ReadFrame: the frame so far into the game's RAM as 320x240 RGBA16
+   (S30_MARK_FB_READ), each N64 pixel from the framebuffer pixel at its
+   centre */
+static u16* sReadFrameDst;
+
+void S30Gfx_ReadFrame(void* dst) {
+    sReadFrameDst = dst;
+}
+
+static void read_frame(void) {
+    static u8 px[S30_FB_W * S30_FB_H * 4];
+    u16* dst = sReadFrameDst;
+    int x, y;
+
+    if (dst == NULL) {
+        return;
+    }
+    sReadFrameDst = NULL;
+    S30Display_ReadFrame(px);
+    for (y = 0; y < SCREEN_H; y++) {
+        int fy = (int)((SCREEN_H - y - 0.5f) * FB_SCALE);
+
+        for (x = 0; x < SCREEN_W; x++) {
+            int fx = (int)((x + WIDE_PAD + 0.5f) * FB_SCALE);
+            const u8* p = &px[(fy * S30_FB_W + fx) * 4];
+
+            dst[y * SCREEN_W + x] = ((p[0] >> 3) << 11) | ((p[1] >> 3) << 6) | ((p[2] >> 3) << 1) | 1;
+        }
     }
 }
 
@@ -1625,6 +1663,13 @@ static void apply_state(void) {
     if (sh->curLod != rdp.primLod) {
         glUniform1f(sh->uPrimLod, rdp.primLod);
         sh->curLod = rdp.primLod;
+    }
+    if (sh->uNoise >= 0 && sh->curNoise != sFrame) {
+        // A new offset each frame (an LCG step of the frame number)
+        u32 r = sFrame * 1103515245u + 12345u;
+
+        glUniform2f(sh->uNoise, (float)(r & 0x3F) / 64.0f, (float)((r >> 6) & 0x3F) / 64.0f);
+        sh->curNoise = sFrame;
     }
 
     for (i = 0; i < 2; i++) {
@@ -2777,6 +2822,8 @@ static void walk(Gfx* dl, int depth) {
                 S30Display_MotionBlurBlend(rdp.prim[3]);
             } else if (w1 == S30_MARK_MBLUR_SAVE) {
                 S30Display_MotionBlurSave();
+            } else if (w1 == S30_MARK_FB_READ) {
+                read_frame();
             }
             gl_cache_reset();
             continue;
@@ -3063,6 +3110,29 @@ void S30Gfx_Init(void) {
 
     sHasNpot = ext != NULL && strstr(ext, "GL_OES_texture_npot") != NULL;
     printf("gfx: npot textures %s\n", sHasNpot ? "yes" : "no");
+
+    // The combiner's NOISE input: 64x64 random intensities on texture unit 2,
+    // which nothing else binds
+    {
+        static u8 noise[64 * 64];
+        GLuint tex;
+        u32 r = 0x4E4F4953; // "NOIS"
+        int i;
+
+        for (i = 0; i < 64 * 64; i++) {
+            r = r * 1103515245u + 12345u;
+            noise[i] = r >> 24;
+        }
+        glGenTextures(1, &tex);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 64, 64, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, noise);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glActiveTexture(GL_TEXTURE0);
+    }
 }
 
 /* The game edited a texture in place: forget load memos so the next load
