@@ -399,7 +399,7 @@ step_mesa() {
 # the ARMv8-only AOSP one, the rotation for the portrait panel). Its libc
 # table generator parses the sysroot's headers with libclang (bindings in a
 # venv under $WORK). Output: $WORK/gmloader/ (gmloadernext.armhf and the
-# lib/armeabi-v7a libraries it loads; see ports/am2r)
+# lib/armeabi-v7a libraries it loads; see build/gmloader/am2r)
 step_gmloader() {
 	local src="$WORK/gmloader-next" sr="$WORK/sysroot" venv="$WORK/gml-venv" patch cxxv out="$WORK/gmloader"
 	upstream_tree gmloader-next

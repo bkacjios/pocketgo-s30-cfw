@@ -1,0 +1,13 @@
+{
+    "save_dir" : "saves",
+    "apk_path" : "am2r.apk",
+    "show_cursor" : false,
+    "disable_controller" : false,
+    "disable_depth" : false,
+    "disable_extensions" : false,
+    "disable_joystick" : false,
+    "disable_rumble" : true,
+    "rumble_scale" : 1.0,
+    "first_pad_slot" : 1,
+    "force_platform" : "os_android"
+}
