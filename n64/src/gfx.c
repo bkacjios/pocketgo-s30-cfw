@@ -3227,7 +3227,12 @@ void pc_process_displaylist(void* displayList) {
     sVboNext = 0;
     gl_cache_reset();
     glBlendColor(0, 0, 0, 1);
-    glPolygonOffset(-1.0f, -2.0f);
+    // Decals (ZMODE_DEC): the RDP passes them within the surface's depth
+    // slope (dz) of what is there, so a decal polygon a little under the
+    // ground (OoT's paths, their own coarser mesh) still shows at grazing
+    // angles close up. Mostly slope-based here too; a fixed offset alone
+    // loses close to the camera, where 16-bit depth units are tiny
+    glPolygonOffset(-4.0f, -4.0f);
     glDepthFunc(GL_LEQUAL);
     glFrontFace(GL_CCW);
 

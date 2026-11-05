@@ -25,7 +25,7 @@
  * works when the daemon is not involved.
  *
  * System menu: the power key (grabbed, so apps never see it) opens a menu
- * over whoever holds the lease: Resume / System / Exit game over an app; the
+ * over whoever holds the lease: Exit game / System / Resume over an app; the
  * System page (straight away over the launcher) has a brightness slider
  * (D-pad left/right; the level is saved to the file given as argument and
  * restored at start), the performance overlay switch, the stick calibration,
@@ -431,8 +431,8 @@ static int osd_is_battery(void) {
    row closes the menu instead of going back. The system page: the brightness
    slider (NULL), the performance overlay switch, the stick calibration (its
    own screen, page 2), sleep, reboot, power off. */
-enum { APP_RESUME, APP_SYSTEM, APP_EXIT };
-static const char* const kAppItems[] = { "Resume", "System", "Exit game" };
+enum { APP_EXIT, APP_SYSTEM, APP_RESUME };
+static const char* const kAppItems[] = { "Exit game", "System", "Resume" };
 enum { SYS_BRIGHTNESS, SYS_PERF, SYS_CALIBRATE, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_BACK };
 static const char* const kSysItems[] = { NULL, "Overlay", "Calibrate stick", "Sleep", "Reboot", "Shut down", "Back" };
 
