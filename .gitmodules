@@ -42,3 +42,7 @@
 	path = ports/mk64
 	url = https://github.com/bkacjios/mk64-s30.git
 	shallow = true
+[submodule "external/gmloader-next"]
+	path = external/gmloader-next
+	url = https://github.com/PortsMaster/gmloader-next.git
+	shallow = true

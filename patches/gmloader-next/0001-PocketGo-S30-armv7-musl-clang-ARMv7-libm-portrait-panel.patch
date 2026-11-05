@@ -1,0 +1,2625 @@
+From: Bkacjios
+Subject: [PATCH] PocketGo S30: armv7 musl (Alpine), clang, ARMv7 libm, portrait panel
+
+Runs GameMaker Android titles (AM2R) on the PocketGo S30: Allwinner A33
+(Cortex-A7, ARMv7), Alpine (musl), GLES 2 on a portrait panel.
+
+- musl: the glibc extensions it lacks (s30/musl_compat.h, s30/musl_extra.cpp);
+  generate_libc.py parses the target sysroot (GML_CLANG_EXTRA), skips cursor
+  kinds older bindings lack, and only calls a function ambiguous when two
+  declarations differ
+- bionic armv7 has a 32-bit time_t/off_t/rlim_t/sigset_t, musl 64-bit (128-byte
+  sigset): converting wrappers (thunks/libc/bionic32.cpp) for time, stat,
+  offsets, mmap, rlimits, signals and sigsetjmp; BIONIC_FILE is 84 bytes
+  (BIONIC_fpos_t a long); the stdio wrappers unwrap the FILE bridge
+- clang: the JNI table has the guest ABI (pcs("aapcs")); bionic div_t etc.
+  alias the host types
+- the shipped AOSP libm.so is ARMv8-A code: the host libm instead
+  (thunks/libm/libm.cpp)
+- a portrait window: the game draws landscape offscreen, shown rotated
+  (gmloader/s30_rotate.cpp)
+- first_pad_slot (config): AM2R reads gamepad slot 1
+- crash report with guest module offsets; S30_GML_INPUT_LOG=1 logs input
+
+diff --git a/Makefile.gmloader b/Makefile.gmloader
+index f87282b..bf372a2 100755
+--- a/Makefile.gmloader
++++ b/Makefile.gmloader
+@@ -77,6 +77,8 @@ JNI_OBJS+=$(patsubst %.cpp,build/%.cpp.o,$(wildcard jni/*.cpp))
+ GMLOADER_OBJS:=$(patsubst %.cpp,build/%.cpp.o,$(wildcard gmloader/*.cpp))
+ GMLOADER_OBJS+=$(patsubst %.cpp,build/%.cpp.o,$(wildcard gmloader/classes/*.cpp))
+ GMLOADER_OBJS+=$(patsubst %.cpp,build/%.cpp.o,$(wildcard gmloader/stubs/*.cpp))
++# S30 (musl): glibc functions the export table refers to
++GMLOADER_OBJS+=$(patsubst %.cpp,build/%.cpp.o,$(wildcard s30/*.cpp))
+ 
+ GENERIC_OBJ:=\
+ 	${LOADER_OBJS} \
+diff --git a/gmloader/configuration.cpp b/gmloader/configuration.cpp
+index bc4f180..b7a21df 100644
+--- a/gmloader/configuration.cpp
++++ b/gmloader/configuration.cpp
+@@ -13,6 +13,7 @@ void from_json(const json& j, gml_config& c) {
+     get_if_exists("disable_depth", disable_depth);
+     get_if_exists("disable_extensions", disable_extensions);
+     get_if_exists("disable_joystick", disable_joystick);
++    get_if_exists("first_pad_slot", first_pad_slot);
+     get_if_exists("disable_rumble", disable_rumble);
+     get_if_exists("disable_texhack", disable_texhack);
+     get_if_exists("rumble_scale", rumble_scale);
+@@ -27,6 +28,7 @@ void gml_config::init_defaults(){
+     disable_depth = false;
+     disable_extensions = true;
+     disable_joystick = false;
++    first_pad_slot = 0;
+     disable_rumble = false;
+     disable_texhack = true; /* Disabled by default until properly tested. */
+     rumble_scale = 1.0;
+@@ -62,6 +64,7 @@ void gml_config::show_config(){
+     printf("config: disable_depth = %d\n", disable_depth);
+     printf("config: disable_extensions = %d\n", disable_extensions);
+     printf("config: disable_joystick = %d\n", disable_joystick);
++    printf("config: first_pad_slot = %d\n", first_pad_slot);
+     printf("config: disable_rumble = %d\n", disable_rumble);
+     printf("config: disable_texhack = %d\n", disable_texhack);
+     printf("config: rumble_scale = %f\n", rumble_scale);
+diff --git a/gmloader/configuration.h b/gmloader/configuration.h
+index ab0e96d..e217cc4 100644
+--- a/gmloader/configuration.h
++++ b/gmloader/configuration.h
+@@ -15,6 +15,7 @@ struct gml_config {
+     bool disable_depth;
+     bool disable_extensions;
+     bool disable_joystick;
++    int first_pad_slot; // S30: the first gamepad slot handed out (AM2R reads slot 1)
+     bool disable_rumble;
+     bool disable_texhack;
+     float rumble_scale;
+diff --git a/gmloader/gamepad.cpp b/gmloader/gamepad.cpp
+index d612183..68bdba7 100644
+--- a/gmloader/gamepad.cpp
++++ b/gmloader/gamepad.cpp
+@@ -1,3 +1,11 @@
++#include <stdlib.h>
++// S30 debugging (S30_GML_INPUT_LOG=1): the first calls of each function the game makes
++#define S30_LOG_CALL(name) do { \
++    static int n; static int log = -1; \
++    if (log < 0) log = getenv("S30_GML_INPUT_LOG") != NULL; \
++    if (log && n < 5) { n++; fprintf(stderr, "s30 input: game calls %s(%s)\n", name, \
++        argc > 0 ? (argc > 1 ? "id, arg" : "id") : ""); } \
++} while (0)
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <math.h>
+@@ -35,12 +43,14 @@ int translateAxis(RValue *val, int index)
+ // (RValue *ret, void *self, void *other, int argc, RValue *args)
+ ABI_ATTR void gamepad_is_supported(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_is_supported");
+     ret->kind = VALUE_REAL;
+     ret->rvalue.val = 1.0;
+ }
+ 
+ ABI_ATTR void gamepad_get_device_count(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_get_device_count");
+     // Documentation claims this can be "the number of available "slots" for game pads to be connected to."
+     // and since this is the upper-end, we're using that.
+     ret->kind = VALUE_REAL;
+@@ -49,6 +59,7 @@ ABI_ATTR void gamepad_get_device_count(RValue *ret, void *self, void *other, int
+ 
+ ABI_ATTR void gamepad_is_connected(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_is_connected");
+     ret->kind = VALUE_REAL;
+ 
+     int id = YYGetInt32(args, 0);
+@@ -59,33 +70,46 @@ ABI_ATTR void gamepad_is_connected(RValue *ret, void *self, void *other, int arg
+ 
+     Gamepad *gamepad = &yoyo_gamepads[id];
+     ret->rvalue.val = (gamepad->is_available) ? 1.0 : 0.0;
++    {
++        static int n;
++        if (getenv("S30_GML_INPUT_LOG") && n < 40) {
++            n++;
++            fprintf(stderr, "s30 input: gamepad_is_connected(%d) = %g (args kind %d, argc %d)\n", id,
++                    ret->rvalue.val, args[0].kind, argc);
++        }
++    }
+ }
+ 
+ #define CONTROLLER_NAME "Xbox 360 Controller (XInput STANDARD GAMEPAD)"
+ ABI_ATTR void gamepad_get_description(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_get_description");
+     YYCreateStringHelper(ret, CONTROLLER_NAME);
+ }
+ 
+ ABI_ATTR void gamepad_get_button_threshold(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_get_button_threshold");
+     ret->kind = VALUE_REAL;
+     ret->rvalue.val = 0.5f;
+ }
+ 
+ ABI_ATTR void gamepad_set_button_threshold(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_set_button_threshold");
+ 
+ }
+ 
+ ABI_ATTR void gamepad_axis_count(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_axis_count");
+     ret->kind = VALUE_REAL;
+     ret->rvalue.val = 4.f;
+ }
+ 
+ ABI_ATTR void gamepad_axis_value(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_axis_value");
+     ret->kind = VALUE_REAL;
+     int id = YYGetInt32(args, 0);
+     int axis = translateAxis(args, 1);
+@@ -127,6 +151,7 @@ ABI_ATTR void gamepad_axis_value(RValue *ret, void *self, void *other, int argc,
+ 
+ ABI_ATTR void gamepad_button_check(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_button_check");
+     ret->kind = VALUE_REAL;
+     int id = YYGetInt32(args, 0);
+     int btn = translateButton(args, 1);
+@@ -145,6 +170,7 @@ ABI_ATTR void gamepad_button_check(RValue *ret, void *self, void *other, int arg
+ 
+ ABI_ATTR void gamepad_button_check_pressed(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_button_check_pressed");
+     ret->kind = VALUE_REAL;
+     int id = YYGetInt32(args, 0);
+     int btn = translateButton(args, 1);
+@@ -163,6 +189,7 @@ ABI_ATTR void gamepad_button_check_pressed(RValue *ret, void *self, void *other,
+ 
+ ABI_ATTR void gamepad_button_check_released(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_button_check_released");
+     ret->kind = VALUE_REAL;
+     int id = YYGetInt32(args, 0);
+     int btn = translateButton(args, 1);
+@@ -181,12 +208,14 @@ ABI_ATTR void gamepad_button_check_released(RValue *ret, void *self, void *other
+ 
+ ABI_ATTR void gamepad_button_count(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_button_count");
+     ret->kind = VALUE_REAL;
+     ret->rvalue.val = 16.f;
+ }
+ 
+ ABI_ATTR void gamepad_button_value(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_button_value");
+     ret->kind = VALUE_REAL;
+     int id = YYGetInt32(args, 0);
+     int btn = translateButton(args, 1);
+@@ -205,6 +234,7 @@ ABI_ATTR void gamepad_button_value(RValue *ret, void *self, void *other, int arg
+ 
+ ABI_ATTR void gamepad_set_vibration(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_set_vibration");
+     int id = YYGetInt32(args, 0);
+     double left = YYGetReal(args, 1);
+     double right = YYGetReal(args, 2);
+@@ -221,6 +251,7 @@ ABI_ATTR void gamepad_set_vibration(RValue *ret, void *self, void *other, int ar
+ 
+ ABI_ATTR void gamepad_set_axis_deadzone(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_set_axis_deadzone");
+     int id = YYGetInt32(args, 0);
+     double deadzone = YYGetReal(args, 1);
+     if (!IS_CONTROLLER_BOUNDS) {
+@@ -233,6 +264,7 @@ ABI_ATTR void gamepad_set_axis_deadzone(RValue *ret, void *self, void *other, in
+ 
+ ABI_ATTR void gamepad_get_axis_deadzone(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_get_axis_deadzone");
+     ret->kind = VALUE_REAL;
+     int id = YYGetInt32(args, 0);
+     if (!IS_CONTROLLER_BOUNDS) {
+@@ -246,6 +278,7 @@ ABI_ATTR void gamepad_get_axis_deadzone(RValue *ret, void *self, void *other, in
+ 
+ ABI_ATTR void gamepad_set_colour(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("gamepad_set_colour");
+     
+ }
+ 
+@@ -261,6 +294,7 @@ ABI_ATTR void GamePadRestart()
+ 
+ ABI_ATTR void joystick_exists(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("joystick_exists");
+     ret->kind = VALUE_REAL;
+     int id = YYGetInt32(args, 0);
+     if (!IS_JOYSTICK_BOUNDS) {
+@@ -274,6 +308,7 @@ ABI_ATTR void joystick_exists(RValue *ret, void *self, void *other, int argc, RV
+ 
+ ABI_ATTR void joystick_check_button(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("joystick_check_button");
+     ret->kind = VALUE_REAL;
+     int id = YYGetInt32(args, 0);
+     int btn = translateButton(args, 1);
+@@ -288,6 +323,7 @@ ABI_ATTR void joystick_check_button(RValue *ret, void *self, void *other, int ar
+ 
+ ABI_ATTR void joystick_buttons(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("joystick_buttons");
+     ret->kind = VALUE_REAL;
+     int id = YYGetInt32(args, 0);
+     if (!IS_JOYSTICK_BOUNDS) {
+@@ -301,6 +337,7 @@ ABI_ATTR void joystick_buttons(RValue *ret, void *self, void *other, int argc, R
+ 
+ ABI_ATTR void joystick_has_pov(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("joystick_has_pov");
+     ret->kind = VALUE_REAL;
+     int id = YYGetInt32(args, 0);
+     if (!IS_JOYSTICK_BOUNDS) {
+@@ -314,6 +351,7 @@ ABI_ATTR void joystick_has_pov(RValue *ret, void *self, void *other, int argc, R
+ 
+ ABI_ATTR void joystick_direction(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("joystick_direction");
+     ret->kind = VALUE_REAL;
+     int id = YYGetInt32(args, 0);
+     if (!IS_JOYSTICK_BOUNDS) {
+@@ -342,6 +380,7 @@ ABI_ATTR void joystick_direction(RValue *ret, void *self, void *other, int argc,
+ 
+ ABI_ATTR void joystick_pov(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("joystick_pov");
+     ret->kind = VALUE_REAL;
+     int id = YYGetInt32(args, 0);
+     if (!IS_JOYSTICK_BOUNDS) {
+@@ -391,11 +430,13 @@ void joystick_common_pos(RValue *ret, void *self, void *other, int argc, RValue
+ 
+ ABI_ATTR void joystick_xpos(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("joystick_xpos");
+     joystick_common_pos(ret, self, other, argc, args, 0);
+ }
+ 
+ ABI_ATTR void joystick_ypos(RValue *ret, void *self, void *other, int argc, RValue *args)
+ {
++    S30_LOG_CALL("joystick_ypos");
+     joystick_common_pos(ret, self, other, argc, args, 1);
+ }
+ 
+diff --git a/gmloader/input.cpp b/gmloader/input.cpp
+index 5b535f1..c48e5b0 100644
+--- a/gmloader/input.cpp
++++ b/gmloader/input.cpp
+@@ -52,7 +52,8 @@ static int get_which_controller(int which)
+ 
+ static int get_free_yoyogamepad_slot()
+ {
+-    for (int i = 0; i < ARRAY_SIZE(yoyo_gamepads); i++) {
++    for (int i = gmloader_config.first_pad_slot; i < ARRAY_SIZE(yoyo_gamepads); i++) {
++        if (i < 0) continue;
+         if (!yoyo_gamepads[i].is_available) //not connected
+             return i;
+     }
+@@ -356,6 +357,18 @@ int update_inputs(SDL_Window *win)
+             SDL_GameControllerRumble(controller->controller, left_motor, right_motor, duration_ms);
+         }
+ 
++        // S30 debugging (S30_GML_INPUT_LOG=1): the pad's buttons as SDL reports them
++        {
++            static int log = -1;
++            static uint8_t last[16];
++            if (log < 0) log = getenv("S30_GML_INPUT_LOG") != NULL;
++            for (int j = 0; log && j < 16; j++) {
++                if (new_states[j] != last[j]) {
++                    fprintf(stderr, "s30 input: slot %d button %d %s\n", slot, j, new_states[j] ? "down" : "up");
++                    last[j] = new_states[j];
++                }
++            }
++        }
+         for (int j = 0; j < ARRAY_SIZE(yoyo_gamepads[slot].buttons); j++) {
+             // down -> held or up -> cleared
+             yoyo_gamepads[slot].buttons[j] = (double)update_button(new_states[j], (int)yoyo_gamepads[slot].buttons[j]);
+diff --git a/gmloader/main.cpp b/gmloader/main.cpp
+index 4132bb4..88cc136 100755
+--- a/gmloader/main.cpp
++++ b/gmloader/main.cpp
+@@ -40,6 +40,7 @@ int foo() { return tls0[0]++; }
+ extern DynLibFunction symtable_libc[];
+ extern DynLibFunction symtable_zlib[];
+ extern DynLibFunction symtable_gles2[];
++extern DynLibFunction symtable_libm[]; // S30: thunks/libm/libm.cpp
+ 
+ extern double FORCE_PLATFORM;
+ 
+@@ -51,9 +52,15 @@ DynLibFunction *so_dynamic_libraries[32] = {
+     symtable_libc,
+     symtable_zlib,
+     symtable_gles2,
++    symtable_libm,
+     NULL
+ };
+ 
++extern "C" void s30_install_crash_handler(void); // loader/so_util.cpp
++void s30_rotate_init(SDL_Window* win, int* w, int* h); // gmloader/s30_rotate.cpp
++void s30_rotate_present(void);
++void s30_rotate_after_swap(void);
++
+ int load_module(const char *soname, zip_t *apk, so_module &mod, uintptr_t base_address, JavaVM *vm)
+ {
+     void *buffer;
+@@ -216,7 +223,8 @@ int main(int argc, char *argv[])
+     warning("Loading images...\n");
+     // libc.so is implicit (implemented by gmloader)
+     // libopenal.so is statically patched via so_static_patches (so we can overload static builds)
+-    if (!load_module("libm.so", apk, libm, addr_libm, vm)) return -1;
++    // S30: the AOSP libm.so is ARMv8-A code; the host's libm instead (symtable_libm)
++    (void)addr_libm;
+     if (!load_module("libcompiler_rt.so", apk, libcrt, addr_libcrt, vm)) return -1;
+     if (!load_module("libc++_shared.so", apk, stdcpp, addr_stdcpp, vm)) return -1;
+     int has_al = !load_module("libopenal.so", apk, openal, addr_openal, vm); /* Some APKs have external libopenal.so */
+@@ -289,6 +297,8 @@ int main(int argc, char *argv[])
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+ 
+     sdl_ctx = SDL_GL_CreateContext(sdl_win);
++    // S30: SDL installs its own fatal-signal handlers (evdev keyboard restore); the loader's crash report goes first
++    s30_install_crash_handler();
+     if (sdl_ctx == NULL) {
+         fatal_error("Failed to create OpenGL Context: %s\n", SDL_GetError());
+         return -1;
+@@ -301,6 +311,10 @@ int main(int argc, char *argv[])
+     load_egl_funcs();
+     load_gles2_funcs();
+ 
++    // S30: a portrait panel gets the game in landscape, rotated (gmloader/s30_rotate.cpp)
++    int rot_w, rot_h;
++    s30_rotate_init(sdl_win, &rot_w, &rot_h);
++
+     int cont = 1;
+     int w, h;
+ 
+@@ -321,10 +335,13 @@ int main(int argc, char *argv[])
+         #endif
+         if (update_inputs(sdl_win) != 1)
+             break;
+-        SDL_GetWindowSize(sdl_win, &w, &h);
+-        cont = RunnerJNILib::Process(env, 0, w, h, 0, 0, 0, 0, 0, 60);
+-        if (RunnerJNILib::canFlip(env, 0))
++        (void)w; (void)h;
++        cont = RunnerJNILib::Process(env, 0, rot_w, rot_h, 0, 0, 0, 0, 0, 60);
++        if (RunnerJNILib::canFlip(env, 0)) {
++            s30_rotate_present();
+             SDL_GL_SwapWindow(sdl_win);
++            s30_rotate_after_swap();
++        }
+     }
+ 
+     SDL_GL_DeleteContext(sdl_ctx);
+diff --git a/gmloader/s30_rotate.cpp b/gmloader/s30_rotate.cpp
+new file mode 100644
+index 0000000..d48ecc5
+--- /dev/null
++++ b/gmloader/s30_rotate.cpp
+@@ -0,0 +1,199 @@
++// S30: the PocketGo S30's panel is portrait (320x480) and mounted sideways.
++// When the window is taller than wide, the game gets a landscape size and
++// draws into an offscreen framebuffer of that size (its "default framebuffer"
++// 0 maps there), which is drawn rotated onto the panel before each swap.
++// Landscape (x, y) is panel (y, 479 - x), as everywhere on the S30.
++#include <SDL2/SDL.h>
++#include <string.h>
++#include "../thunks/khronos/glad.h"
++
++#include "platform.h"
++#include "so_util.h"
++#include "thunk_gen.h"
++
++extern DynLibFunction symtable_gles2[];
++
++static int sOn;
++static int sW, sH; // landscape size the game draws at
++static int sPanelW, sPanelH;
++static GLuint sFbo, sTex, sDepth, sProg, sVbo;
++static GLint sPosLoc, sUvLoc;
++static GLuint sGameFb; // bound when the frame ended
++
++ABI_ATTR static void bind_framebuffer_impl(GLenum target, GLuint fb) {
++    glad_glBindFramebuffer(target, fb == 0 ? sFbo : fb);
++}
++
++ABI_ATTR static void get_integerv_impl(GLenum pname, GLint* v) {
++    glad_glGetIntegerv(pname, v);
++    if (pname == GL_FRAMEBUFFER_BINDING && *v == (GLint)sFbo) {
++        *v = 0;
++    }
++}
++
++static void replace(const char* name, uintptr_t func) {
++    for (int i = 0; symtable_gles2[i].symbol != NULL; i++) {
++        if (strcmp(symtable_gles2[i].symbol, name) == 0) {
++            symtable_gles2[i].func = func;
++            return;
++        }
++    }
++}
++
++static GLuint shader(GLenum type, const char* src) {
++    GLuint s = glad_glCreateShader(type);
++
++    glad_glShaderSource(s, 1, &src, NULL);
++    glad_glCompileShader(s);
++    return s;
++}
++
++// Call after load_gles2_funcs(). *w, *h: the size to give the game.
++void s30_rotate_init(SDL_Window* win, int* w, int* h) {
++    // panel corner, uv: landscape x along the panel's height, y across it
++    static const float quad[] = {
++        -1.0f, -1.0f, 0.0f, 1.0f,
++         1.0f, -1.0f, 0.0f, 0.0f,
++        -1.0f,  1.0f, 1.0f, 1.0f,
++         1.0f,  1.0f, 1.0f, 0.0f,
++    };
++    GLuint vs, fs;
++
++    SDL_GL_GetDrawableSize(win, &sPanelW, &sPanelH);
++    *w = sPanelW;
++    *h = sPanelH;
++    if (sPanelH <= sPanelW) {
++        return;
++    }
++    sOn = 1;
++    sW = sPanelH;
++    sH = sPanelW;
++    *w = sW;
++    *h = sH;
++
++    glad_glGenTextures(1, &sTex);
++    glad_glBindTexture(GL_TEXTURE_2D, sTex);
++    glad_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sW, sH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++    glad_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glad_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glad_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glad_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    glad_glGenRenderbuffers(1, &sDepth);
++    glad_glBindRenderbuffer(GL_RENDERBUFFER, sDepth);
++    glad_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8_OES, sW, sH);
++    glad_glGenFramebuffers(1, &sFbo);
++    glad_glBindFramebuffer(GL_FRAMEBUFFER, sFbo);
++    glad_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sTex, 0);
++    glad_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, sDepth);
++    glad_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, sDepth);
++    if (glad_glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++        fprintf(stderr, "s30_rotate: offscreen framebuffer incomplete, not rotating\n");
++        glad_glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        sOn = 0;
++        *w = sPanelW;
++        *h = sPanelH;
++        return;
++    }
++
++    vs = shader(GL_VERTEX_SHADER,
++                "attribute vec2 aPos; attribute vec2 aUv; varying vec2 vUv;\n"
++                "void main() { vUv = aUv; gl_Position = vec4(aPos, 0.0, 1.0); }\n");
++    fs = shader(GL_FRAGMENT_SHADER,
++                "precision mediump float; varying vec2 vUv; uniform sampler2D uTex;\n"
++                "void main() { gl_FragColor = texture2D(uTex, vUv); }\n");
++    sProg = glad_glCreateProgram();
++    glad_glAttachShader(sProg, vs);
++    glad_glAttachShader(sProg, fs);
++    glad_glLinkProgram(sProg);
++    sPosLoc = glad_glGetAttribLocation(sProg, "aPos");
++    sUvLoc = glad_glGetAttribLocation(sProg, "aUv");
++    glad_glGenBuffers(1, &sVbo);
++    glad_glBindBuffer(GL_ARRAY_BUFFER, sVbo);
++    glad_glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
++    glad_glBindBuffer(GL_ARRAY_BUFFER, 0);
++
++    replace("glBindFramebuffer", (uintptr_t)&bind_framebuffer_impl);
++    replace("glGetIntegerv", (uintptr_t)&get_integerv_impl);
++    glad_glBindFramebuffer(GL_FRAMEBUFFER, sFbo);
++    glad_glViewport(0, 0, sW, sH);
++    fprintf(stderr, "s30_rotate: %dx%d panel, the game at %dx%d\n", sPanelW, sPanelH, sW, sH);
++}
++
++// Before SDL_GL_SwapWindow: the offscreen frame onto the panel, rotated.
++// The game's GL state is put back afterwards.
++void s30_rotate_present(void) {
++    GLint fb, prog, tex, unit, abuf, vp[4], en[2], size[2], type[2], norm[2], stride[2];
++    GLvoid* ptr[2];
++    GLboolean blend, depth, scissor, cull, stencil, mask[4];
++    GLint locs[2] = { sPosLoc, sUvLoc };
++
++    if (!sOn) {
++        return;
++    }
++    glad_glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
++    glad_glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
++    glad_glGetIntegerv(GL_ACTIVE_TEXTURE, &unit);
++    glad_glActiveTexture(GL_TEXTURE0);
++    glad_glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
++    glad_glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &abuf);
++    glad_glGetIntegerv(GL_VIEWPORT, vp);
++    glad_glGetBooleanv(GL_COLOR_WRITEMASK, mask);
++    blend = glad_glIsEnabled(GL_BLEND);
++    depth = glad_glIsEnabled(GL_DEPTH_TEST);
++    scissor = glad_glIsEnabled(GL_SCISSOR_TEST);
++    cull = glad_glIsEnabled(GL_CULL_FACE);
++    stencil = glad_glIsEnabled(GL_STENCIL_TEST);
++    for (int i = 0; i < 2; i++) {
++        glad_glGetVertexAttribiv(locs[i], GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en[i]);
++        glad_glGetVertexAttribiv(locs[i], GL_VERTEX_ATTRIB_ARRAY_SIZE, &size[i]);
++        glad_glGetVertexAttribiv(locs[i], GL_VERTEX_ATTRIB_ARRAY_TYPE, &type[i]);
++        glad_glGetVertexAttribiv(locs[i], GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &norm[i]);
++        glad_glGetVertexAttribiv(locs[i], GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride[i]);
++        glad_glGetVertexAttribPointerv(locs[i], GL_VERTEX_ATTRIB_ARRAY_POINTER, &ptr[i]);
++    }
++
++    glad_glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    glad_glViewport(0, 0, sPanelW, sPanelH);
++    glad_glDisable(GL_BLEND);
++    glad_glDisable(GL_DEPTH_TEST);
++    glad_glDisable(GL_SCISSOR_TEST);
++    glad_glDisable(GL_CULL_FACE);
++    glad_glDisable(GL_STENCIL_TEST);
++    glad_glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    glad_glUseProgram(sProg);
++    glad_glBindTexture(GL_TEXTURE_2D, sTex);
++    glad_glBindBuffer(GL_ARRAY_BUFFER, sVbo);
++    glad_glEnableVertexAttribArray(sPosLoc);
++    glad_glEnableVertexAttribArray(sUvLoc);
++    glad_glVertexAttribPointer(sPosLoc, 2, GL_FLOAT, GL_FALSE, 16, (const void*)0);
++    glad_glVertexAttribPointer(sUvLoc, 2, GL_FLOAT, GL_FALSE, 16, (const void*)8);
++    glad_glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++
++    // The game's state back (the framebuffer after the swap: s30_rotate_after_swap)
++    glad_glBindBuffer(GL_ARRAY_BUFFER, abuf);
++    for (int i = 0; i < 2; i++) {
++        glad_glVertexAttribPointer(locs[i], size[i], type[i], norm[i], stride[i], ptr[i]);
++        if (!en[i]) {
++            glad_glDisableVertexAttribArray(locs[i]);
++        }
++    }
++    glad_glBindBuffer(GL_ARRAY_BUFFER, abuf);
++    glad_glBindTexture(GL_TEXTURE_2D, tex);
++    glad_glActiveTexture(unit);
++    glad_glUseProgram(prog);
++    glad_glColorMask(mask[0], mask[1], mask[2], mask[3]);
++    (blend ? glad_glEnable : glad_glDisable)(GL_BLEND);
++    (depth ? glad_glEnable : glad_glDisable)(GL_DEPTH_TEST);
++    (scissor ? glad_glEnable : glad_glDisable)(GL_SCISSOR_TEST);
++    (cull ? glad_glEnable : glad_glDisable)(GL_CULL_FACE);
++    (stencil ? glad_glEnable : glad_glDisable)(GL_STENCIL_TEST);
++    glad_glViewport(vp[0], vp[1], vp[2], vp[3]);
++    sGameFb = (GLuint)fb;
++}
++
++// After SDL_GL_SwapWindow: the game's framebuffer again
++void s30_rotate_after_swap(void) {
++    if (sOn) {
++        glad_glBindFramebuffer(GL_FRAMEBUFFER, sGameFb);
++    }
++}
+diff --git a/jni/jni.h b/jni/jni.h
+index 4c34313..e9c5da6 100644
+--- a/jni/jni.h
++++ b/jni/jni.h
+@@ -26,6 +26,8 @@
+ 
+ #include <stdarg.h>
+ #include <stdint.h>
++/* S30: the Android library calls these with its soft-float ABI (pcs("aapcs")) */
++#include "platform.h"
+ 
+ /* Primitive types that match up with Java equivalents. */
+ typedef uint8_t  jboolean; /* unsigned 8 bits */
+@@ -153,332 +155,332 @@ struct JNINativeInterface {
+     void*       reserved2;
+     void*       reserved3;
+ 
+-    jint        (*GetVersion)(JNIEnv *);
++    jint        (ABI_ATTR *GetVersion)(JNIEnv *);
+ 
+-    jclass      (*DefineClass)(JNIEnv*, const char*, jobject, const jbyte*,
++    jclass      (ABI_ATTR *DefineClass)(JNIEnv*, const char*, jobject, const jbyte*,
+                         jsize);
+-    jclass      (*FindClass)(JNIEnv*, const char*);
++    jclass      (ABI_ATTR *FindClass)(JNIEnv*, const char*);
+ 
+-    jmethodID   (*FromReflectedMethod)(JNIEnv*, jobject);
+-    jfieldID    (*FromReflectedField)(JNIEnv*, jobject);
++    jmethodID   (ABI_ATTR *FromReflectedMethod)(JNIEnv*, jobject);
++    jfieldID    (ABI_ATTR *FromReflectedField)(JNIEnv*, jobject);
+     /* spec doesn't show jboolean parameter */
+-    jobject     (*ToReflectedMethod)(JNIEnv*, jclass, jmethodID, jboolean);
++    jobject     (ABI_ATTR *ToReflectedMethod)(JNIEnv*, jclass, jmethodID, jboolean);
+ 
+-    jclass      (*GetSuperclass)(JNIEnv*, jclass);
+-    jboolean    (*IsAssignableFrom)(JNIEnv*, jclass, jclass);
++    jclass      (ABI_ATTR *GetSuperclass)(JNIEnv*, jclass);
++    jboolean    (ABI_ATTR *IsAssignableFrom)(JNIEnv*, jclass, jclass);
+ 
+     /* spec doesn't show jboolean parameter */
+-    jobject     (*ToReflectedField)(JNIEnv*, jclass, jfieldID, jboolean);
+-
+-    jint        (*Throw)(JNIEnv*, jthrowable);
+-    jint        (*ThrowNew)(JNIEnv *, jclass, const char *);
+-    jthrowable  (*ExceptionOccurred)(JNIEnv*);
+-    void        (*ExceptionDescribe)(JNIEnv*);
+-    void        (*ExceptionClear)(JNIEnv*);
+-    void        (*FatalError)(JNIEnv*, const char*);
+-
+-    jint        (*PushLocalFrame)(JNIEnv*, jint);
+-    jobject     (*PopLocalFrame)(JNIEnv*, jobject);
+-
+-    jobject     (*NewGlobalRef)(JNIEnv*, jobject);
+-    void        (*DeleteGlobalRef)(JNIEnv*, jobject);
+-    void        (*DeleteLocalRef)(JNIEnv*, jobject);
+-    jboolean    (*IsSameObject)(JNIEnv*, jobject, jobject);
+-
+-    jobject     (*NewLocalRef)(JNIEnv*, jobject);
+-    jint        (*EnsureLocalCapacity)(JNIEnv*, jint);
+-
+-    jobject     (*AllocObject)(JNIEnv*, jclass);
+-    jobject     (*NewObject)(JNIEnv*, jclass, jmethodID, ...);
+-    jobject     (*NewObjectV)(JNIEnv*, jclass, jmethodID, va_list);
+-    jobject     (*NewObjectA)(JNIEnv*, jclass, jmethodID, const jvalue*);
+-
+-    jclass      (*GetObjectClass)(JNIEnv*, jobject);
+-    jboolean    (*IsInstanceOf)(JNIEnv*, jobject, jclass);
+-    jmethodID   (*GetMethodID)(JNIEnv*, jclass, const char*, const char*);
+-
+-    jobject     (*CallObjectMethod)(JNIEnv*, jobject, jmethodID, ...);
+-    jobject     (*CallObjectMethodV)(JNIEnv*, jobject, jmethodID, va_list);
+-    jobject     (*CallObjectMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
+-    jboolean    (*CallBooleanMethod)(JNIEnv*, jobject, jmethodID, ...);
+-    jboolean    (*CallBooleanMethodV)(JNIEnv*, jobject, jmethodID, va_list);
+-    jboolean    (*CallBooleanMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
+-    jbyte       (*CallByteMethod)(JNIEnv*, jobject, jmethodID, ...);
+-    jbyte       (*CallByteMethodV)(JNIEnv*, jobject, jmethodID, va_list);
+-    jbyte       (*CallByteMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
+-    jchar       (*CallCharMethod)(JNIEnv*, jobject, jmethodID, ...);
+-    jchar       (*CallCharMethodV)(JNIEnv*, jobject, jmethodID, va_list);
+-    jchar       (*CallCharMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
+-    jshort      (*CallShortMethod)(JNIEnv*, jobject, jmethodID, ...);
+-    jshort      (*CallShortMethodV)(JNIEnv*, jobject, jmethodID, va_list);
+-    jshort      (*CallShortMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
+-    jint        (*CallIntMethod)(JNIEnv*, jobject, jmethodID, ...);
+-    jint        (*CallIntMethodV)(JNIEnv*, jobject, jmethodID, va_list);
+-    jint        (*CallIntMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
+-    jlong       (*CallLongMethod)(JNIEnv*, jobject, jmethodID, ...);
+-    jlong       (*CallLongMethodV)(JNIEnv*, jobject, jmethodID, va_list);
+-    jlong       (*CallLongMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
+-    jfloat      (*CallFloatMethod)(JNIEnv*, jobject, jmethodID, ...);
+-    jfloat      (*CallFloatMethodV)(JNIEnv*, jobject, jmethodID, va_list);
+-    jfloat      (*CallFloatMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
+-    jdouble     (*CallDoubleMethod)(JNIEnv*, jobject, jmethodID, ...);
+-    jdouble     (*CallDoubleMethodV)(JNIEnv*, jobject, jmethodID, va_list);
+-    jdouble     (*CallDoubleMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
+-    void        (*CallVoidMethod)(JNIEnv*, jobject, jmethodID, ...);
+-    void        (*CallVoidMethodV)(JNIEnv*, jobject, jmethodID, va_list);
+-    void        (*CallVoidMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
+-
+-    jobject     (*CallNonvirtualObjectMethod)(JNIEnv*, jobject, jclass,
++    jobject     (ABI_ATTR *ToReflectedField)(JNIEnv*, jclass, jfieldID, jboolean);
++
++    jint        (ABI_ATTR *Throw)(JNIEnv*, jthrowable);
++    jint        (ABI_ATTR *ThrowNew)(JNIEnv *, jclass, const char *);
++    jthrowable  (ABI_ATTR *ExceptionOccurred)(JNIEnv*);
++    void        (ABI_ATTR *ExceptionDescribe)(JNIEnv*);
++    void        (ABI_ATTR *ExceptionClear)(JNIEnv*);
++    void        (ABI_ATTR *FatalError)(JNIEnv*, const char*);
++
++    jint        (ABI_ATTR *PushLocalFrame)(JNIEnv*, jint);
++    jobject     (ABI_ATTR *PopLocalFrame)(JNIEnv*, jobject);
++
++    jobject     (ABI_ATTR *NewGlobalRef)(JNIEnv*, jobject);
++    void        (ABI_ATTR *DeleteGlobalRef)(JNIEnv*, jobject);
++    void        (ABI_ATTR *DeleteLocalRef)(JNIEnv*, jobject);
++    jboolean    (ABI_ATTR *IsSameObject)(JNIEnv*, jobject, jobject);
++
++    jobject     (ABI_ATTR *NewLocalRef)(JNIEnv*, jobject);
++    jint        (ABI_ATTR *EnsureLocalCapacity)(JNIEnv*, jint);
++
++    jobject     (ABI_ATTR *AllocObject)(JNIEnv*, jclass);
++    jobject     (ABI_ATTR *NewObject)(JNIEnv*, jclass, jmethodID, ...);
++    jobject     (ABI_ATTR *NewObjectV)(JNIEnv*, jclass, jmethodID, va_list);
++    jobject     (ABI_ATTR *NewObjectA)(JNIEnv*, jclass, jmethodID, const jvalue*);
++
++    jclass      (ABI_ATTR *GetObjectClass)(JNIEnv*, jobject);
++    jboolean    (ABI_ATTR *IsInstanceOf)(JNIEnv*, jobject, jclass);
++    jmethodID   (ABI_ATTR *GetMethodID)(JNIEnv*, jclass, const char*, const char*);
++
++    jobject     (ABI_ATTR *CallObjectMethod)(JNIEnv*, jobject, jmethodID, ...);
++    jobject     (ABI_ATTR *CallObjectMethodV)(JNIEnv*, jobject, jmethodID, va_list);
++    jobject     (ABI_ATTR *CallObjectMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
++    jboolean    (ABI_ATTR *CallBooleanMethod)(JNIEnv*, jobject, jmethodID, ...);
++    jboolean    (ABI_ATTR *CallBooleanMethodV)(JNIEnv*, jobject, jmethodID, va_list);
++    jboolean    (ABI_ATTR *CallBooleanMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
++    jbyte       (ABI_ATTR *CallByteMethod)(JNIEnv*, jobject, jmethodID, ...);
++    jbyte       (ABI_ATTR *CallByteMethodV)(JNIEnv*, jobject, jmethodID, va_list);
++    jbyte       (ABI_ATTR *CallByteMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
++    jchar       (ABI_ATTR *CallCharMethod)(JNIEnv*, jobject, jmethodID, ...);
++    jchar       (ABI_ATTR *CallCharMethodV)(JNIEnv*, jobject, jmethodID, va_list);
++    jchar       (ABI_ATTR *CallCharMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
++    jshort      (ABI_ATTR *CallShortMethod)(JNIEnv*, jobject, jmethodID, ...);
++    jshort      (ABI_ATTR *CallShortMethodV)(JNIEnv*, jobject, jmethodID, va_list);
++    jshort      (ABI_ATTR *CallShortMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
++    jint        (ABI_ATTR *CallIntMethod)(JNIEnv*, jobject, jmethodID, ...);
++    jint        (ABI_ATTR *CallIntMethodV)(JNIEnv*, jobject, jmethodID, va_list);
++    jint        (ABI_ATTR *CallIntMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
++    jlong       (ABI_ATTR *CallLongMethod)(JNIEnv*, jobject, jmethodID, ...);
++    jlong       (ABI_ATTR *CallLongMethodV)(JNIEnv*, jobject, jmethodID, va_list);
++    jlong       (ABI_ATTR *CallLongMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
++    jfloat      (ABI_ATTR *CallFloatMethod)(JNIEnv*, jobject, jmethodID, ...);
++    jfloat      (ABI_ATTR *CallFloatMethodV)(JNIEnv*, jobject, jmethodID, va_list);
++    jfloat      (ABI_ATTR *CallFloatMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
++    jdouble     (ABI_ATTR *CallDoubleMethod)(JNIEnv*, jobject, jmethodID, ...);
++    jdouble     (ABI_ATTR *CallDoubleMethodV)(JNIEnv*, jobject, jmethodID, va_list);
++    jdouble     (ABI_ATTR *CallDoubleMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
++    void        (ABI_ATTR *CallVoidMethod)(JNIEnv*, jobject, jmethodID, ...);
++    void        (ABI_ATTR *CallVoidMethodV)(JNIEnv*, jobject, jmethodID, va_list);
++    void        (ABI_ATTR *CallVoidMethodA)(JNIEnv*, jobject, jmethodID, const jvalue*);
++
++    jobject     (ABI_ATTR *CallNonvirtualObjectMethod)(JNIEnv*, jobject, jclass,
+                         jmethodID, ...);
+-    jobject     (*CallNonvirtualObjectMethodV)(JNIEnv*, jobject, jclass,
++    jobject     (ABI_ATTR *CallNonvirtualObjectMethodV)(JNIEnv*, jobject, jclass,
+                         jmethodID, va_list);
+-    jobject     (*CallNonvirtualObjectMethodA)(JNIEnv*, jobject, jclass,
++    jobject     (ABI_ATTR *CallNonvirtualObjectMethodA)(JNIEnv*, jobject, jclass,
+                         jmethodID, const jvalue*);
+-    jboolean    (*CallNonvirtualBooleanMethod)(JNIEnv*, jobject, jclass,
++    jboolean    (ABI_ATTR *CallNonvirtualBooleanMethod)(JNIEnv*, jobject, jclass,
+                         jmethodID, ...);
+-    jboolean    (*CallNonvirtualBooleanMethodV)(JNIEnv*, jobject, jclass,
++    jboolean    (ABI_ATTR *CallNonvirtualBooleanMethodV)(JNIEnv*, jobject, jclass,
+                          jmethodID, va_list);
+-    jboolean    (*CallNonvirtualBooleanMethodA)(JNIEnv*, jobject, jclass,
++    jboolean    (ABI_ATTR *CallNonvirtualBooleanMethodA)(JNIEnv*, jobject, jclass,
+                          jmethodID, const jvalue*);
+-    jbyte       (*CallNonvirtualByteMethod)(JNIEnv*, jobject, jclass,
++    jbyte       (ABI_ATTR *CallNonvirtualByteMethod)(JNIEnv*, jobject, jclass,
+                         jmethodID, ...);
+-    jbyte       (*CallNonvirtualByteMethodV)(JNIEnv*, jobject, jclass,
++    jbyte       (ABI_ATTR *CallNonvirtualByteMethodV)(JNIEnv*, jobject, jclass,
+                         jmethodID, va_list);
+-    jbyte       (*CallNonvirtualByteMethodA)(JNIEnv*, jobject, jclass,
++    jbyte       (ABI_ATTR *CallNonvirtualByteMethodA)(JNIEnv*, jobject, jclass,
+                         jmethodID, const jvalue*);
+-    jchar       (*CallNonvirtualCharMethod)(JNIEnv*, jobject, jclass,
++    jchar       (ABI_ATTR *CallNonvirtualCharMethod)(JNIEnv*, jobject, jclass,
+                         jmethodID, ...);
+-    jchar       (*CallNonvirtualCharMethodV)(JNIEnv*, jobject, jclass,
++    jchar       (ABI_ATTR *CallNonvirtualCharMethodV)(JNIEnv*, jobject, jclass,
+                         jmethodID, va_list);
+-    jchar       (*CallNonvirtualCharMethodA)(JNIEnv*, jobject, jclass,
++    jchar       (ABI_ATTR *CallNonvirtualCharMethodA)(JNIEnv*, jobject, jclass,
+                         jmethodID, const jvalue*);
+-    jshort      (*CallNonvirtualShortMethod)(JNIEnv*, jobject, jclass,
++    jshort      (ABI_ATTR *CallNonvirtualShortMethod)(JNIEnv*, jobject, jclass,
+                         jmethodID, ...);
+-    jshort      (*CallNonvirtualShortMethodV)(JNIEnv*, jobject, jclass,
++    jshort      (ABI_ATTR *CallNonvirtualShortMethodV)(JNIEnv*, jobject, jclass,
+                         jmethodID, va_list);
+-    jshort      (*CallNonvirtualShortMethodA)(JNIEnv*, jobject, jclass,
++    jshort      (ABI_ATTR *CallNonvirtualShortMethodA)(JNIEnv*, jobject, jclass,
+                         jmethodID, const jvalue*);
+-    jint        (*CallNonvirtualIntMethod)(JNIEnv*, jobject, jclass,
++    jint        (ABI_ATTR *CallNonvirtualIntMethod)(JNIEnv*, jobject, jclass,
+                         jmethodID, ...);
+-    jint        (*CallNonvirtualIntMethodV)(JNIEnv*, jobject, jclass,
++    jint        (ABI_ATTR *CallNonvirtualIntMethodV)(JNIEnv*, jobject, jclass,
+                         jmethodID, va_list);
+-    jint        (*CallNonvirtualIntMethodA)(JNIEnv*, jobject, jclass,
++    jint        (ABI_ATTR *CallNonvirtualIntMethodA)(JNIEnv*, jobject, jclass,
+                         jmethodID, const jvalue*);
+-    jlong       (*CallNonvirtualLongMethod)(JNIEnv*, jobject, jclass,
++    jlong       (ABI_ATTR *CallNonvirtualLongMethod)(JNIEnv*, jobject, jclass,
+                         jmethodID, ...);
+-    jlong       (*CallNonvirtualLongMethodV)(JNIEnv*, jobject, jclass,
++    jlong       (ABI_ATTR *CallNonvirtualLongMethodV)(JNIEnv*, jobject, jclass,
+                         jmethodID, va_list);
+-    jlong       (*CallNonvirtualLongMethodA)(JNIEnv*, jobject, jclass,
++    jlong       (ABI_ATTR *CallNonvirtualLongMethodA)(JNIEnv*, jobject, jclass,
+                         jmethodID, const jvalue*);
+-    jfloat      (*CallNonvirtualFloatMethod)(JNIEnv*, jobject, jclass,
++    jfloat      (ABI_ATTR *CallNonvirtualFloatMethod)(JNIEnv*, jobject, jclass,
+                         jmethodID, ...);
+-    jfloat      (*CallNonvirtualFloatMethodV)(JNIEnv*, jobject, jclass,
++    jfloat      (ABI_ATTR *CallNonvirtualFloatMethodV)(JNIEnv*, jobject, jclass,
+                         jmethodID, va_list);
+-    jfloat      (*CallNonvirtualFloatMethodA)(JNIEnv*, jobject, jclass,
++    jfloat      (ABI_ATTR *CallNonvirtualFloatMethodA)(JNIEnv*, jobject, jclass,
+                         jmethodID, const jvalue*);
+-    jdouble     (*CallNonvirtualDoubleMethod)(JNIEnv*, jobject, jclass,
++    jdouble     (ABI_ATTR *CallNonvirtualDoubleMethod)(JNIEnv*, jobject, jclass,
+                         jmethodID, ...);
+-    jdouble     (*CallNonvirtualDoubleMethodV)(JNIEnv*, jobject, jclass,
++    jdouble     (ABI_ATTR *CallNonvirtualDoubleMethodV)(JNIEnv*, jobject, jclass,
+                         jmethodID, va_list);
+-    jdouble     (*CallNonvirtualDoubleMethodA)(JNIEnv*, jobject, jclass,
++    jdouble     (ABI_ATTR *CallNonvirtualDoubleMethodA)(JNIEnv*, jobject, jclass,
+                         jmethodID, const jvalue*);
+-    void        (*CallNonvirtualVoidMethod)(JNIEnv*, jobject, jclass,
++    void        (ABI_ATTR *CallNonvirtualVoidMethod)(JNIEnv*, jobject, jclass,
+                         jmethodID, ...);
+-    void        (*CallNonvirtualVoidMethodV)(JNIEnv*, jobject, jclass,
++    void        (ABI_ATTR *CallNonvirtualVoidMethodV)(JNIEnv*, jobject, jclass,
+                         jmethodID, va_list);
+-    void        (*CallNonvirtualVoidMethodA)(JNIEnv*, jobject, jclass,
++    void        (ABI_ATTR *CallNonvirtualVoidMethodA)(JNIEnv*, jobject, jclass,
+                         jmethodID, const jvalue*);
+ 
+-    jfieldID    (*GetFieldID)(JNIEnv*, jclass, const char*, const char*);
+-
+-    jobject     (*GetObjectField)(JNIEnv*, jobject, jfieldID);
+-    jboolean    (*GetBooleanField)(JNIEnv*, jobject, jfieldID);
+-    jbyte       (*GetByteField)(JNIEnv*, jobject, jfieldID);
+-    jchar       (*GetCharField)(JNIEnv*, jobject, jfieldID);
+-    jshort      (*GetShortField)(JNIEnv*, jobject, jfieldID);
+-    jint        (*GetIntField)(JNIEnv*, jobject, jfieldID);
+-    jlong       (*GetLongField)(JNIEnv*, jobject, jfieldID);
+-    jfloat      (*GetFloatField)(JNIEnv*, jobject, jfieldID);
+-    jdouble     (*GetDoubleField)(JNIEnv*, jobject, jfieldID);
+-
+-    void        (*SetObjectField)(JNIEnv*, jobject, jfieldID, jobject);
+-    void        (*SetBooleanField)(JNIEnv*, jobject, jfieldID, jboolean);
+-    void        (*SetByteField)(JNIEnv*, jobject, jfieldID, jbyte);
+-    void        (*SetCharField)(JNIEnv*, jobject, jfieldID, jchar);
+-    void        (*SetShortField)(JNIEnv*, jobject, jfieldID, jshort);
+-    void        (*SetIntField)(JNIEnv*, jobject, jfieldID, jint);
+-    void        (*SetLongField)(JNIEnv*, jobject, jfieldID, jlong);
+-    void        (*SetFloatField)(JNIEnv*, jobject, jfieldID, jfloat);
+-    void        (*SetDoubleField)(JNIEnv*, jobject, jfieldID, jdouble);
+-
+-    jmethodID   (*GetStaticMethodID)(JNIEnv*, jclass, const char*, const char*);
+-
+-    jobject     (*CallStaticObjectMethod)(JNIEnv*, jclass, jmethodID, ...);
+-    jobject     (*CallStaticObjectMethodV)(JNIEnv*, jclass, jmethodID, va_list);
+-    jobject     (*CallStaticObjectMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
+-    jboolean    (*CallStaticBooleanMethod)(JNIEnv*, jclass, jmethodID, ...);
+-    jboolean    (*CallStaticBooleanMethodV)(JNIEnv*, jclass, jmethodID,
++    jfieldID    (ABI_ATTR *GetFieldID)(JNIEnv*, jclass, const char*, const char*);
++
++    jobject     (ABI_ATTR *GetObjectField)(JNIEnv*, jobject, jfieldID);
++    jboolean    (ABI_ATTR *GetBooleanField)(JNIEnv*, jobject, jfieldID);
++    jbyte       (ABI_ATTR *GetByteField)(JNIEnv*, jobject, jfieldID);
++    jchar       (ABI_ATTR *GetCharField)(JNIEnv*, jobject, jfieldID);
++    jshort      (ABI_ATTR *GetShortField)(JNIEnv*, jobject, jfieldID);
++    jint        (ABI_ATTR *GetIntField)(JNIEnv*, jobject, jfieldID);
++    jlong       (ABI_ATTR *GetLongField)(JNIEnv*, jobject, jfieldID);
++    jfloat      (ABI_ATTR *GetFloatField)(JNIEnv*, jobject, jfieldID);
++    jdouble     (ABI_ATTR *GetDoubleField)(JNIEnv*, jobject, jfieldID);
++
++    void        (ABI_ATTR *SetObjectField)(JNIEnv*, jobject, jfieldID, jobject);
++    void        (ABI_ATTR *SetBooleanField)(JNIEnv*, jobject, jfieldID, jboolean);
++    void        (ABI_ATTR *SetByteField)(JNIEnv*, jobject, jfieldID, jbyte);
++    void        (ABI_ATTR *SetCharField)(JNIEnv*, jobject, jfieldID, jchar);
++    void        (ABI_ATTR *SetShortField)(JNIEnv*, jobject, jfieldID, jshort);
++    void        (ABI_ATTR *SetIntField)(JNIEnv*, jobject, jfieldID, jint);
++    void        (ABI_ATTR *SetLongField)(JNIEnv*, jobject, jfieldID, jlong);
++    void        (ABI_ATTR *SetFloatField)(JNIEnv*, jobject, jfieldID, jfloat);
++    void        (ABI_ATTR *SetDoubleField)(JNIEnv*, jobject, jfieldID, jdouble);
++
++    jmethodID   (ABI_ATTR *GetStaticMethodID)(JNIEnv*, jclass, const char*, const char*);
++
++    jobject     (ABI_ATTR *CallStaticObjectMethod)(JNIEnv*, jclass, jmethodID, ...);
++    jobject     (ABI_ATTR *CallStaticObjectMethodV)(JNIEnv*, jclass, jmethodID, va_list);
++    jobject     (ABI_ATTR *CallStaticObjectMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
++    jboolean    (ABI_ATTR *CallStaticBooleanMethod)(JNIEnv*, jclass, jmethodID, ...);
++    jboolean    (ABI_ATTR *CallStaticBooleanMethodV)(JNIEnv*, jclass, jmethodID,
+                         va_list);
+-    jboolean    (*CallStaticBooleanMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
+-    jbyte       (*CallStaticByteMethod)(JNIEnv*, jclass, jmethodID, ...);
+-    jbyte       (*CallStaticByteMethodV)(JNIEnv*, jclass, jmethodID, va_list);
+-    jbyte       (*CallStaticByteMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
+-    jchar       (*CallStaticCharMethod)(JNIEnv*, jclass, jmethodID, ...);
+-    jchar       (*CallStaticCharMethodV)(JNIEnv*, jclass, jmethodID, va_list);
+-    jchar       (*CallStaticCharMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
+-    jshort      (*CallStaticShortMethod)(JNIEnv*, jclass, jmethodID, ...);
+-    jshort      (*CallStaticShortMethodV)(JNIEnv*, jclass, jmethodID, va_list);
+-    jshort      (*CallStaticShortMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
+-    jint        (*CallStaticIntMethod)(JNIEnv*, jclass, jmethodID, ...);
+-    jint        (*CallStaticIntMethodV)(JNIEnv*, jclass, jmethodID, va_list);
+-    jint        (*CallStaticIntMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
+-    jlong       (*CallStaticLongMethod)(JNIEnv*, jclass, jmethodID, ...);
+-    jlong       (*CallStaticLongMethodV)(JNIEnv*, jclass, jmethodID, va_list);
+-    jlong       (*CallStaticLongMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
+-    jfloat      (*CallStaticFloatMethod)(JNIEnv*, jclass, jmethodID, ...);
+-    jfloat      (*CallStaticFloatMethodV)(JNIEnv*, jclass, jmethodID, va_list);
+-    jfloat      (*CallStaticFloatMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
+-    jdouble     (*CallStaticDoubleMethod)(JNIEnv*, jclass, jmethodID, ...);
+-    jdouble     (*CallStaticDoubleMethodV)(JNIEnv*, jclass, jmethodID, va_list);
+-    jdouble     (*CallStaticDoubleMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
+-    void        (*CallStaticVoidMethod)(JNIEnv*, jclass, jmethodID, ...);
+-    void        (*CallStaticVoidMethodV)(JNIEnv*, jclass, jmethodID, va_list);
+-    void        (*CallStaticVoidMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
+-
+-    jfieldID    (*GetStaticFieldID)(JNIEnv*, jclass, const char*,
++    jboolean    (ABI_ATTR *CallStaticBooleanMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
++    jbyte       (ABI_ATTR *CallStaticByteMethod)(JNIEnv*, jclass, jmethodID, ...);
++    jbyte       (ABI_ATTR *CallStaticByteMethodV)(JNIEnv*, jclass, jmethodID, va_list);
++    jbyte       (ABI_ATTR *CallStaticByteMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
++    jchar       (ABI_ATTR *CallStaticCharMethod)(JNIEnv*, jclass, jmethodID, ...);
++    jchar       (ABI_ATTR *CallStaticCharMethodV)(JNIEnv*, jclass, jmethodID, va_list);
++    jchar       (ABI_ATTR *CallStaticCharMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
++    jshort      (ABI_ATTR *CallStaticShortMethod)(JNIEnv*, jclass, jmethodID, ...);
++    jshort      (ABI_ATTR *CallStaticShortMethodV)(JNIEnv*, jclass, jmethodID, va_list);
++    jshort      (ABI_ATTR *CallStaticShortMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
++    jint        (ABI_ATTR *CallStaticIntMethod)(JNIEnv*, jclass, jmethodID, ...);
++    jint        (ABI_ATTR *CallStaticIntMethodV)(JNIEnv*, jclass, jmethodID, va_list);
++    jint        (ABI_ATTR *CallStaticIntMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
++    jlong       (ABI_ATTR *CallStaticLongMethod)(JNIEnv*, jclass, jmethodID, ...);
++    jlong       (ABI_ATTR *CallStaticLongMethodV)(JNIEnv*, jclass, jmethodID, va_list);
++    jlong       (ABI_ATTR *CallStaticLongMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
++    jfloat      (ABI_ATTR *CallStaticFloatMethod)(JNIEnv*, jclass, jmethodID, ...);
++    jfloat      (ABI_ATTR *CallStaticFloatMethodV)(JNIEnv*, jclass, jmethodID, va_list);
++    jfloat      (ABI_ATTR *CallStaticFloatMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
++    jdouble     (ABI_ATTR *CallStaticDoubleMethod)(JNIEnv*, jclass, jmethodID, ...);
++    jdouble     (ABI_ATTR *CallStaticDoubleMethodV)(JNIEnv*, jclass, jmethodID, va_list);
++    jdouble     (ABI_ATTR *CallStaticDoubleMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
++    void        (ABI_ATTR *CallStaticVoidMethod)(JNIEnv*, jclass, jmethodID, ...);
++    void        (ABI_ATTR *CallStaticVoidMethodV)(JNIEnv*, jclass, jmethodID, va_list);
++    void        (ABI_ATTR *CallStaticVoidMethodA)(JNIEnv*, jclass, jmethodID, const jvalue*);
++
++    jfieldID    (ABI_ATTR *GetStaticFieldID)(JNIEnv*, jclass, const char*,
+                         const char*);
+ 
+-    jobject     (*GetStaticObjectField)(JNIEnv*, jclass, jfieldID);
+-    jboolean    (*GetStaticBooleanField)(JNIEnv*, jclass, jfieldID);
+-    jbyte       (*GetStaticByteField)(JNIEnv*, jclass, jfieldID);
+-    jchar       (*GetStaticCharField)(JNIEnv*, jclass, jfieldID);
+-    jshort      (*GetStaticShortField)(JNIEnv*, jclass, jfieldID);
+-    jint        (*GetStaticIntField)(JNIEnv*, jclass, jfieldID);
+-    jlong       (*GetStaticLongField)(JNIEnv*, jclass, jfieldID);
+-    jfloat      (*GetStaticFloatField)(JNIEnv*, jclass, jfieldID);
+-    jdouble     (*GetStaticDoubleField)(JNIEnv*, jclass, jfieldID);
+-
+-    void        (*SetStaticObjectField)(JNIEnv*, jclass, jfieldID, jobject);
+-    void        (*SetStaticBooleanField)(JNIEnv*, jclass, jfieldID, jboolean);
+-    void        (*SetStaticByteField)(JNIEnv*, jclass, jfieldID, jbyte);
+-    void        (*SetStaticCharField)(JNIEnv*, jclass, jfieldID, jchar);
+-    void        (*SetStaticShortField)(JNIEnv*, jclass, jfieldID, jshort);
+-    void        (*SetStaticIntField)(JNIEnv*, jclass, jfieldID, jint);
+-    void        (*SetStaticLongField)(JNIEnv*, jclass, jfieldID, jlong);
+-    void        (*SetStaticFloatField)(JNIEnv*, jclass, jfieldID, jfloat);
+-    void        (*SetStaticDoubleField)(JNIEnv*, jclass, jfieldID, jdouble);
+-
+-    jstring     (*NewString)(JNIEnv*, const jchar*, jsize);
+-    jsize       (*GetStringLength)(JNIEnv*, jstring);
+-    const jchar* (*GetStringChars)(JNIEnv*, jstring, jboolean*);
+-    void        (*ReleaseStringChars)(JNIEnv*, jstring, const jchar*);
+-    jstring     (*NewStringUTF)(JNIEnv*, const char*);
+-    jsize       (*GetStringUTFLength)(JNIEnv*, jstring);
++    jobject     (ABI_ATTR *GetStaticObjectField)(JNIEnv*, jclass, jfieldID);
++    jboolean    (ABI_ATTR *GetStaticBooleanField)(JNIEnv*, jclass, jfieldID);
++    jbyte       (ABI_ATTR *GetStaticByteField)(JNIEnv*, jclass, jfieldID);
++    jchar       (ABI_ATTR *GetStaticCharField)(JNIEnv*, jclass, jfieldID);
++    jshort      (ABI_ATTR *GetStaticShortField)(JNIEnv*, jclass, jfieldID);
++    jint        (ABI_ATTR *GetStaticIntField)(JNIEnv*, jclass, jfieldID);
++    jlong       (ABI_ATTR *GetStaticLongField)(JNIEnv*, jclass, jfieldID);
++    jfloat      (ABI_ATTR *GetStaticFloatField)(JNIEnv*, jclass, jfieldID);
++    jdouble     (ABI_ATTR *GetStaticDoubleField)(JNIEnv*, jclass, jfieldID);
++
++    void        (ABI_ATTR *SetStaticObjectField)(JNIEnv*, jclass, jfieldID, jobject);
++    void        (ABI_ATTR *SetStaticBooleanField)(JNIEnv*, jclass, jfieldID, jboolean);
++    void        (ABI_ATTR *SetStaticByteField)(JNIEnv*, jclass, jfieldID, jbyte);
++    void        (ABI_ATTR *SetStaticCharField)(JNIEnv*, jclass, jfieldID, jchar);
++    void        (ABI_ATTR *SetStaticShortField)(JNIEnv*, jclass, jfieldID, jshort);
++    void        (ABI_ATTR *SetStaticIntField)(JNIEnv*, jclass, jfieldID, jint);
++    void        (ABI_ATTR *SetStaticLongField)(JNIEnv*, jclass, jfieldID, jlong);
++    void        (ABI_ATTR *SetStaticFloatField)(JNIEnv*, jclass, jfieldID, jfloat);
++    void        (ABI_ATTR *SetStaticDoubleField)(JNIEnv*, jclass, jfieldID, jdouble);
++
++    jstring     (ABI_ATTR *NewString)(JNIEnv*, const jchar*, jsize);
++    jsize       (ABI_ATTR *GetStringLength)(JNIEnv*, jstring);
++    const jchar* (ABI_ATTR *GetStringChars)(JNIEnv*, jstring, jboolean*);
++    void        (ABI_ATTR *ReleaseStringChars)(JNIEnv*, jstring, const jchar*);
++    jstring     (ABI_ATTR *NewStringUTF)(JNIEnv*, const char*);
++    jsize       (ABI_ATTR *GetStringUTFLength)(JNIEnv*, jstring);
+     /* JNI spec says this returns const jbyte*, but that's inconsistent */
+-    const char* (*GetStringUTFChars)(JNIEnv*, jstring, jboolean*);
+-    void        (*ReleaseStringUTFChars)(JNIEnv*, jstring, const char*);
+-    jsize       (*GetArrayLength)(JNIEnv*, jarray);
+-    jobjectArray (*NewObjectArray)(JNIEnv*, jsize, jclass, jobject);
+-    jobject     (*GetObjectArrayElement)(JNIEnv*, jobjectArray, jsize);
+-    void        (*SetObjectArrayElement)(JNIEnv*, jobjectArray, jsize, jobject);
+-
+-    jbooleanArray (*NewBooleanArray)(JNIEnv*, jsize);
+-    jbyteArray    (*NewByteArray)(JNIEnv*, jsize);
+-    jcharArray    (*NewCharArray)(JNIEnv*, jsize);
+-    jshortArray   (*NewShortArray)(JNIEnv*, jsize);
+-    jintArray     (*NewIntArray)(JNIEnv*, jsize);
+-    jlongArray    (*NewLongArray)(JNIEnv*, jsize);
+-    jfloatArray   (*NewFloatArray)(JNIEnv*, jsize);
+-    jdoubleArray  (*NewDoubleArray)(JNIEnv*, jsize);
+-
+-    jboolean*   (*GetBooleanArrayElements)(JNIEnv*, jbooleanArray, jboolean*);
+-    jbyte*      (*GetByteArrayElements)(JNIEnv*, jbyteArray, jboolean*);
+-    jchar*      (*GetCharArrayElements)(JNIEnv*, jcharArray, jboolean*);
+-    jshort*     (*GetShortArrayElements)(JNIEnv*, jshortArray, jboolean*);
+-    jint*       (*GetIntArrayElements)(JNIEnv*, jintArray, jboolean*);
+-    jlong*      (*GetLongArrayElements)(JNIEnv*, jlongArray, jboolean*);
+-    jfloat*     (*GetFloatArrayElements)(JNIEnv*, jfloatArray, jboolean*);
+-    jdouble*    (*GetDoubleArrayElements)(JNIEnv*, jdoubleArray, jboolean*);
+-
+-    void        (*ReleaseBooleanArrayElements)(JNIEnv*, jbooleanArray,
++    const char* (ABI_ATTR *GetStringUTFChars)(JNIEnv*, jstring, jboolean*);
++    void        (ABI_ATTR *ReleaseStringUTFChars)(JNIEnv*, jstring, const char*);
++    jsize       (ABI_ATTR *GetArrayLength)(JNIEnv*, jarray);
++    jobjectArray (ABI_ATTR *NewObjectArray)(JNIEnv*, jsize, jclass, jobject);
++    jobject     (ABI_ATTR *GetObjectArrayElement)(JNIEnv*, jobjectArray, jsize);
++    void        (ABI_ATTR *SetObjectArrayElement)(JNIEnv*, jobjectArray, jsize, jobject);
++
++    jbooleanArray (ABI_ATTR *NewBooleanArray)(JNIEnv*, jsize);
++    jbyteArray    (ABI_ATTR *NewByteArray)(JNIEnv*, jsize);
++    jcharArray    (ABI_ATTR *NewCharArray)(JNIEnv*, jsize);
++    jshortArray   (ABI_ATTR *NewShortArray)(JNIEnv*, jsize);
++    jintArray     (ABI_ATTR *NewIntArray)(JNIEnv*, jsize);
++    jlongArray    (ABI_ATTR *NewLongArray)(JNIEnv*, jsize);
++    jfloatArray   (ABI_ATTR *NewFloatArray)(JNIEnv*, jsize);
++    jdoubleArray  (ABI_ATTR *NewDoubleArray)(JNIEnv*, jsize);
++
++    jboolean*   (ABI_ATTR *GetBooleanArrayElements)(JNIEnv*, jbooleanArray, jboolean*);
++    jbyte*      (ABI_ATTR *GetByteArrayElements)(JNIEnv*, jbyteArray, jboolean*);
++    jchar*      (ABI_ATTR *GetCharArrayElements)(JNIEnv*, jcharArray, jboolean*);
++    jshort*     (ABI_ATTR *GetShortArrayElements)(JNIEnv*, jshortArray, jboolean*);
++    jint*       (ABI_ATTR *GetIntArrayElements)(JNIEnv*, jintArray, jboolean*);
++    jlong*      (ABI_ATTR *GetLongArrayElements)(JNIEnv*, jlongArray, jboolean*);
++    jfloat*     (ABI_ATTR *GetFloatArrayElements)(JNIEnv*, jfloatArray, jboolean*);
++    jdouble*    (ABI_ATTR *GetDoubleArrayElements)(JNIEnv*, jdoubleArray, jboolean*);
++
++    void        (ABI_ATTR *ReleaseBooleanArrayElements)(JNIEnv*, jbooleanArray,
+                         jboolean*, jint);
+-    void        (*ReleaseByteArrayElements)(JNIEnv*, jbyteArray,
++    void        (ABI_ATTR *ReleaseByteArrayElements)(JNIEnv*, jbyteArray,
+                         jbyte*, jint);
+-    void        (*ReleaseCharArrayElements)(JNIEnv*, jcharArray,
++    void        (ABI_ATTR *ReleaseCharArrayElements)(JNIEnv*, jcharArray,
+                         jchar*, jint);
+-    void        (*ReleaseShortArrayElements)(JNIEnv*, jshortArray,
++    void        (ABI_ATTR *ReleaseShortArrayElements)(JNIEnv*, jshortArray,
+                         jshort*, jint);
+-    void        (*ReleaseIntArrayElements)(JNIEnv*, jintArray,
++    void        (ABI_ATTR *ReleaseIntArrayElements)(JNIEnv*, jintArray,
+                         jint*, jint);
+-    void        (*ReleaseLongArrayElements)(JNIEnv*, jlongArray,
++    void        (ABI_ATTR *ReleaseLongArrayElements)(JNIEnv*, jlongArray,
+                         jlong*, jint);
+-    void        (*ReleaseFloatArrayElements)(JNIEnv*, jfloatArray,
++    void        (ABI_ATTR *ReleaseFloatArrayElements)(JNIEnv*, jfloatArray,
+                         jfloat*, jint);
+-    void        (*ReleaseDoubleArrayElements)(JNIEnv*, jdoubleArray,
++    void        (ABI_ATTR *ReleaseDoubleArrayElements)(JNIEnv*, jdoubleArray,
+                         jdouble*, jint);
+ 
+-    void        (*GetBooleanArrayRegion)(JNIEnv*, jbooleanArray,
++    void        (ABI_ATTR *GetBooleanArrayRegion)(JNIEnv*, jbooleanArray,
+                         jsize, jsize, jboolean*);
+-    void        (*GetByteArrayRegion)(JNIEnv*, jbyteArray,
++    void        (ABI_ATTR *GetByteArrayRegion)(JNIEnv*, jbyteArray,
+                         jsize, jsize, jbyte*);
+-    void        (*GetCharArrayRegion)(JNIEnv*, jcharArray,
++    void        (ABI_ATTR *GetCharArrayRegion)(JNIEnv*, jcharArray,
+                         jsize, jsize, jchar*);
+-    void        (*GetShortArrayRegion)(JNIEnv*, jshortArray,
++    void        (ABI_ATTR *GetShortArrayRegion)(JNIEnv*, jshortArray,
+                         jsize, jsize, jshort*);
+-    void        (*GetIntArrayRegion)(JNIEnv*, jintArray,
++    void        (ABI_ATTR *GetIntArrayRegion)(JNIEnv*, jintArray,
+                         jsize, jsize, jint*);
+-    void        (*GetLongArrayRegion)(JNIEnv*, jlongArray,
++    void        (ABI_ATTR *GetLongArrayRegion)(JNIEnv*, jlongArray,
+                         jsize, jsize, jlong*);
+-    void        (*GetFloatArrayRegion)(JNIEnv*, jfloatArray,
++    void        (ABI_ATTR *GetFloatArrayRegion)(JNIEnv*, jfloatArray,
+                         jsize, jsize, jfloat*);
+-    void        (*GetDoubleArrayRegion)(JNIEnv*, jdoubleArray,
++    void        (ABI_ATTR *GetDoubleArrayRegion)(JNIEnv*, jdoubleArray,
+                         jsize, jsize, jdouble*);
+ 
+     /* spec shows these without const; some jni.h do, some don't */
+-    void        (*SetBooleanArrayRegion)(JNIEnv*, jbooleanArray,
++    void        (ABI_ATTR *SetBooleanArrayRegion)(JNIEnv*, jbooleanArray,
+                         jsize, jsize, const jboolean*);
+-    void        (*SetByteArrayRegion)(JNIEnv*, jbyteArray,
++    void        (ABI_ATTR *SetByteArrayRegion)(JNIEnv*, jbyteArray,
+                         jsize, jsize, const jbyte*);
+-    void        (*SetCharArrayRegion)(JNIEnv*, jcharArray,
++    void        (ABI_ATTR *SetCharArrayRegion)(JNIEnv*, jcharArray,
+                         jsize, jsize, const jchar*);
+-    void        (*SetShortArrayRegion)(JNIEnv*, jshortArray,
++    void        (ABI_ATTR *SetShortArrayRegion)(JNIEnv*, jshortArray,
+                         jsize, jsize, const jshort*);
+-    void        (*SetIntArrayRegion)(JNIEnv*, jintArray,
++    void        (ABI_ATTR *SetIntArrayRegion)(JNIEnv*, jintArray,
+                         jsize, jsize, const jint*);
+-    void        (*SetLongArrayRegion)(JNIEnv*, jlongArray,
++    void        (ABI_ATTR *SetLongArrayRegion)(JNIEnv*, jlongArray,
+                         jsize, jsize, const jlong*);
+-    void        (*SetFloatArrayRegion)(JNIEnv*, jfloatArray,
++    void        (ABI_ATTR *SetFloatArrayRegion)(JNIEnv*, jfloatArray,
+                         jsize, jsize, const jfloat*);
+-    void        (*SetDoubleArrayRegion)(JNIEnv*, jdoubleArray,
++    void        (ABI_ATTR *SetDoubleArrayRegion)(JNIEnv*, jdoubleArray,
+                         jsize, jsize, const jdouble*);
+ 
+-    jint        (*RegisterNatives)(JNIEnv*, jclass, const JNINativeMethod*,
++    jint        (ABI_ATTR *RegisterNatives)(JNIEnv*, jclass, const JNINativeMethod*,
+                         jint);
+-    jint        (*UnregisterNatives)(JNIEnv*, jclass);
+-    jint        (*MonitorEnter)(JNIEnv*, jobject);
+-    jint        (*MonitorExit)(JNIEnv*, jobject);
+-    jint        (*GetJavaVM)(JNIEnv*, JavaVM**);
++    jint        (ABI_ATTR *UnregisterNatives)(JNIEnv*, jclass);
++    jint        (ABI_ATTR *MonitorEnter)(JNIEnv*, jobject);
++    jint        (ABI_ATTR *MonitorExit)(JNIEnv*, jobject);
++    jint        (ABI_ATTR *GetJavaVM)(JNIEnv*, JavaVM**);
+ 
+-    void        (*GetStringRegion)(JNIEnv*, jstring, jsize, jsize, jchar*);
+-    void        (*GetStringUTFRegion)(JNIEnv*, jstring, jsize, jsize, char*);
++    void        (ABI_ATTR *GetStringRegion)(JNIEnv*, jstring, jsize, jsize, jchar*);
++    void        (ABI_ATTR *GetStringUTFRegion)(JNIEnv*, jstring, jsize, jsize, char*);
+ 
+-    void*       (*GetPrimitiveArrayCritical)(JNIEnv*, jarray, jboolean*);
+-    void        (*ReleasePrimitiveArrayCritical)(JNIEnv*, jarray, void*, jint);
++    void*       (ABI_ATTR *GetPrimitiveArrayCritical)(JNIEnv*, jarray, jboolean*);
++    void        (ABI_ATTR *ReleasePrimitiveArrayCritical)(JNIEnv*, jarray, void*, jint);
+ 
+-    const jchar* (*GetStringCritical)(JNIEnv*, jstring, jboolean*);
+-    void        (*ReleaseStringCritical)(JNIEnv*, jstring, const jchar*);
++    const jchar* (ABI_ATTR *GetStringCritical)(JNIEnv*, jstring, jboolean*);
++    void        (ABI_ATTR *ReleaseStringCritical)(JNIEnv*, jstring, const jchar*);
+ 
+-    jweak       (*NewWeakGlobalRef)(JNIEnv*, jobject);
+-    void        (*DeleteWeakGlobalRef)(JNIEnv*, jweak);
++    jweak       (ABI_ATTR *NewWeakGlobalRef)(JNIEnv*, jobject);
++    void        (ABI_ATTR *DeleteWeakGlobalRef)(JNIEnv*, jweak);
+ 
+-    jboolean    (*ExceptionCheck)(JNIEnv*);
++    jboolean    (ABI_ATTR *ExceptionCheck)(JNIEnv*);
+ 
+-    jobject     (*NewDirectByteBuffer)(JNIEnv*, void*, jlong);
+-    void*       (*GetDirectBufferAddress)(JNIEnv*, jobject);
+-    jlong       (*GetDirectBufferCapacity)(JNIEnv*, jobject);
++    jobject     (ABI_ATTR *NewDirectByteBuffer)(JNIEnv*, void*, jlong);
++    void*       (ABI_ATTR *GetDirectBufferAddress)(JNIEnv*, jobject);
++    jlong       (ABI_ATTR *GetDirectBufferCapacity)(JNIEnv*, jobject);
+ 
+     /* added in JNI 1.6 */
+-    jobjectRefType (*GetObjectRefType)(JNIEnv*, jobject);
++    jobjectRefType (ABI_ATTR *GetObjectRefType)(JNIEnv*, jobject);
+ };
+ 
+ /*
+@@ -1039,11 +1041,11 @@ struct JNIInvokeInterface {
+     void*       reserved1;
+     void*       reserved2;
+ 
+-    jint        (*DestroyJavaVM)(JavaVM*);
+-    jint        (*AttachCurrentThread)(JavaVM*, JNIEnv**, void*);
+-    jint        (*DetachCurrentThread)(JavaVM*);
+-    jint        (*GetEnv)(JavaVM*, void**, jint);
+-    jint        (*AttachCurrentThreadAsDaemon)(JavaVM*, JNIEnv**, void*);
++    jint        (ABI_ATTR *DestroyJavaVM)(JavaVM*);
++    jint        (ABI_ATTR *AttachCurrentThread)(JavaVM*, JNIEnv**, void*);
++    jint        (ABI_ATTR *DetachCurrentThread)(JavaVM*);
++    jint        (ABI_ATTR *GetEnv)(JavaVM*, void**, jint);
++    jint        (ABI_ATTR *AttachCurrentThreadAsDaemon)(JavaVM*, JNIEnv**, void*);
+ };
+ 
+ /*
+diff --git a/loader/platform.h b/loader/platform.h
+index 35d9bac..7aab472 100644
+--- a/loader/platform.h
++++ b/loader/platform.h
+@@ -2,6 +2,7 @@
+ #define __PLATFORM_H__
+ 
+ #include <stdint.h>
++#include "bionic32_types.h" // S30: guest 32-bit types (thunks/libc/bionic32.cpp)
+ 
+ // Elf attributes
+ #if defined(__x86_64) || defined(__aarch64__)
+diff --git a/loader/so_util.cpp b/loader/so_util.cpp
+index 3e63fde..449d229 100644
+--- a/loader/so_util.cpp
++++ b/loader/so_util.cpp
+@@ -47,6 +47,75 @@
+ #define PATCH_SZ 0x10000 //64 KB-ish arenas
+ static so_module *head = NULL;
+ 
++// S30: on a crash, where (guest module + offset, or host library)
++#include <signal.h>
++#include <ucontext.h>
++#include <dlfcn.h>
++static void s30_where(const char* what, uintptr_t addr) {
++  so_module *best = NULL;
++  Dl_info info;
++
++  for (so_module *m = head; m != NULL; m = m->next) {
++    if (m->base <= addr && (best == NULL || m->base > best->base))
++      best = m;
++  }
++  if (best != NULL && addr - best->base < 0x4000000) {
++    fprintf(stderr, "  %s %08x = %s+0x%x\n", what, (unsigned)addr, best->soname ? best->soname : "?",
++            (unsigned)(addr - best->base));
++  } else if (dladdr((void*)addr, &info) && info.dli_fname) {
++    fprintf(stderr, "  %s %08x = host %s+0x%x (%s)\n", what, (unsigned)addr, info.dli_fname,
++            (unsigned)(addr - (uintptr_t)info.dli_fbase), info.dli_sname ? info.dli_sname : "?");
++  } else {
++    fprintf(stderr, "  %s %08x\n", what, (unsigned)addr);
++  }
++}
++
++extern "C" void s30_report_address(const char* what, uintptr_t addr) {
++  s30_where(what, addr);
++}
++
++static void s30_crash(int sig, siginfo_t *si, void *ctx) {
++  ucontext_t *uc = (ucontext_t*)ctx;
++
++  fprintf(stderr, "\n*** signal %d, fault address %p\n", sig, si->si_addr);
++  s30_where("pc", uc->uc_mcontext.arm_pc);
++  s30_where("lr", uc->uc_mcontext.arm_lr);
++  fprintf(stderr, "  si_code %d (SI_TKILL -6), sender pid %d, our pid %d tid %d\n", si->si_code, (int)si->si_pid,
++          (int)getpid(), (int)gettid());
++  // Rough backtrace: stack words that point into a guest module or host code
++  {
++    uintptr_t *sp = (uintptr_t*)uc->uc_mcontext.arm_sp;
++    int shown = 0;
++    for (int i = 0; i < 2048 && shown < 24; i++) {
++      uintptr_t v = sp[i];
++      Dl_info info;
++      int guest = 0;
++      for (so_module *m = head; m != NULL; m = m->next)
++        if (v >= m->text_base && v < m->text_base + m->text_size) guest = 1;
++      if (guest || (v > 0x10000 && dladdr((void*)v, &info) && info.dli_sname)) {
++        char tag[24];
++        snprintf(tag, sizeof(tag), "sp+%03x", i * 4);
++        s30_where(tag, v);
++        shown++;
++      }
++    }
++  }
++  for (so_module *m = head; m != NULL; m = m->next)
++    fprintf(stderr, "  module %s at %08x\n", m->soname ? m->soname : "?", (unsigned)m->base);
++  signal(sig, SIG_DFL);
++  raise(sig);
++}
++
++extern "C" __attribute__((constructor)) void s30_install_crash_handler(void) {
++  struct sigaction sa = {};
++
++  sa.sa_sigaction = s30_crash;
++  sa.sa_flags = SA_SIGINFO;
++  sigaction(SIGSEGV, &sa, NULL);
++  sigaction(SIGBUS, &sa, NULL);
++  sigaction(SIGILL, &sa, NULL);
++}
++
+ // rela_functor functions should return 1 to stop, or 0 to continue executing,
+ // and will receive the module and relocation data from the relocation iterator
+ using rela_functor = std::function<int(so_module *mod, const Elf_Rela *rel)>;
+@@ -693,11 +762,11 @@ void rehook_new(so_module *mod, ReentrantHook *hook, uintptr_t addr, uintptr_t d
+ void rehook_hook(ReentrantHook *hook)
+ {
+   memcpy((void *)hook->addr, (void *)hook->trampoline, sizeof(hook->trampoline));
+-  __builtin___clear_cache((void *)hook->addr, (void *)hook->addr+sizeof(hook->trampoline));
++  __builtin___clear_cache((void *)hook->addr, (char *)hook->addr+sizeof(hook->trampoline));
+ }
+ 
+ void rehook_unhook(ReentrantHook *hook)
+ {
+   memcpy((void *)hook->addr, (void *)hook->prologue, sizeof(hook->prologue));
+-  __builtin___clear_cache((void *)hook->addr, (void *)hook->addr+sizeof(hook->prologue));
++  __builtin___clear_cache((void *)hook->addr, (char *)hook->addr+sizeof(hook->prologue));
+ }
+\ No newline at end of file
+diff --git a/loader/so_util_arm32.cpp b/loader/so_util_arm32.cpp
+index 13ea965..7168531 100644
+--- a/loader/so_util_arm32.cpp
++++ b/loader/so_util_arm32.cpp
+@@ -19,7 +19,7 @@ static void trampoline_ldm(so_module *mod, uint32_t *dst)
+   int baseReg = ((*dst) >> 16) & 0xF;
+   int bitMask =  (*dst)        & 0xFFFF;
+ 
+-  uint32_t stored = NULL;
++  uint32_t stored = 0;
+   for (int i = 0; i < 16; i++) {
+     if (bitMask & (1 << i)) {
+       // If the register we're reading the offset from is the same as the one we're writing,
+diff --git a/s30/bionic32_types.h b/s30/bionic32_types.h
+new file mode 100644
+index 0000000..bb4e274
+--- /dev/null
++++ b/s30/bionic32_types.h
+@@ -0,0 +1,17 @@
++/* S30 (musl): Android armv7's 32-bit time_t / off_t, for the converting
++   wrappers in thunks/libc/bionic32.cpp (their declarations are generated
++   into impl_header.h) */
++#pragma once
++#include <stdint.h>
++typedef int32_t b_time_t;
++typedef int32_t b_off_t;
++struct b_timespec;
++struct b_timeval;
++struct b_rlimit;
++struct b_stat;
++struct b_sigaction;
++#include <stddef.h>
++/* bionic struct mallinfo: ten size_t (returned by value) */
++struct b_mallinfo {
++    size_t arena, ordblks, smblks, hblks, hblkhd, usmblks, fsmblks, uordblks, fordblks, keepcost;
++};
+diff --git a/s30/musl_compat.h b/s30/musl_compat.h
+new file mode 100644
+index 0000000..c9253a4
+--- /dev/null
++++ b/s30/musl_compat.h
+@@ -0,0 +1,72 @@
++/* S30 (Alpine, musl): the glibc extensions gmloader-next uses */
++#pragma once
++#ifndef IS_TAB_GEN /* not in the bare prototype list (thunks/libc/c_prototypes.h) */
++#ifndef _LARGEFILE64_SOURCE
++#define _LARGEFILE64_SOURCE 1 /* fopen64, pread64, off64_t ... */
++#endif
++#include <dirent.h>
++#include <fcntl.h>
++#include <libgen.h> /* basename (glibc: string.h) */
++#include <stdlib.h>
++#include <string.h>
++#include <sys/select.h>
++#include <unistd.h>
++
++typedef int (*__compar_fn_t)(const void*, const void*);
++#ifndef __FD_ISSET
++#define __FD_ISSET(fd, set) FD_ISSET(fd, set)
++#define __FD_SET(fd, set) FD_SET(fd, set)
++#define __FD_CLR(fd, set) FD_CLR(fd, set)
++#endif
++
++/* scandirat: scandir relative to a directory fd (not in musl) */
++static inline int scandirat(int dirfd, const char* path, struct dirent*** list,
++                            int (*sel)(const struct dirent*),
++                            int (*cmp)(const struct dirent**, const struct dirent**)) {
++	int fd = openat(dirfd, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++	DIR* d;
++	struct dirent *e, **v = NULL;
++	size_t n = 0, cap = 0;
++
++	if (fd < 0) {
++		return -1;
++	}
++	d = fdopendir(fd);
++	if (d == NULL) {
++		close(fd);
++		return -1;
++	}
++	while ((e = readdir(d)) != NULL) {
++		if (sel != NULL && !sel(e)) {
++			continue;
++		}
++		if (n == cap) {
++			struct dirent** t;
++			cap = cap ? cap * 2 : 16;
++			t = (struct dirent**)realloc(v, cap * sizeof(*v));
++			if (t == NULL) {
++				goto fail;
++			}
++			v = t;
++		}
++		v[n] = (struct dirent*)malloc(sizeof(*e));
++		if (v[n] == NULL) {
++			goto fail;
++		}
++		memcpy(v[n++], e, sizeof(*e));
++	}
++	closedir(d);
++	if (cmp != NULL) {
++		qsort(v, n, sizeof(*v), (__compar_fn_t)cmp);
++	}
++	*list = v;
++	return (int)n;
++fail:
++	while (n > 0) {
++		free(v[--n]);
++	}
++	free(v);
++	closedir(d);
++	return -1;
++}
++#endif
+diff --git a/s30/musl_extra.cpp b/s30/musl_extra.cpp
+new file mode 100644
+index 0000000..155bd1f
+--- /dev/null
++++ b/s30/musl_extra.cpp
+@@ -0,0 +1,74 @@
++// S30 (Alpine, musl): glibc functions the bionic export table refers to that
++// musl doesn't have. The locale variants use the C locale (all musl has).
++#include <errno.h>
++#include <stdint.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <wchar.h>
++#include <locale.h>
++
++extern "C" {
++
++long strtol_l(const char* s, char** e, int b, locale_t) { return strtol(s, e, b); }
++unsigned long strtoul_l(const char* s, char** e, int b, locale_t) { return strtoul(s, e, b); }
++long long strtoll_l(const char* s, char** e, int b, locale_t) { return strtoll(s, e, b); }
++unsigned long long strtoull_l(const char* s, char** e, int b, locale_t) { return strtoull(s, e, b); }
++long wcstol_l(const wchar_t* s, wchar_t** e, int b, locale_t) { return wcstol(s, e, b); }
++unsigned long wcstoul_l(const wchar_t* s, wchar_t** e, int b, locale_t) { return wcstoul(s, e, b); }
++long long wcstoll_l(const wchar_t* s, wchar_t** e, int b, locale_t) { return wcstoll(s, e, b); }
++unsigned long long wcstoull_l(const wchar_t* s, wchar_t** e, int b, locale_t) { return wcstoull(s, e, b); }
++float wcstof_l(const wchar_t* s, wchar_t** e, locale_t) { return wcstof(s, e); }
++double wcstod_l(const wchar_t* s, wchar_t** e, locale_t) { return wcstod(s, e); }
++long double wcstold_l(const wchar_t* s, wchar_t** e, locale_t) { return wcstold(s, e); }
++
++wchar_t* wmempcpy(wchar_t* d, const wchar_t* s, size_t n) { return wmemcpy(d, s, n) + n; }
++
++int getpt(void) { return posix_openpt(O_RDWR | O_NOCTTY); }
++
++// malloc tuning and reports: not available, harmless to refuse
++int mallopt(int, int) { return 0; }
++int malloc_info(int, FILE*) { errno = ENOSYS; return -1; }
++
++int __register_atfork(void (*prepare)(void), void (*parent)(void), void (*child)(void), void*) {
++	return pthread_atfork(prepare, parent, child);
++}
++
++// thread_local destructors: run at thread exit, last registered first
++struct ThreadDtor {
++	void (*fn)(void*);
++	void* obj;
++	ThreadDtor* next;
++};
++static pthread_key_t sDtorKey;
++static pthread_once_t sDtorOnce = PTHREAD_ONCE_INIT;
++
++static void run_dtors(void* p) {
++	for (ThreadDtor* d = (ThreadDtor*)p; d != nullptr;) {
++		ThreadDtor* next = d->next;
++		d->fn(d->obj);
++		free(d);
++		d = next;
++	}
++}
++
++static void make_key(void) { pthread_key_create(&sDtorKey, run_dtors); }
++
++int __cxa_thread_atexit_impl(void (*fn)(void*), void* obj, void*) {
++	ThreadDtor* d = (ThreadDtor*)malloc(sizeof(*d));
++
++	if (d == nullptr) {
++		return -1;
++	}
++	pthread_once(&sDtorOnce, make_key);
++	d->fn = fn;
++	d->obj = obj;
++	d->next = (ThreadDtor*)pthread_getspecific(sDtorKey);
++	pthread_setspecific(sDtorKey, d);
++	return 0;
++}
++
++
++
++}
+diff --git a/s30/zipconf.h b/s30/zipconf.h
+new file mode 100644
+index 0000000..e42c459
+--- /dev/null
++++ b/s30/zipconf.h
+@@ -0,0 +1,48 @@
++#ifndef _HAD_ZIPCONF_H
++#define _HAD_ZIPCONF_H
++
++/*
++   zipconf.h -- platform specific include file
++
++   This file was generated automatically by CMake
++   based on ../cmake-zipconf.h.in.
++ */
++
++#define LIBZIP_VERSION "1.11.3"
++#define LIBZIP_VERSION_MAJOR 1
++#define LIBZIP_VERSION_MINOR 11
++#define LIBZIP_VERSION_MICRO 3
++
++/* #undef ZIP_STATIC */
++
++#if !defined(__STDC_FORMAT_MACROS)
++#define __STDC_FORMAT_MACROS 1
++#endif
++#include <inttypes.h>
++
++typedef int8_t zip_int8_t;
++typedef uint8_t zip_uint8_t;
++typedef int16_t zip_int16_t;
++typedef uint16_t zip_uint16_t;
++typedef int32_t zip_int32_t;
++typedef uint32_t zip_uint32_t;
++typedef int64_t zip_int64_t;
++typedef uint64_t zip_uint64_t;
++
++#define ZIP_INT8_MIN     (-ZIP_INT8_MAX-1)
++#define ZIP_INT8_MAX     0x7f
++#define ZIP_UINT8_MAX    0xff
++
++#define ZIP_INT16_MIN    (-ZIP_INT16_MAX-1)
++#define ZIP_INT16_MAX    0x7fff
++#define ZIP_UINT16_MAX   0xffff
++
++#define ZIP_INT32_MIN    (-ZIP_INT32_MAX-1L)
++#define ZIP_INT32_MAX    0x7fffffffL
++#define ZIP_UINT32_MAX   0xffffffffLU
++
++#define ZIP_INT64_MIN    (-ZIP_INT64_MAX-1LL)
++#define ZIP_INT64_MAX    0x7fffffffffffffffLL
++#define ZIP_UINT64_MAX   0xffffffffffffffffULL
++
++#endif /* zipconf.h */
+\ No newline at end of file
+diff --git a/scripts/generate_libc.py b/scripts/generate_libc.py
+index 063c36c..da5ebd7 100644
+--- a/scripts/generate_libc.py
++++ b/scripts/generate_libc.py
+@@ -48,6 +48,7 @@ avail = []
+ variadic = []
+ 
+ ambiguous = []
++signatures = {}
+ c_protos = []
+ 
+ class ExceptionSpecificationKind(clang.cindex.BaseEnumeration):
+@@ -100,8 +101,15 @@ def except_type(node):
+     return ""
+ 
+ # Traverse the AST (Abstract Syntax Tree) to extract function signatures
++def node_kind(node):
++    # S30: newer libstdc++ headers have cursor kinds older bindings don't know
++    try:
++        return node.kind
++    except ValueError:
++        return None
++
+ def extract_function_signatures(node):
+-    if node.kind == clang.cindex.CursorKind.FUNCTION_DECL:
++    if node_kind(node) == clang.cindex.CursorKind.FUNCTION_DECL:
+         # Get the function name
+         function_name = node.spelling
+         if function_name in ambiguous:
+@@ -111,7 +119,7 @@ def extract_function_signatures(node):
+         return_type = node.result_type.spelling
+ 
+         # Get and print function arguments
+-        arguments = [p for p in node.get_children() if p.kind == clang.cindex.CursorKind.PARM_DECL]
++        arguments = [p for p in node.get_children() if node_kind(p) == clang.cindex.CursorKind.PARM_DECL]
+         argument_list = ', '.join(["{}".format(arg.type.spelling) for arg in arguments])
+ 
+         var="// " if is_variadic(node) else ""
+@@ -122,6 +130,13 @@ def extract_function_signatures(node):
+         if node.type.get_num_template_arguments() > 0:
+             ambiguous.append(function_name)
+ 
++        # S30: a header may declare a function twice (musl: wchar.h and
++        # wctype.h); only a different type makes it ambiguous
++        sig = node.type.spelling
++        if function_name in avail and signatures.get(function_name) == sig:
++            return
++        signatures[function_name] = sig
++
+         if function_name in avail:
+             avail.remove(function_name)
+             ambiguous.append(function_name)
+@@ -154,7 +169,7 @@ def extract_impl_functions(node):
+         function_name = node.spelling
+ 
+         # Get and print function arguments
+-        arguments = [p for p in node.get_children() if p.kind == clang.cindex.CursorKind.PARM_DECL]
++        arguments = [p for p in node.get_children() if node_kind(p) == clang.cindex.CursorKind.PARM_DECL]
+         argument_list = ', '.join(["{}".format(arg.type.spelling) for arg in arguments])
+ 
+         linkage = 'extern "C"' if function_name == node.mangled_name else "extern"
+@@ -182,7 +197,7 @@ def extract_c_impl_functions(node):
+         function_name = node.spelling
+ 
+         # Get and print function arguments
+-        arguments = [p for p in node.get_children() if p.kind == clang.cindex.CursorKind.PARM_DECL]
++        arguments = [p for p in node.get_children() if node_kind(p) == clang.cindex.CursorKind.PARM_DECL]
+         argument_list = ', '.join(["{}".format(arg.type.spelling) for arg in arguments])
+ 
+         # Print the complete function signature
+@@ -209,6 +224,9 @@ if __name__ == '__main__':
+ 
+     arch=args.arch
+     target_platform="--target={arch}".format(arch=arch)
++    # S30: parse the target's own libc headers (musl, from a sysroot)
++    import os, shlex
++    includes.extend(shlex.split(os.environ.get("GML_CLANG_EXTRA", "")))
+     build_path="build/{arch}/".format(arch=arch)
+ 
+     print("{call}: settings:".format(call=sys.argv[0]))
+diff --git a/thunks/libc/bionic32.cpp b/thunks/libc/bionic32.cpp
+new file mode 100644
+index 0000000..63792c9
+--- /dev/null
++++ b/thunks/libc/bionic32.cpp
+@@ -0,0 +1,666 @@
++// S30 (Alpine, musl): Android armv7's 32-bit time_t, off_t and rlim_t
++// against musl armv7's 64-bit ones. A direct thunk would hand the guest's
++// structs and arguments to musl in the wrong layout, so these convert. Also
++// the bionic-only and variadic functions the GameMaker runner imports.
++#include "musl_compat.h"
++#include <errno.h>
++#include <semaphore.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <setjmp.h>
++#include <signal.h>
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/file.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/resource.h>
++#include <sys/select.h>
++#include <sys/stat.h>
++#include <sys/time.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "platform.h"
++#include "bionic32_types.h"
++#include "bionic_file.h"
++
++/* The guest's FILE* is a bridge around musl's (thunks/libc/stdio.cpp) */
++static FILE* host_file(FILE* g) {
++    return g != NULL ? (FILE*)((BIONIC_FILE*)g)->_cookie : NULL;
++}
++
++struct b_timespec {
++    int32_t tv_sec;
++    int32_t tv_nsec;
++};
++
++struct b_timeval {
++    int32_t tv_sec;
++    int32_t tv_usec;
++};
++
++struct b_rlimit {
++    uint32_t rlim_cur;
++    uint32_t rlim_max;
++};
++
++// bionic arm struct stat (__STAT64_BODY)
++struct b_stat {
++    unsigned long long st_dev;
++    unsigned char __pad0[4];
++    uint32_t __st_ino;
++    uint32_t st_mode;
++    uint32_t st_nlink;
++    uint32_t st_uid;
++    uint32_t st_gid;
++    unsigned long long st_rdev;
++    unsigned char __pad3[4];
++    long long st_size;
++    uint32_t st_blksize;
++    unsigned long long st_blocks;
++    struct b_timespec st_atim;
++    struct b_timespec st_mtim;
++    struct b_timespec st_ctim;
++    unsigned long long st_ino;
++};
++static_assert(sizeof(struct b_stat) == 104, "bionic arm struct stat is 104 bytes");
++
++static struct timespec ts_in(const struct b_timespec* b) {
++    struct timespec t = { b->tv_sec, b->tv_nsec };
++    return t;
++}
++
++static void ts_out(struct b_timespec* b, const struct timespec* t) {
++    b->tv_sec = (int32_t)t->tv_sec;
++    b->tv_nsec = (int32_t)t->tv_nsec;
++}
++
++static void stat_out(struct b_stat* b, const struct stat* s) {
++    memset(b, 0, sizeof(*b));
++    b->st_dev = s->st_dev;
++    b->__st_ino = (uint32_t)s->st_ino;
++    b->st_mode = s->st_mode;
++    b->st_nlink = s->st_nlink;
++    b->st_uid = s->st_uid;
++    b->st_gid = s->st_gid;
++    b->st_rdev = s->st_rdev;
++    b->st_size = s->st_size;
++    b->st_blksize = s->st_blksize;
++    b->st_blocks = s->st_blocks;
++    ts_out(&b->st_atim, &s->st_atim);
++    ts_out(&b->st_mtim, &s->st_mtim);
++    ts_out(&b->st_ctim, &s->st_ctim);
++    b->st_ino = s->st_ino;
++}
++
++extern "C" {
++
++/* ---- time ---- */
++
++ABI_ATTR b_time_t time_impl(b_time_t* out) {
++    b_time_t t = (b_time_t)time(NULL);
++
++    if (out != NULL) {
++        *out = t;
++    }
++    return t;
++}
++
++ABI_ATTR int clock_gettime_impl(clockid_t clk, struct b_timespec* out) {
++    struct timespec t;
++    int r = clock_gettime(clk, &t);
++
++    if (r == 0 && out != NULL) {
++        ts_out(out, &t);
++    }
++    return r;
++}
++
++ABI_ATTR int clock_getres_impl(clockid_t clk, struct b_timespec* out) {
++    struct timespec t;
++    int r = clock_getres(clk, &t);
++
++    if (r == 0 && out != NULL) {
++        ts_out(out, &t);
++    }
++    return r;
++}
++
++ABI_ATTR int nanosleep_impl(const struct b_timespec* req, struct b_timespec* rem) {
++    struct timespec r = ts_in(req), left;
++    int ret = nanosleep(&r, &left);
++
++    if (ret != 0 && rem != NULL) {
++        ts_out(rem, &left);
++    }
++    return ret;
++}
++
++ABI_ATTR int clock_nanosleep_impl(clockid_t clk, int flags, const struct b_timespec* req, struct b_timespec* rem) {
++    struct timespec r = ts_in(req), left;
++    int ret = clock_nanosleep(clk, flags, &r, &left);
++
++    if (ret == EINTR && rem != NULL) {
++        ts_out(rem, &left);
++    }
++    return ret;
++}
++
++ABI_ATTR int gettimeofday_impl(struct b_timeval* out, void* tz) {
++    struct timeval t;
++    int r = gettimeofday(&t, NULL);
++
++    (void)tz;
++    if (r == 0 && out != NULL) {
++        out->tv_sec = (int32_t)t.tv_sec;
++        out->tv_usec = (int32_t)t.tv_usec;
++    }
++    return r;
++}
++
++ABI_ATTR int select_impl(int n, fd_set* rd, fd_set* wr, fd_set* ex, struct b_timeval* tv) {
++    struct timeval t, *tp = NULL;
++    int r;
++
++    if (tv != NULL) {
++        t.tv_sec = tv->tv_sec;
++        t.tv_usec = tv->tv_usec;
++        tp = &t;
++    }
++    r = select(n, rd, wr, ex, tp);
++    if (tv != NULL) {
++        tv->tv_sec = (int32_t)t.tv_sec;
++        tv->tv_usec = (int32_t)t.tv_usec;
++    }
++    return r;
++}
++
++ABI_ATTR int ppoll_impl(struct pollfd* fds, nfds_t n, const struct b_timespec* ts, const sigset_t* mask) {
++    struct timespec t;
++
++    if (ts != NULL) {
++        t = ts_in(ts);
++    }
++    return ppoll(fds, n, ts != NULL ? &t : NULL, mask);
++}
++
++ABI_ATTR struct tm* localtime_impl(const b_time_t* t) {
++    time_t h = *t;
++    return localtime(&h);
++}
++
++ABI_ATTR struct tm* localtime_r_impl(const b_time_t* t, struct tm* out) {
++    time_t h = *t;
++    return localtime_r(&h, out);
++}
++
++ABI_ATTR struct tm* gmtime_impl(const b_time_t* t) {
++    time_t h = *t;
++    return gmtime(&h);
++}
++
++ABI_ATTR struct tm* gmtime_r_impl(const b_time_t* t, struct tm* out) {
++    time_t h = *t;
++    return gmtime_r(&h, out);
++}
++
++ABI_ATTR b_time_t mktime_impl(struct tm* tm) {
++    return (b_time_t)mktime(tm);
++}
++
++ABI_ATTR b_time_t timegm_impl(struct tm* tm) {
++    return (b_time_t)timegm(tm);
++}
++
++ABI_ATTR char* ctime_impl(const b_time_t* t) {
++    time_t h = *t;
++    return ctime(&h);
++}
++
++ABI_ATTR char* ctime_r_impl(const b_time_t* t, char* buf) {
++    time_t h = *t;
++    return ctime_r(&h, buf);
++}
++
++ABI_ATTR double difftime_impl(b_time_t a, b_time_t b) {
++    return (double)a - (double)b;
++}
++
++ABI_ATTR int utimensat_impl(int dir, const char* path, const struct b_timespec* ts, int flags) {
++    struct timespec t[2];
++
++    if (ts == NULL) {
++        return utimensat(dir, path, NULL, flags);
++    }
++    t[0] = ts_in(&ts[0]);
++    t[1] = ts_in(&ts[1]);
++    return utimensat(dir, path, t, flags);
++}
++
++ABI_ATTR int futimens_impl(int fd, const struct b_timespec* ts) {
++    struct timespec t[2];
++
++    if (ts == NULL) {
++        return futimens(fd, NULL);
++    }
++    t[0] = ts_in(&ts[0]);
++    t[1] = ts_in(&ts[1]);
++    return futimens(fd, t);
++}
++
++ABI_ATTR int sem_timedwait_impl(sem_t* s, const struct b_timespec* ts) {
++    struct timespec t = ts_in(ts);
++    return sem_timedwait(s, &t);
++}
++
++/* ---- stat ---- */
++
++ABI_ATTR int stat_impl(const char* path, struct b_stat* out) {
++    struct stat s;
++    int r = stat(path, &s);
++
++    if (r == 0) {
++        stat_out(out, &s);
++    }
++    return r;
++}
++
++ABI_ATTR int lstat_impl(const char* path, struct b_stat* out) {
++    struct stat s;
++    int r = lstat(path, &s);
++
++    if (r == 0) {
++        stat_out(out, &s);
++    }
++    return r;
++}
++
++ABI_ATTR int fstat_impl(int fd, struct b_stat* out) {
++    struct stat s;
++    int r = fstat(fd, &s);
++
++    if (r == 0) {
++        stat_out(out, &s);
++    }
++    return r;
++}
++
++ABI_ATTR int fstatat_impl(int dir, const char* path, struct b_stat* out, int flags) {
++    struct stat s;
++    int r = fstatat(dir, path, &s, flags);
++
++    if (r == 0) {
++        stat_out(out, &s);
++    }
++    return r;
++}
++
++/* bionic's stat64 family has the same layout (off64_t, struct stat64) */
++ABI_ATTR int stat64_impl(const char* path, struct b_stat* out) { return stat_impl(path, out); }
++ABI_ATTR int lstat64_impl(const char* path, struct b_stat* out) { return lstat_impl(path, out); }
++ABI_ATTR int fstat64_impl(int fd, struct b_stat* out) { return fstat_impl(fd, out); }
++ABI_ATTR int fstatat64_impl(int dir, const char* path, struct b_stat* out, int flags) {
++    return fstatat_impl(dir, path, out, flags);
++}
++
++/* ---- 32-bit file offsets ---- */
++
++ABI_ATTR b_off_t lseek_impl(int fd, b_off_t off, int whence) {
++    off_t r = lseek(fd, off, whence);
++
++    if (r > INT32_MAX) {
++        errno = EOVERFLOW;
++        return -1;
++    }
++    return (b_off_t)r;
++}
++
++ABI_ATTR ssize_t pread_impl(int fd, void* buf, size_t n, b_off_t off) {
++    return pread(fd, buf, n, off);
++}
++
++ABI_ATTR ssize_t pwrite_impl(int fd, const void* buf, size_t n, b_off_t off) {
++    return pwrite(fd, buf, n, off);
++}
++
++ABI_ATTR int ftruncate_impl(int fd, b_off_t len) {
++    return ftruncate(fd, len);
++}
++
++ABI_ATTR int truncate_impl(const char* path, b_off_t len) {
++    return truncate(path, len);
++}
++
++ABI_ATTR void* mmap_impl(void* addr, size_t len, int prot, int flags, int fd, b_off_t off) {
++    return mmap(addr, len, prot, flags, fd, (off_t)(uint32_t)off);
++}
++
++ABI_ATTR int fseeko_impl(FILE* f, b_off_t off, int whence) {
++    return fseeko(host_file(f), off, whence);
++}
++
++ABI_ATTR b_off_t ftello_impl(FILE* f) {
++    off_t r = ftello(host_file(f));
++
++    if (r > INT32_MAX) {
++        errno = EOVERFLOW;
++        return -1;
++    }
++    return (b_off_t)r;
++}
++
++/* bionic's fpos_t is an off_t */
++ABI_ATTR int fgetpos_impl(FILE* f, b_off_t* pos) {
++    b_off_t r = ftello_impl(f);
++
++    if (r < 0) {
++        return -1;
++    }
++    *pos = r;
++    return 0;
++}
++
++ABI_ATTR int fsetpos_impl(FILE* f, const b_off_t* pos) {
++    return fseeko(host_file(f), *pos, SEEK_SET);
++}
++
++ABI_ATTR int posix_fadvise_impl(int fd, b_off_t off, b_off_t len, int advice) {
++    return posix_fadvise(fd, off, len, advice);
++}
++
++ABI_ATTR int posix_fallocate_impl(int fd, b_off_t off, b_off_t len) {
++    return posix_fallocate(fd, off, len);
++}
++
++/* ---- rlimits (bionic RLIM_INFINITY: ~0UL) ---- */
++
++ABI_ATTR int getrlimit_impl(int res, struct b_rlimit* out) {
++    struct rlimit r;
++    int ret = getrlimit(res, &r);
++
++    if (ret == 0) {
++        out->rlim_cur = r.rlim_cur == RLIM_INFINITY || r.rlim_cur > UINT32_MAX ? UINT32_MAX : (uint32_t)r.rlim_cur;
++        out->rlim_max = r.rlim_max == RLIM_INFINITY || r.rlim_max > UINT32_MAX ? UINT32_MAX : (uint32_t)r.rlim_max;
++    }
++    return ret;
++}
++
++ABI_ATTR int setrlimit_impl(int res, const struct b_rlimit* in) {
++    struct rlimit r;
++
++    r.rlim_cur = in->rlim_cur == UINT32_MAX ? RLIM_INFINITY : in->rlim_cur;
++    r.rlim_max = in->rlim_max == UINT32_MAX ? RLIM_INFINITY : in->rlim_max;
++    return setrlimit(res, &r);
++}
++
++/* ---- variadic ones ---- */
++
++ABI_ATTR int open_impl(const char* path, int flags, ...) {
++    mode_t mode = 0;
++
++    if (flags & (O_CREAT | O_TMPFILE)) {
++        va_list ap;
++        va_start(ap, flags);
++        mode = (mode_t)va_arg(ap, int);
++        va_end(ap);
++    }
++    return open(path, flags, mode);
++}
++
++ABI_ATTR int openat_impl(int dir, const char* path, int flags, ...) {
++    mode_t mode = 0;
++
++    if (flags & (O_CREAT | O_TMPFILE)) {
++        va_list ap;
++        va_start(ap, flags);
++        mode = (mode_t)va_arg(ap, int);
++        va_end(ap);
++    }
++    return openat(dir, path, flags, mode);
++}
++
++ABI_ATTR int fcntl_impl(int fd, int cmd, ...) {
++    va_list ap;
++    void* arg;
++
++    va_start(ap, cmd);
++    arg = va_arg(ap, void*);
++    va_end(ap);
++    return fcntl(fd, cmd, arg);
++}
++
++ABI_ATTR int ioctl_impl(int fd, int request, ...) {
++    va_list ap;
++    void* arg;
++
++    va_start(ap, request);
++    arg = va_arg(ap, void*);
++    va_end(ap);
++    return ioctl(fd, request, arg);
++}
++
++
++/* ---- signals: bionic LP32 sigset_t is 32 bits (signals 1-32) ---- */
++
++struct b_sigaction {
++    void* handler; // sa_handler / sa_sigaction
++    uint32_t sa_mask;
++    uint32_t sa_flags;
++    void* sa_restorer;
++};
++
++static void set_in(sigset_t* h, uint32_t b) {
++    sigemptyset(h);
++    for (int i = 1; i <= 32; i++) {
++        if (b & (1u << (i - 1))) {
++            sigaddset(h, i);
++        }
++    }
++}
++
++static uint32_t set_out(const sigset_t* h) {
++    uint32_t b = 0;
++
++    for (int i = 1; i <= 32; i++) {
++        if (sigismember(h, i) == 1) {
++            b |= 1u << (i - 1);
++        }
++    }
++    return b;
++}
++
++ABI_ATTR int sigemptyset_impl(uint32_t* s) { *s = 0; return 0; }
++ABI_ATTR int sigfillset_impl(uint32_t* s) { *s = ~0u; return 0; }
++
++ABI_ATTR int sigaddset_impl(uint32_t* s, int n) {
++    if (n < 1 || n > 32) {
++        errno = EINVAL;
++        return -1;
++    }
++    *s |= 1u << (n - 1);
++    return 0;
++}
++
++ABI_ATTR int sigdelset_impl(uint32_t* s, int n) {
++    if (n < 1 || n > 32) {
++        errno = EINVAL;
++        return -1;
++    }
++    *s &= ~(1u << (n - 1));
++    return 0;
++}
++
++ABI_ATTR int sigismember_impl(const uint32_t* s, int n) {
++    if (n < 1 || n > 32) {
++        errno = EINVAL;
++        return -1;
++    }
++    return (*s >> (n - 1)) & 1;
++}
++
++ABI_ATTR int sigprocmask_impl(int how, const uint32_t* set, uint32_t* old) {
++    sigset_t h, o;
++    int r;
++
++    if (set != NULL) {
++        set_in(&h, *set);
++    }
++    r = sigprocmask(how, set != NULL ? &h : NULL, &o);
++    if (r == 0 && old != NULL) {
++        *old = set_out(&o);
++    }
++    return r;
++}
++
++ABI_ATTR int pthread_sigmask_impl(int how, const uint32_t* set, uint32_t* old) {
++    sigset_t h, o;
++    int r;
++
++    if (set != NULL) {
++        set_in(&h, *set);
++    }
++    r = pthread_sigmask(how, set != NULL ? &h : NULL, &o);
++    if (r == 0 && old != NULL) {
++        *old = set_out(&o);
++    }
++    return r;
++}
++
++ABI_ATTR int sigsuspend_impl(const uint32_t* set) {
++    sigset_t h;
++
++    set_in(&h, *set);
++    return sigsuspend(&h);
++}
++
++ABI_ATTR int sigpending_impl(uint32_t* set) {
++    sigset_t h;
++    int r = sigpending(&h);
++
++    if (r == 0) {
++        *set = set_out(&h);
++    }
++    return r;
++}
++
++ABI_ATTR int sigwait_impl(const uint32_t* set, int* sig) {
++    sigset_t h;
++
++    set_in(&h, *set);
++    return sigwait(&h, sig);
++}
++
++ABI_ATTR int sigaction_impl(int sig, const struct b_sigaction* act, struct b_sigaction* old) {
++    struct sigaction h, o;
++    int r;
++
++    // Debugging (S30_GML_KEEP_SEGV=1): keep the loader's crash report for faults
++    if (act != NULL && (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL) && getenv("S30_GML_KEEP_SEGV")) {
++        if (old != NULL) {
++            memset(old, 0, sizeof(*old));
++        }
++        return 0;
++    }
++    if (act != NULL) {
++        memset(&h, 0, sizeof(h));
++        h.sa_sigaction = (void (*)(int, siginfo_t*, void*))act->handler;
++        set_in(&h.sa_mask, act->sa_mask);
++        h.sa_flags = (int)(act->sa_flags & ~0x04000000u); // SA_RESTORER: musl's own
++    }
++    r = sigaction(sig, act != NULL ? &h : NULL, &o);
++    if (r == 0 && old != NULL) {
++        old->handler = (void*)o.sa_sigaction;
++        old->sa_mask = set_out(&o.sa_mask);
++        old->sa_flags = (uint32_t)o.sa_flags;
++        old->sa_restorer = NULL;
++    }
++    return r;
++}
++
++/* ---- sigsetjmp: musl's sigjmp_buf (~388 bytes) is bigger than bionic's
++   (256): the mask goes to a side table, the registers to musl's setjmp
++   (which writes ~104 bytes). The stub tail-calls setjmp so it saves the
++   guest's own sp and lr. ---- */
++
++#define S30_JMP_SLOTS 64
++static struct {
++    void* env;
++    uint32_t saved; // savemask was set
++    sigset_t mask;
++} sJmpSlots[S30_JMP_SLOTS];
++static unsigned sJmpNext;
++
++extern "C" void s30_sigsetjmp_save(void* env, int savemask) {
++    unsigned i, slot = S30_JMP_SLOTS;
++
++    for (i = 0; i < S30_JMP_SLOTS; i++) {
++        if (sJmpSlots[i].env == env) {
++            slot = i;
++            break;
++        }
++    }
++    if (slot == S30_JMP_SLOTS) {
++        slot = sJmpNext++ % S30_JMP_SLOTS;
++        sJmpSlots[slot].env = env;
++    }
++    sJmpSlots[slot].saved = savemask != 0;
++    if (savemask) {
++        pthread_sigmask(SIG_BLOCK, NULL, &sJmpSlots[slot].mask);
++    }
++}
++
++__attribute__((naked)) int sigsetjmp_impl(void* env, int savemask) {
++    asm volatile(
++        "push {r0, r1, r2, lr}\n"
++        "bl s30_sigsetjmp_save\n"
++        "pop {r0, r1, r2, lr}\n"
++        "b setjmp\n");
++}
++
++ABI_ATTR void siglongjmp_impl(void* env, int val) {
++    for (unsigned i = 0; i < S30_JMP_SLOTS; i++) {
++        if (sJmpSlots[i].env == env) {
++            if (sJmpSlots[i].saved) {
++                pthread_sigmask(SIG_SETMASK, &sJmpSlots[i].mask, NULL);
++            }
++            break;
++        }
++    }
++    longjmp(*(jmp_buf*)env, val);
++}
++
++/* ---- debugging: who raises a signal (the runner's own crash path) ---- */
++
++extern "C" void s30_report_address(const char* what, uintptr_t addr);
++
++ABI_ATTR int raise_impl(int sig) {
++    fprintf(stderr, "\n*** guest raise(%d)\n", sig);
++    s30_report_address("called from", (uintptr_t)__builtin_return_address(0));
++    return raise(sig);
++}
++
++/* ---- bionic-only ---- */
++
++ABI_ATTR void __assert2_impl(const char* file, int line, const char* func, const char* expr) {
++    fprintf(stderr, "%s:%d: %s: assertion \"%s\" failed\n", file, line, func, expr);
++    abort();
++}
++
++/* musl has no mallinfo (struct b_mallinfo: bionic32_types.h) */
++ABI_ATTR struct b_mallinfo mallinfo_impl(void) {
++    struct b_mallinfo m;
++
++    memset(&m, 0, sizeof(m));
++    return m;
++}
++
++ABI_ATTR int flock_impl(int fd, int op) {
++    return flock(fd, op);
++}
++
++}
+diff --git a/thunks/libc/bionic_file.h b/thunks/libc/bionic_file.h
+index 888bff5..dcc0aff 100644
+--- a/thunks/libc/bionic_file.h
++++ b/thunks/libc/bionic_file.h
+@@ -5,7 +5,9 @@
+ #include <cstddef>
+ #include <cstdio>
+ 
+-typedef off_t BIONIC_fpos_t;
++/* bionic's fpos_t is its off_t: a long (32 bits on armv7; musl's off_t is
++   always 64), so not the host's off_t */
++typedef long BIONIC_fpos_t;
+ 
+ /* "struct dirent" from bionic/libc/include/dirent.h */
+ struct bionic_dirent {
+@@ -63,5 +65,8 @@ typedef	struct BIONIC__sFILE {
+ 	int	_blksize;	/* stat.st_blksize (may be != _bf._size) */
+ 	BIONIC_fpos_t	_offset;	/* current lseek offset */
+ } BIONIC_FILE;
++#if !defined(__LP64__)
++static_assert(sizeof(BIONIC_FILE) == 84, "bionic LP32 FILE is 84 bytes (&__sF[n])");
++#endif
+ 
+ #endif
+\ No newline at end of file
+diff --git a/thunks/libc/c_prototypes.h b/thunks/libc/c_prototypes.h
+index 1207ab4..5dac242 100644
+--- a/thunks/libc/c_prototypes.h
++++ b/thunks/libc/c_prototypes.h
+@@ -5,10 +5,19 @@
+ #include <stdint.h>
+ #include <stddef.h>
+ #include <stdarg.h>
++#ifdef __GLIBC__
+ #include <bits/types/locale_t.h>
+ #include <bits/types/wint_t.h>
+ #include <bits/types/FILE.h>
+ #include <bits/types/mbstate_t.h>
++#else
++/* S30, musl: the same types, alone */
++#define __NEED_locale_t
++#define __NEED_wint_t
++#define __NEED_FILE
++#define __NEED_mbstate_t
++#include <bits/alltypes.h>
++#endif
+ #undef __attribute_pure__
+ #undef __attribute_const__
+ #endif
+@@ -376,8 +385,13 @@ void* realloc(void* __ptr, size_t __byte_count) __BIONIC_ALLOC_SIZE(2) __wur;
+ void* reallocarray(void* __ptr, size_t __item_count, size_t __item_size) __BIONIC_ALLOC_SIZE(2, 3) __wur __INTRODUCED_IN(29);
+ void free(void* __ptr);
+ void* memalign(size_t __alignment, size_t __byte_count) __mallocfunc __BIONIC_ALLOC_SIZE(2) __wur;
++#ifdef __GLIBC__
+ size_t malloc_usable_size(const void* __ptr) __INTRODUCED_IN(17);
+ struct mallinfo mallinfo(void);
++#else
++/* S30, musl: its own declaration; no mallinfo */
++size_t malloc_usable_size(void* __ptr);
++#endif
+ int malloc_info(int __must_be_zero, FILE* __fp) __INTRODUCED_IN(23);
+ int mallopt(int __option, int __value) __INTRODUCED_IN(26);
+ 
+@@ -548,24 +562,36 @@ int unlockpt(int __fd);
+ 
+ int getsubopt(char** __option, char* const* __tokens, char** __value_ptr) __INTRODUCED_IN(26);
+ 
++#if defined(__GLIBC__) || defined(IS_TAB_GEN)
+ typedef struct {
+   int quot;
+   int rem;
+ } div_t;
++#else
++using ::div_t; /* S30, musl: the host type (same layout) */
++#endif
+ 
+ div_t div(int __numerator, int __denominator) __attribute_const__;
+ 
++#if defined(__GLIBC__) || defined(IS_TAB_GEN)
+ typedef struct {
+   long int quot;
+   long int rem;
+ } ldiv_t;
++#else
++using ::ldiv_t; /* S30, musl: the host type (same layout) */
++#endif
+ 
+ ldiv_t ldiv(long __numerator, long __denominator) __attribute_const__;
+ 
++#if defined(__GLIBC__) || defined(IS_TAB_GEN)
+ typedef struct {
+   long long int quot;
+   long long int rem;
+ } lldiv_t;
++#else
++using ::lldiv_t; /* S30, musl: the host type (same layout) */
++#endif
+ 
+ lldiv_t lldiv(long long __numerator, long long __denominator) __attribute_const__;
+ int getloadavg(double __averages[], int __n) __INTRODUCED_IN(29);
+diff --git a/thunks/libc/fortify.cpp b/thunks/libc/fortify.cpp
+index 213644c..d4ed40d 100644
+--- a/thunks/libc/fortify.cpp
++++ b/thunks/libc/fortify.cpp
+@@ -1,3 +1,4 @@
++#include "musl_compat.h" // S30: glibc extensions musl lacks
+ /*
+  * Copyright (C) 2012 The Android Open Source Project
+  * All rights reserved.
+@@ -176,6 +177,14 @@ int ABI_ATTR __poll_chk_impl(pollfd* fds, nfds_t fd_count, int timeout, size_t f
+ int ABI_ATTR __ppoll_chk_impl(pollfd* fds, nfds_t fd_count, const timespec* timeout,
+                 const sigset_t* mask, size_t fds_size) {
+   __check_pollfd_array("ppoll", fds_size, fd_count);
++#ifndef __GLIBC__
++  // S30, musl: the guest's timespec has a 32-bit tv_sec
++  if (timeout != NULL) {
++    const int32_t* b = (const int32_t*)timeout;
++    struct timespec t = { b[0], b[1] };
++    return ppoll(fds, fd_count, &t, mask);
++  }
++#endif
+   return ppoll(fds, fd_count, timeout, mask);
+ }
+ 
+@@ -191,7 +200,7 @@ ssize_t ABI_ATTR __pread64_chk_impl(int fd, void* buf, size_t count, off64_t off
+   return pread64(fd, buf, count, offset);
+ }
+ 
+-ssize_t ABI_ATTR __pread_chk_impl(int fd, void* buf, size_t count, off_t offset, size_t buf_size) {
++ssize_t ABI_ATTR __pread_chk_impl(int fd, void* buf, size_t count, int32_t offset, size_t buf_size) { // S30: bionic's 32-bit off_t
+   __check_count("pread", "count", count);
+   __check_buffer_access("pread", "write into", count, buf_size);
+   return pread(fd, buf, count, offset);
+@@ -204,7 +213,7 @@ ssize_t ABI_ATTR __pwrite64_chk_impl(int fd, const void* buf, size_t count, off6
+   return pwrite64(fd, buf, count, offset);
+ }
+ 
+-ssize_t ABI_ATTR __pwrite_chk_impl(int fd, const void* buf, size_t count, off_t offset,
++ssize_t ABI_ATTR __pwrite_chk_impl(int fd, const void* buf, size_t count, int32_t offset, // S30: bionic's 32-bit off_t
+                                 size_t buf_size) {
+   __check_count("pwrite", "count", count);
+   __check_buffer_access("pwrite", "read from", count, buf_size);
+diff --git a/thunks/libc/misc.cpp b/thunks/libc/misc.cpp
+index 3f68565..de14ae4 100644
+--- a/thunks/libc/misc.cpp
++++ b/thunks/libc/misc.cpp
+@@ -1,3 +1,4 @@
++#include "musl_compat.h" // S30: glibc extensions musl lacks
+ #include <errno.h>
+ #include <string.h>
+ #include <fcntl.h>
+diff --git a/thunks/libc/pthread.cpp b/thunks/libc/pthread.cpp
+index 014c1e1..da31b7c 100644
+--- a/thunks/libc/pthread.cpp
++++ b/thunks/libc/pthread.cpp
+@@ -175,6 +175,14 @@ ABI_ATTR int pthread_cond_timedwait_impl(pthread_cond_t **cnd, BIONIC_pthread_mu
+         if (pthread_cond_init_impl(cnd, NULL) < 0)
+             return -1;
+     }
++#ifndef __GLIBC__
++    // S30, musl: the guest's timespec has a 32-bit tv_sec
++    {
++        const int32_t* b = (const int32_t*)t;
++        struct timespec h = { b[0], b[1] };
++        return pthread_cond_timedwait(*cnd, *mtx, &h);
++    }
++#endif
+     return pthread_cond_timedwait(*cnd, *mtx, t);
+ }
+ 
+diff --git a/thunks/libc/symtab_exclude b/thunks/libc/symtab_exclude
+index 64d0d3d..224ba87 100644
+--- a/thunks/libc/symtab_exclude
++++ b/thunks/libc/symtab_exclude
+@@ -291,3 +291,47 @@ y1
+ y1f
+ yn
+ ynf
++# S30 (musl, 64-bit time_t/off_t/rlim_t): guest structs or arguments in a
++# different layout and no converting wrapper (thunks/libc/bionic32.cpp) yet:
++# missing (a loud failure if used) rather than wrong
++settimeofday
++clock_settime
++pselect
++getitimer
++setitimer
++getrusage
++wait3
++wait4
++timer_settime
++timer_gettime
++timerfd_settime
++timerfd_gettime
++sigtimedwait
++sched_rr_get_interval
++futimes
++lutimes
++utimes
++utime
++futimesat
++statfs
++fstatfs
++statvfs
++fstatvfs
++sendfile
++fallocate
++readahead
++sync_file_range
++lockf
++preadv
++pwritev
++timespec_get
++mtx_timedlock
++cnd_timedwait
++thrd_sleep
++pthread_mutex_timedlock
++pthread_rwlock_timedrdlock
++pthread_rwlock_timedwrlock
++semtimedop
++recvmmsg
++prlimit
++statx
+diff --git a/thunks/libm/libm.cpp b/thunks/libm/libm.cpp
+new file mode 100644
+index 0000000..b1dac43
+--- /dev/null
++++ b/thunks/libm/libm.cpp
+@@ -0,0 +1,71 @@
++// S30: the guest's libm from the host (musl). The shipped AOSP libm.so for
++// armeabi-v7a is built for ARMv8-A (vrintx, vcvta, ...) and traps on the S30's
++// Cortex-A7, so it isn't loaded; the thunks convert the guest's soft-float
++// calls. The functions the GameMaker runner, its OpenAL, libc++ and
++// compiler_rt import (llvm-nm -D --undefined-only against libm.so's exports).
++#include "platform.h"
++#include "thunk_gen.h"
++#include "so_util.h"
++
++// C linkage in a namespace: <cmath>'s overloads would make &sin ambiguous
++namespace M {
++extern "C" {
++double acos(double); float acosf(float);
++double asin(double); float asinf(float);
++double atan(double); float atanf(float);
++double atan2(double, double); float atan2f(float, float);
++double ceil(double); float ceilf(float);
++double cos(double); float cosf(float);
++double exp(double); float expf(float);
++double floor(double); float floorf(float);
++double fmod(double, double); float fmodf(float, float);
++double log(double); double log10(double); float log10f(float);
++double logb(double); float logbf(float); long double logbl(long double);
++long lrint(double);
++double modf(double, double*); float modff(float, float*);
++double pow(double, double); float powf(float, float);
++double scalbn(double, int); float scalbnf(float, int); long double scalbnl(long double, int);
++double sin(double); float sinf(float);
++double sqrt(double); float sqrtf(float);
++double tan(double); float tanf(float);
++float logf(float);
++double fabs(double); float fabsf(float);
++double round(double); float roundf(float);
++double trunc(double); float truncf(float);
++double exp2(double); float exp2f(float);
++double log2(double); float log2f(float);
++double sinh(double); double cosh(double); double tanh(double);
++double hypot(double, double); float hypotf(float, float);
++double ldexp(double, int); float ldexpf(float, int);
++double frexp(double, int*); float frexpf(float, int*);
++long lrintf(float); long lround(double); long lroundf(float);
++double rint(double); float rintf(float);
++double nearbyint(double); float nearbyintf(float);
++double fmin(double, double); double fmax(double, double);
++float fminf(float, float); float fmaxf(float, float);
++double copysign(double, double); float copysignf(float, float);
++double cbrt(double); float cbrtf(float);
++}
++}
++
++#define M_THUNK(f) THUNK_SPECIFIC(#f, M::f)
++
++DynLibFunction symtable_libm[] = {
++    M_THUNK(acos), M_THUNK(acosf), M_THUNK(asin), M_THUNK(asinf),
++    M_THUNK(atan), M_THUNK(atanf), M_THUNK(atan2), M_THUNK(atan2f),
++    M_THUNK(ceil), M_THUNK(ceilf), M_THUNK(cos), M_THUNK(cosf),
++    M_THUNK(exp), M_THUNK(expf), M_THUNK(floor), M_THUNK(floorf),
++    M_THUNK(fmod), M_THUNK(fmodf), M_THUNK(log), M_THUNK(logf), M_THUNK(log10), M_THUNK(log10f),
++    M_THUNK(logb), M_THUNK(logbf), M_THUNK(logbl), M_THUNK(lrint), M_THUNK(lrintf),
++    M_THUNK(lround), M_THUNK(lroundf), M_THUNK(modf), M_THUNK(modff),
++    M_THUNK(pow), M_THUNK(powf), M_THUNK(scalbn), M_THUNK(scalbnf), M_THUNK(scalbnl),
++    M_THUNK(sin), M_THUNK(sinf), M_THUNK(sqrt), M_THUNK(sqrtf), M_THUNK(tan), M_THUNK(tanf),
++    M_THUNK(fabs), M_THUNK(fabsf), M_THUNK(round), M_THUNK(roundf), M_THUNK(trunc), M_THUNK(truncf),
++    M_THUNK(exp2), M_THUNK(exp2f), M_THUNK(log2), M_THUNK(log2f),
++    M_THUNK(sinh), M_THUNK(cosh), M_THUNK(tanh), M_THUNK(hypot), M_THUNK(hypotf),
++    M_THUNK(ldexp), M_THUNK(ldexpf), M_THUNK(frexp), M_THUNK(frexpf),
++    M_THUNK(rint), M_THUNK(rintf), M_THUNK(nearbyint), M_THUNK(nearbyintf),
++    M_THUNK(fmin), M_THUNK(fmax), M_THUNK(fminf), M_THUNK(fmaxf),
++    M_THUNK(copysign), M_THUNK(copysignf), M_THUNK(cbrt), M_THUNK(cbrtf),
++    {NULL, 0},
++};

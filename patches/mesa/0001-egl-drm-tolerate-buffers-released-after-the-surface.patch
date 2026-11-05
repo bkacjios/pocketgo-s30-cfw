@@ -1,0 +1,45 @@
+egl/drm: tolerate GBM buffers released after the EGL surface
+
+SDL2 (2.32) KMSDRM_DestroySurfaces destroys the EGL surface, then calls
+gbm_surface_release_buffer() on the buffers it still holds: release_buffer()
+read the freed dri2_egl_surface (a crash on the S30 whenever the freed memory
+was unmapped: the launcher, every other app start). The surface now clears
+its pointer in the GBM surface when destroyed, and the callbacks do nothing
+without it.
+
+--- a/src/egl/drivers/dri2/platform_drm.c	2026-07-29 13:31:27.000000000 -0400
++++ b/src/egl/drivers/dri2/platform_drm.c	2026-11-05 15:56:21.095405479 -0500
+@@ -75,6 +75,11 @@
+    struct gbm_dri_surface *surf = gbm_dri_surface(_surf);
+    struct dri2_egl_surface *dri2_surf = surf->dri_private;
+ 
++   /* The EGL surface is already destroyed (its buffers with it): SDL2's KMSDRM
++    * backend destroys it before releasing the GBM buffers it still holds */
++   if (dri2_surf == NULL)
++      return;
++
+    for (unsigned i = 0; i < ARRAY_SIZE(dri2_surf->color_buffers); i++) {
+       if (dri2_surf->color_buffers[i].bo == bo) {
+          dri2_surf->color_buffers[i].locked = false;
+@@ -89,6 +94,9 @@
+    struct gbm_dri_surface *surf = gbm_dri_surface(_surf);
+    struct dri2_egl_surface *dri2_surf = surf->dri_private;
+ 
++   if (dri2_surf == NULL)
++      return 0;
++
+    for (unsigned i = 0; i < ARRAY_SIZE(dri2_surf->color_buffers); i++)
+       if (!dri2_surf->color_buffers[i].locked)
+          return 1;
+@@ -210,6 +218,11 @@
+          gbm_bo_destroy(dri2_surf->color_buffers[i].bo);
+    }
+ 
++   /* The GBM surface may outlive this one (its owner can still release a
++    * buffer): no pointer to the freed surface left there */
++   if (dri2_surf->gbm_surf != NULL && dri2_surf->gbm_surf->dri_private == dri2_surf)
++      dri2_surf->gbm_surf->dri_private = NULL;
++
+    dri2_fini_surface(surf);
+    free(surf);
+ 

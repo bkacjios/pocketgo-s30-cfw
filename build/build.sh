@@ -332,19 +332,24 @@ step_emulationstation() {
 # took 3.5 s of the launcher's start at boot (squashfs reads and
 # decompression, musl relocates the whole library). The same release as
 # Alpine's (its headers are in the sysroot), checked against Alpine 3.24's
-# sha512. Build tools (meson, mako, PyYAML) in a venv under $WORK.
+# sha512, plus patches/mesa. Build tools (meson, mako, PyYAML) in a venv under $WORK.
 # Output: installed under $WORK/mesa-root, which replaces Alpine's mesa
 # packages in the rootfs (build/packages excludes them).
 MESA_VERSION=26.1.6
 MESA_SHA512=6746b73f5b87e8ff3723eee586b4b5f033dbe6d13cd0309d743b7fa484c350268859ec8ff21aadcbca7a04070cdaa7828146dd28dde4b1935bb879891d687f0b
 step_mesa() {
-	local dir="$WORK/mesa-src" src="$WORK/mesa-src/mesa-$MESA_VERSION" sr="$WORK/sysroot" venv="$WORK/mesa-venv"
+	local dir="$WORK/mesa-src" src="$WORK/mesa-src/mesa-$MESA_VERSION" sr="$WORK/sysroot" venv="$WORK/mesa-venv" patch
 	local tarball="$WORK/mesa-src/mesa-$MESA_VERSION.tar.xz"
 	ensure_sysroot
 	mkdir -p "$dir"
 	[ -f "$tarball" ] || curl -fsSL -o "$tarball" "https://archive.mesa3d.org/mesa-$MESA_VERSION.tar.xz"
 	echo "$MESA_SHA512  $tarball" | sha512sum -c --quiet
 	[ -d "$src" ] || tar -xJf "$tarball" -C "$dir"
+	for patch in "$PROJECT"/patches/mesa/*.patch; do
+		[ -e "$patch" ] || continue
+		patch -d "$src" -p1 -R -s -f --dry-run < "$patch" >/dev/null 2>&1 ||
+			patch -d "$src" -p1 -s < "$patch"
+	done
 	if [ ! -x "$venv/bin/meson" ]; then
 		python3 -m venv "$venv"
 		"$venv/bin/pip" install --quiet meson mako pyyaml packaging
@@ -386,6 +391,46 @@ step_mesa() {
 	# Headers and pkg-config files are the sysroot's (Alpine's mesa-dev)
 	rm -rf "$WORK/mesa-root/usr/include" "$WORK/mesa-root/usr/lib/pkgconfig" "$WORK/mesa-root/usr/share"
 	du -sh "$WORK/mesa-root"
+}
+
+# gmloader-next (PortsMaster's): runs GameMaker Android titles (AM2R) natively,
+# cross-compiled with clang for armv7 musl against the Alpine sysroot, plus
+# patches/gmloader-next (musl and bionic armv7 ABI wrappers, the host libm for
+# the ARMv8-only AOSP one, the rotation for the portrait panel). Its libc
+# table generator parses the sysroot's headers with libclang (bindings in a
+# venv under $WORK). Output: $WORK/gmloader/ (gmloadernext.armhf and the
+# lib/armeabi-v7a libraries it loads; see ports/am2r)
+step_gmloader() {
+	local src="$WORK/gmloader-next" sr="$WORK/sysroot" venv="$WORK/gml-venv" patch cxxv out="$WORK/gmloader"
+	upstream_tree gmloader-next
+	git -C "$src" submodule update --init --recursive --depth 1 -q
+	for patch in "$PROJECT"/patches/gmloader-next/*.patch; do
+		[ -e "$patch" ] || continue
+		git -C "$src" apply --reverse --check "$patch" 2>/dev/null ||
+			git -C "$src" apply "$patch"
+	done
+	ensure_sysroot
+	if [ ! -x "$venv/bin/python3" ]; then
+		python3 -m venv "$venv"
+		"$venv/bin/pip" install --quiet libclang==18.1.1
+	fi
+	cxxv="$(ls "$sr/usr/include/c++" | head -1)"
+	PATH="$venv/bin:$PATH" \
+	GML_CLANG_EXTRA="--sysroot=$sr --target=armv7-alpine-linux-musleabihf -march=armv7-a -mfloat-abi=hard \
+-isystem $sr/usr/include/c++/$cxxv -isystem $sr/usr/include/c++/$cxxv/armv7-alpine-linux-musleabihf \
+-I$src/s30 -D_LARGEFILE64_SOURCE" \
+	PKG_CONFIG_SYSROOT_DIR="$sr" PKG_CONFIG_LIBDIR="$sr/usr/lib/pkgconfig" \
+	make -C "$src" -f Makefile.gmloader ARCH=arm-linux-gnueabihf \
+		CC="$WORK/bin/armv7-clang" CXX="$WORK/bin/armv7-clang++" PKG_CONFIG=pkg-config \
+		LLVM_INC="$sr/usr/include" OPTM="-Os -I$src/s30 -D_LARGEFILE64_SOURCE -Wno-c++11-narrowing" -j"$JOBS"
+	rm -rf "$out"
+	mkdir -p "$out/lib/armeabi-v7a"
+	install -m 0755 "$src/build/arm-linux-gnueabihf/gmloader/gmloadernext.armhf" "$out/"
+	llvm-strip "$out/gmloadernext.armhf"
+	# Not libm.so: ARMv8-A code (the host's libm serves it)
+	install -m 0644 "$src/lib/armeabi-v7a/libc++_shared.so" "$src/lib/armeabi-v7a/libcompiler_rt.so" \
+		"$out/lib/armeabi-v7a/"
+	ls -l "$out/gmloadernext.armhf"
 }
 
 # Root filesystem for build.sh fel: rootfs.sqfs (minirootfs + packages +
@@ -589,8 +634,9 @@ case "${1:-all}" in
 	emulationstation) step_emulationstation ;;
 	launcher) step_launcher ;;
 	mesa) step_mesa ;;
+	gmloader) step_gmloader ;;
 	fel) step_fel ;;
 	sdcard) step_sdcard "${2:-}" "${3:-}" ;;
 	all) step_deps; step_linux; step_uboot; step_rootfs; step_image ;;
-	*) echo "usage: $0 [deps|linux|uboot|rootfs|image|initramfs|retroarch|emulationstation|launcher|mesa|fel|sdcard /dev/sdX [format]|all]" >&2; exit 2 ;;
+	*) echo "usage: $0 [deps|linux|uboot|rootfs|image|initramfs|retroarch|emulationstation|launcher|mesa|gmloader|fel|sdcard /dev/sdX [format]|all]" >&2; exit 2 ;;
 esac
