@@ -15,6 +15,7 @@ On the card, `/mnt/sd/home/ports/am2r/`:
     gmloadernext.armhf           s30-build/gmloader/
     lib/armeabi-v7a/*.so         s30-build/gmloader/lib/armeabi-v7a/
     gmloader.json                this directory (build/gmloader/am2r)
+    config-s30.ini               this directory
     am2r.apk                     AM2RLauncher's APK, renamed
     saves/                       created by the game
 
@@ -24,17 +25,11 @@ and `AM2R.sh` (this directory) in `/mnt/sd/apps/` for the launcher.
 
 `AM2R.sh` maps the face buttons by position for SDL (the game expects an Xbox
 pad). `gmloader.json` puts the pad in gamepad slot 1, the one AM2R reads
-(`first_pad_slot`). Game Boy layout (A jumps, B shoots) in
-`saves/config.ini`, `[Control]`:
-
-    XBJoypadButtonA="32770.000000"         jump: A (right)
-    XBJoypadButtonB="32769.000000"         shoot: B (bottom)
-    XBJoypadButtonR="32771.000000"         aim: Y (left)
-    XBJoypadButtonMenuOK="32770.000000"
-    XBJoypadButtonMenuCancel="32769.000000"
-
-Button prompts matching the S30's labels: Options, Display, Button type:
-SNESColored (`[Extras] Controller="3.000000"`).
+(`first_pad_slot`). On the first run (no `saves/config.ini` yet) `AM2R.sh`
+copies `config-s30.ini` there: the Game Boy layout (A, right, jumps and
+confirms; B, bottom, shoots and cancels; Y, left, aims) and the SNES button
+prompts (`[Extras] Controller="3.000000"`), which show the S30's labels. The
+game's own options menu changes them from then on.
 
 ## Debugging
 
