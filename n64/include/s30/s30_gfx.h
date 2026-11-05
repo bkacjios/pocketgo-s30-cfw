@@ -30,6 +30,10 @@ typedef struct {
     int (*texElemSize)(uintptr_t addr);
     // Debug environment variable prefix: <prefix>_GFXSTATS, _GFXTRACE, ...
     const char* envPrefix;
+    // Overscan margin in N64 pixels: a scissor within this of an edge counts
+    // as reaching it, so the game's full-screen scissor opens the whole frame
+    // (Star Fox 64 clips to the screen minus 8 pixels on every side)
+    int overscan;
 } S30GfxConfig;
 
 // Call once, after S30Display_Init (the config is copied)

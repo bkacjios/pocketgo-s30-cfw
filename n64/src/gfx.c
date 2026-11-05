@@ -1756,7 +1756,10 @@ static void apply_state(void) {
         gl_scissor(rdp.scX, AUX_H - rdp.scY - rdp.scH, rdp.scW, rdp.scH);
     } else {
         float s = sBatchScreen ? 1.0f : FB_SCALE, w = sBatchScreen ? S30_2D_W : S30_FB_W;
-        int fullScissor = rdp.scX <= 0 && rdp.scX + rdp.scW >= SCREEN_W;
+        int m = sCfg.overscan;
+        int fullScissor = rdp.scX <= m && rdp.scX + rdp.scW >= SCREEN_W - m;
+        int fullScissorY = m > 0 && fullScissor && rdp.scY <= m && rdp.scY + rdp.scH >= SCREEN_H - m;
+        int scY = fullScissorY ? 0 : rdp.scY, scH = fullScissorY ? SCREEN_H : rdp.scH;
 
         if (sBatchScreen) {
             gl_viewport(0, 0, S30_2D_W, S30_2D_H);
@@ -1770,8 +1773,8 @@ static void apply_state(void) {
             gl_viewport(x0, (int)((SCREEN_H - rsp.vpY - rsp.vpH) * s), x1 - x0, (int)(rsp.vpH * s));
         }
         gl_enable(GL_SCISSOR_TEST, 1, &sGL.scissor);
-        gl_scissor(fullScissor ? 0 : (int)((rdp.scX + WIDE_PAD) * s), (int)((SCREEN_H - rdp.scY - rdp.scH) * s),
-                   fullScissor ? (int)w : (int)(rdp.scW * s + 0.5f), (int)(rdp.scH * s + 0.5f));
+        gl_scissor(fullScissor ? 0 : (int)((rdp.scX + WIDE_PAD) * s), (int)((SCREEN_H - scY - scH) * s),
+                   fullScissor ? (int)w : (int)(rdp.scW * s + 0.5f), (int)(scH * s + 0.5f));
     }
 }
 

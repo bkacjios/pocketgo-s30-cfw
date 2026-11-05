@@ -142,9 +142,11 @@ static float sAlpha;          // box opacity drawn
 static int sDirty;            // needs a redraw
 static uint64_t sOsdUntil, sNextLeaseCheck;
 static pid_t sAppPid;         // process holding the lease
+static int sAppLauncher;      // ... and it is the launcher (no performance overlay)
 static int sMenu, sMenuSel;   // system menu open, selected item
 static int sMenuPage;         // 0: app, 1: system, 2: stick calibration
-static int sPerf;             // performance overlay on
+enum { PERF_OFF, PERF_FULL, PERF_FPS, PERF_MODES };
+static int sPerf;             // performance overlay (System > Overlay, saved)
 static char sPerfFile[320];   // where sPerf is saved ("" if nowhere)
 static uint64_t sPerfNext;    // next overlay update (0: now)
 static int sMenuLauncher;     // the menu is over the launcher (power menu)
@@ -528,7 +530,8 @@ static void draw_menu(void) {
 			int len, x;
 
 			if (sMenuPage && i == SYS_PERF) {
-				snprintf(label, sizeof(label), "%s: %s", items[i], sPerf ? "On" : "Off");
+				static const char* const modes[] = { "Off", "Full", "FPS" };
+				snprintf(label, sizeof(label), "%s: %s", items[i], modes[sPerf]);
 			} else if (sMenuPage && i == SYS_BACK && sMenuLauncher) {
 				snprintf(label, sizeof(label), "Close");
 			} else {
@@ -1239,7 +1242,7 @@ static void plane_off(void) {
 /* Plane height outside the menu: the OSD strip, or the whole screen while
    the performance overlay is on */
 static int plane_h(void) {
-	return sPerf ? BUF_H : STRIP_H;
+	return sPerf == PERF_FULL && !sAppLauncher ? BUF_H : STRIP_H;
 }
 
 static void osd_show(const char* icon, int percent) {
@@ -1260,6 +1263,9 @@ static void osd_show(const char* icon, int percent) {
 		sPerfNext = 0;
 	}
 }
+
+static int perf_visible(void);
+static void perf_paint(uint64_t nowMs);
 
 /* One frame of fading/easing, drawn just after a vblank (no tearing).
    Returns whether more frames are needed. */
@@ -1290,6 +1296,9 @@ static int osd_frame(void) {
 		present_rect(BOX_X, BOX_Y, BOX_W, BOX_H);
 	} else {
 		fill(0, 0, BUF_W, STRIP_H, 0);
+		if (perf_visible()) {
+			perf_paint(now_ms()); // the overlay's top, under the OSD
+		}
 		if (sAlpha > 0.0f && osd_is_battery()) {
 			draw_battery((int)sTarget, strcmp(sIcon, "charging") == 0, sAlpha);
 		} else if (sAlpha > 0.0f) {
@@ -1462,7 +1471,7 @@ static void menu_confirm(void) {
 	}
 	switch (sMenuSel) {
 		case SYS_PERF:
-			sPerf = !sPerf;
+			sPerf = (sPerf + 1) % PERF_MODES;
 			perf_save();
 			menu_redraw();
 			break;
@@ -1705,6 +1714,7 @@ static void check_lease(void) {
 		plane_off();
 		sLessee = 0;
 		sAppPid = 0;
+		sAppLauncher = 0;
 		set_master(0);
 	}
 }
@@ -1866,6 +1876,7 @@ static void handle_client(int c) {
 		int fd = strcmp(msg + 6, sCard) == 0 ? make_lease() : -1;
 		if (fd >= 0 && getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
 			sAppPid = cred.pid; // the app (the shim runs in it)
+			sAppLauncher = is_launcher(sAppPid);
 		}
 		reply(c, fd >= 0 ? "ok" : "fail", fd);
 		if (fd >= 0) {
@@ -1879,8 +1890,10 @@ static void handle_client(int c) {
 /* ---------------------------------------------------------------------------
  * Performance overlay (System > Overlay), like MangoHud: FPS and frame
  * times of the app on screen (from the page flips libs30lease.so marks in the
- * S30_FRAMES_PATH ring), CPU, GPU, temperatures, memory, battery. A box at
- * the left edge; the plane covers the whole screen while it is on.
+ * S30_FRAMES_PATH ring), CPU, GPU, temperatures, memory, battery. A box in
+ * the top left corner; the plane covers the whole screen while it is on. Or
+ * just the FPS, in a small box there (inside the OSD's strip). The OSD box
+ * overlaps it: while the OSD shows, osd_frame paints the overlay under it.
  * ------------------------------------------------------------------------- */
 
 #define PERF_MS 100         // redraw (FPS and the graph)
@@ -1890,8 +1903,12 @@ static void handle_client(int c) {
 #define PERF_GRAPH_H 28
 #define PERF_LINES 7
 #define PERF_H (6 + 16 + PERF_GRAPH_H + 4 + (PERF_LINES - 1) * 16 + 6)
-#define PERF_Y ((BUF_H - PERF_H) / 2)
+#define PERF_Y 4
 #define PERF_GRAPH_MS 100.0f // graph full height
+#define PERF_FPS_X 4         // the FPS-only box
+#define PERF_FPS_Y 4
+#define PERF_FPS_W (6 + 6 * 8 + 6) // "FPS 60"
+#define PERF_FPS_H (6 + 16 + 6)
 
 static S30Frames* sFrames;
 static char sGpuFreq[300], sPmicTemp[300];
@@ -1939,7 +1956,8 @@ static void perf_init(void) {
 		int dirLen = slash != NULL ? (int)(slash - sBrightFile) : 0;
 
 		snprintf(sPerfFile, sizeof(sPerfFile), "%.*s%sperf_overlay", dirLen, sBrightFile, dirLen ? "/" : "");
-		sPerf = read_int(sPerfFile) == 1;
+		sPerf = read_int(sPerfFile);
+		sPerf = sPerf > 0 && sPerf < PERF_MODES ? sPerf : PERF_OFF;
 	}
 	d = opendir("/sys/class/devfreq");
 	while (d != NULL && (e = readdir(d)) != NULL) {
@@ -2162,7 +2180,24 @@ static int frame_times(float* out, int max, int* fps, uint64_t nowNs) {
 	return n;
 }
 
-static void perf_draw(uint64_t nowMs) {
+static void perf_paint_fps(uint64_t nowMs) {
+	const int x0 = PERF_FPS_X + 6, y0 = PERF_FPS_Y + 6;
+	float ft[1];
+	int fps;
+	char text[8];
+
+	if (frame_times(ft, 1, &fps, nowMs * 1000000ull)) {
+		snprintf(text, sizeof(text), "%3d", fps);
+	} else {
+		snprintf(text, sizeof(text), "  -");
+	}
+	fill(PERF_FPS_X, PERF_FPS_Y, PERF_FPS_W, PERF_FPS_H, 0);
+	draw_box(PERF_FPS_X, PERF_FPS_Y, PERF_FPS_W, PERF_FPS_H, 0.6f);
+	draw_text("FPS", x0, y0, 1, argb(0xe0a050, 1.0f));
+	draw_text(text, x0 + 3 * 8, y0, 1, argb(0x60c0e0, 1.0f));
+}
+
+static void perf_paint_full(uint64_t nowMs) {
 	const int x0 = PERF_X + 6, gy = PERF_Y + 6 + 16 + 2, bars = (PERF_W - 12) / 2;
 	float ft[96];
 	int n, fps, i, y;
@@ -2211,31 +2246,55 @@ static void perf_draw(uint64_t nowMs) {
 		draw_text(label, x0, y, 1, argb(0xe0a050, 1.0f));
 		perf_text(sPerfLine[i] + sPerfLabelLen[i], x0 + sPerfLabelLen[i] * 8, y, 0xffffff);
 	}
-	wait_vblank();
-	present_rect(PERF_X, PERF_Y, PERF_W, PERF_H);
+}
+
+/* Whether the overlay is on screen now */
+static int perf_visible(void) {
+	return sPerf && !sAppLauncher && !sMenu && sMaster && sLessee != 0;
+}
+
+/* Draws the overlay into the buffer (not presented) */
+static void perf_paint(uint64_t nowMs) {
+	if (sPerf == PERF_FPS) {
+		perf_paint_fps(nowMs);
+	} else {
+		perf_paint_full(nowMs);
+	}
 }
 
 /* Main loop step: the overlay over an app, every PERF_MS. Returns the time
-   to the next step (ms), or -1 when off. */
+   to the next step (ms), or -1 when off. Not over the launcher: it only
+   draws when something changes, so its FPS says nothing. */
 static int perf_frame(uint64_t t) {
-	if (!sPerf || sMenu || !sMaster || sLessee == 0) {
+	if (!perf_visible()) {
 		return -1;
 	}
-	if (!sPlaneOn || sShowH != BUF_H) {
-		// The plane over the whole screen (set once per app, like the OSD's)
+	if (!sPlaneOn || sShowH != plane_h()) {
+		// The plane over the whole screen, or the top strip for the FPS alone
+		// (set once per app, like the OSD's)
 		fill(0, 0, BUF_W, BUF_H, 0);
 		present_rect(0, 0, BUF_W, BUF_H);
-		set_plane(0, 0, BUF_W, BUF_H);
+		set_plane(0, 0, BUF_W, plane_h());
 		sPerfNext = 0;
 	}
 	if (t < sPerfNext) {
 		return (int)(sPerfNext - t);
 	}
-	if (t >= sPerfSampleAt) {
+	if (sPerf == PERF_FULL && t >= sPerfSampleAt) {
 		perf_sample();
 		sPerfSampleAt = t + PERF_SAMPLE_MS;
 	}
-	perf_draw(t);
+	if (sAlpha > 0.0f || t < sOsdUntil) {
+		sDirty = 1; // the OSD over it: osd_frame draws both
+	} else {
+		perf_paint(t);
+		wait_vblank();
+		if (sPerf == PERF_FPS) {
+			present_rect(PERF_FPS_X, PERF_FPS_Y, PERF_FPS_W, PERF_FPS_H);
+		} else {
+			present_rect(PERF_X, PERF_Y, PERF_W, PERF_H);
+		}
+	}
 	sPerfNext = t + PERF_MS;
 	return PERF_MS;
 }
