@@ -15,10 +15,21 @@ until [ -b /dev/mmcblk0p1 ]; do
 	sleep 0.1
 done
 
-# Hold SELECT (BTN_SELECT 314) at power on: USB disk mode. The whole SD card
+# USB disk mode: hold SELECT (BTN_SELECT 314) at power on, or the system
+# menu's "USB storage" (s30-display leaves /boot/usb-mode on the card and
+# reboots; the marker is removed here, so it is one-shot). The whole SD card
 # is a USB mass storage device on the PC; nothing on it is mounted here.
 # Ejecting it on the PC or pressing START (BTN_START 315) reboots.
+usb_mode=0
 if s30-keyheld 314; then
+	usb_mode=1
+elif mount -o ro /dev/mmcblk0p1 /sd 2>/dev/null; then
+	if [ -e /sd/boot/usb-mode ]; then
+		mount -o remount,rw /sd && rm -f /sd/boot/usb-mode && usb_mode=1
+	fi
+	umount /sd
+fi
+if [ $usb_mode = 1 ]; then
 	s30-splash -i /usb.bmp
 	G=/sys/kernel/config/usb_gadget/s30
 	F=$G/functions/mass_storage.usb0
@@ -48,8 +59,17 @@ fi
 
 # FAT (stock card) or ext4
 mount /dev/mmcblk0p1 /sd || fail "cannot mount SD card"
-# Staged update (copied over ssh while the old one is in use as /)
-[ -f /sd/boot/rootfs.sqfs.new ] && mv /sd/boot/rootfs.sqfs.new /sd/boot/rootfs.sqfs
+# Staged update (copied over ssh while the old one is in use as /): installed
+# only if it mounts, so a copy cut short by a reboot is dropped, not booted
+if [ -f /sd/boot/rootfs.sqfs.new ]; then
+	if mount -t squashfs -o loop,ro /sd/boot/rootfs.sqfs.new /ro; then
+		umount /ro
+		mv /sd/boot/rootfs.sqfs.new /sd/boot/rootfs.sqfs
+	else
+		echo "s30-loader: rootfs.sqfs.new does not mount, dropped" > /dev/console
+		rm -f /sd/boot/rootfs.sqfs.new
+	fi
+fi
 mount -t squashfs -o loop,ro /sd/boot/rootfs.sqfs /ro || fail "cannot mount /boot/rootfs.sqfs"
 mount -t tmpfs -o mode=755 tmpfs /rw
 mkdir -p /rw/upper /rw/work

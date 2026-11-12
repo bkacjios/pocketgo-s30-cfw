@@ -232,8 +232,9 @@ ensure_sysroot() {
 }
 
 # Device programs. The launcher (launcher/): filebrowser.c, the boot UI that
-# starts RetroArch, OoT and other apps, with ui.c. SDL2 (KMS), text in
-# utils/osd_font.h. Utilities (utils/): s30-fel, s30-volumed, s30-splash,
+# starts RetroArch, OoT and other apps (a tile grid with icons, an image
+# viewer), with ui.c. SDL2 (KMS), text in utils/osd_font.h, images through
+# the vendored stb_image.h. Utilities (utils/): s30-fel, s30-volumed, s30-splash,
 # s30-keyheld, s30-display (with the system menu and stick calibration) and its
 # preload libs30lease.so, s30-screenshot (the screen's KMS planes to a PNG). Output: $WORK/{launcher,s30-*}.bin, $WORK/libs30lease.so
 step_launcher() {

@@ -271,7 +271,12 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   router/DNS). `ssh root@10.42.0.2`, `scp`/`rsync` work (dropbear,
   sftp-server, rsync); scp ~6 MB/s (83 MB rootfs in 14 s). First boot
   generates the host key (takes a while).
-- USB disk mode: hold SELECT at power on. `s30-loader` (initramfs) exports
+- USB disk mode: hold SELECT at power on, or System menu > Settings > USB storage
+  (2026-11-12: s30-display creates `/mnt/sd/boot/usb-mode` and reboots; the
+  loader removes the marker and enters the mode, so it is one-shot). The
+  card can't be exported while the system runs: the root squashfs is
+  loop-mounted from it, so `/mnt/sd` can't be unmounted; a live mode would
+  need the loader to copy rootfs.sqfs to RAM (83 MB) first. `s30-loader` (initramfs) exports
   the whole card (`/dev/mmcblk0`) as a USB mass storage device before
   mounting anything, and shows `build/splash/usb.bmp` (regenerate with
   `tools/make_usb_splash.py`, kernel VGA 8x16 font). Ejecting on the PC or
@@ -308,9 +313,11 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
 - `HOME=/mnt/sd/home`, `XDG_RUNTIME_DIR=/run/user/0` from
   `/etc/profile.d/s30.sh` (login shells, rc, frontend; `ssh host cmd` is not
   a login shell and keeps HOME=/root).
-- System menu (s30-display, power key): Sleep / Reboot / Shut down / Cancel
-  over the launcher (`reboot` / `poweroff` through init), Resume / Sleep /
-  Exit game over an app. The PMIC node has
+- System menu (s30-display, power key). Over an app: Exit game / Screenshot /
+  System / Resume. System page (straight over the launcher): Settings / Sleep /
+  Reboot / Shut down / Back (Close) (`reboot` / `poweroff` through init).
+  Settings page (2026-11-12): brightness slider / Overlay / Calibrate stick /
+  USB storage / Back. B goes one page up. The PMIC node has
   `x-powers,system-power-controller`, so poweroff cuts power via the AXP.
 - `s30-volumed` (utils/s30-volumed.c, respawned by init): volume keys
   (gpio-keys, polled, no autorepeat: the daemon repeats while held) step
@@ -370,6 +377,36 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
 - Launcher text: the system menu's VGA 8x16 font (utils/osd_font.h, a glyph
   texture tinted per call; no bold (double-striking looked bad); non-ASCII bytes show
   as '?'); SDL2_ttf is no longer linked.
+- Launcher layout (2026-11-12): a 4x2 grid of 104x116 tiles (icon 72 px, label
+  on up to two lines, the full name in the footer), scroll bar at the right
+  edge, header with the folder (the start folder shows "PocketGo S30") and
+  the battery, footer with (A) Open/Run/View and (B) Back as face-button
+  glyphs. D-pad/stick in four directions, A opens/runs/views, B goes up.
+- Face-button glyphs (utils/osd_button.h, shared by s30-display's menus and
+  the launcher): a 14 px disc anti-aliased by pixel coverage, the 6x8 letter
+  cut in dark; s30-display blends it per pixel, the launcher bakes one
+  texture per letter.
+  Icons: an image beside an entry with the same stem (`Ocarina of Time.png`
+  for `Ocarina of Time.sh`, `Folder.png` for `Folder/`) is its tile and is not
+  listed; square art, 72 px or larger, PNG/JPEG/BMP (launcher/stb_image.h,
+  decoded at most 2 per frame, thumbnails box-downsampled to <= 160 px).
+  Other images are listed as thumbnails and open in a viewer (fit to 480x320,
+  name and n/m in a strip; left/right step through the folder's images, B
+  back). The start folder gets a "Screenshots" tile for /mnt/sd/screenshots
+  (B from there returns to it). Textures are dropped around app runs and
+  decoded again. SDL's signal handlers are off (`SDL_HINT_NO_SIGNAL_HANDLERS`),
+  so `killall s30-launcher` works (before, SDL turned SIGTERM into an unread
+  SDL_QUIT). Desktop rendering test: `S30_UI_SHOT=out.bmp` opens a 320x480
+  window with the default video driver and saves every presented canvas
+  there (use `SDL_VIDEODRIVER=offscreen SDL_RENDER_DRIVER=software`, or a
+  window takes over the desktop).
+- Testing the launcher on the device: copy the binary to `/usr/bin/s30-launcher`
+  (overlay, gone at reboot), `killall s30-launcher`, `s30-screenshot`. Pad
+  presses can be injected by writing `struct input_event` (16 bytes:
+  sec, usec, type, code, value) to the gamepad's `/dev/input/eventN`. Never
+  kill the launcher while an app it started runs: the app keeps the DRM lease
+  and the respawned launcher fails with "kmsdrm not available" until the app
+  is killed (check `ps` for children of the launcher first).
 - Battery (launcher header and system menu, same look and place: right edge
   10 px in, centred 16 px down): 42x18 outlined battery filled to the level
   (green > 50 %, yellow > 20 %, red), the percentage inside in the 8x16 font

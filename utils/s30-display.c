@@ -83,6 +83,7 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#include "osd_button.h"
 #include "osd_font.h"
 #include "s30-frames.h"
 
@@ -145,7 +146,7 @@ static uint64_t sOsdUntil, sNextLeaseCheck;
 static pid_t sAppPid;         // process holding the lease
 static int sAppLauncher;      // ... and it is the launcher (no performance overlay)
 static int sMenu, sMenuSel;   // system menu open, selected item
-static int sMenuPage;         // 0: app, 1: system, 2: stick calibration
+static int sMenuPage;         // 0: app, 1: system, 2: stick calibration, 3: settings, 4: USB confirmation
 enum { PERF_OFF, PERF_FULL, PERF_FPS, PERF_MODES };
 static int sPerf;             // performance overlay (System > Overlay, saved)
 static char sPerfFile[320];   // where sPerf is saved ("" if nowhere)
@@ -434,15 +435,29 @@ static int osd_is_battery(void) {
    own screen, page 2), sleep, reboot, power off. */
 enum { APP_EXIT, APP_SCREENSHOT, APP_SYSTEM, APP_RESUME };
 static const char* const kAppItems[] = { "Exit game", "Screenshot", "System", "Resume" };
-enum { SYS_BRIGHTNESS, SYS_PERF, SYS_CALIBRATE, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_BACK };
-static const char* const kSysItems[] = { NULL, "Overlay", "Calibrate stick", "Sleep", "Reboot", "Shut down", "Back" };
+enum { SYS_SETTINGS, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_BACK };
+static const char* const kSysItems[] = { "Settings", "Sleep", "Reboot", "Shut down", "Back" };
+enum { SET_BRIGHTNESS, SET_PERF, SET_CALIBRATE, SET_USB, SET_BACK };
+static const char* const kSetItems[] = { NULL, "Overlay", "Calibrate stick", "USB storage", "Back" };
+/* USB storage confirmation: two text rows (USB_TEXT_ROWS, not selectable), OK, Cancel */
+enum { USB_TEXT_ROWS = 2, USB_OK = 2, USB_CANCEL };
+static const char* const kUsbItems[] = { "USB storage mode", "reboots the device", "OK", "Cancel" };
+
+static const char* const* menu_items(void) {
+	return sMenuPage == 4 ? kUsbItems : sMenuPage == 3 ? kSetItems : sMenuPage == 1 ? kSysItems : kAppItems;
+}
 
 static int menu_count(void) {
-	return sMenuPage ? 7 : 4;
+	return sMenuPage == 0 || sMenuPage == 4 ? 4 : 5;
+}
+
+/* The row B returns from (its glyph is drawn there) */
+static int menu_back_row(void) {
+	return sMenuPage == 4 ? USB_CANCEL : sMenuPage == 3 ? SET_BACK : sMenuPage == 1 ? SYS_BACK : APP_RESUME;
 }
 
 static int on_brightness_row(void) {
-	return sMenuPage == 1 && sMenuSel == SYS_BRIGHTNESS;
+	return sMenuPage == 3 && sMenuSel == SET_BRIGHTNESS;
 }
 
 static int brightness_min(void);
@@ -476,24 +491,15 @@ static void draw_brightness_row(int y, int selected) {
 	}
 }
 
-/* A face button, 14x14 at 1x: a round button, the letter (6x8) cut in dark */
-static const char* const kButton[14] = {
-	"....######....", "..##########..", ".############.", ".############.", "##############",
-	"##############", "##############", "##############", "##############", "##############",
-	".############.", ".############.", "..##########..", "....######....",
-};
-static const char* const kLetterB[8] = { "#####.", "##..##", "##..##", "#####.", "##..##", "##..##", "##..##", "#####." };
+static void blend(int x, int y, uint32_t rgb, float a);
 
+/* A face button (osd_button.h): the anti-aliased disc, the letter cut in dark */
 static void draw_button(int x0, int y0, const char* const* letter) {
 	int x, y;
 
-	for (y = 0; y < 14; y++) {
-		for (x = 0; x < 14; x++) {
-			if (kButton[y][x] == '#') {
-				int lx = x - 4, ly = y - 3; // the letter's cell
-				int cut = lx >= 0 && lx < 6 && ly >= 0 && ly < 8 && letter[ly][lx] == '#';
-				put(x0 + x, y0 + y, argb(cut ? 0x101018 : 0xc8c8c8, 1.0f));
-			}
+	for (y = 0; y < BUTTON_SIZE; y++) {
+		for (x = 0; x < BUTTON_SIZE; x++) {
+			blend(x0 + x, y0 + y, button_letter(letter, x, y) ? BUTTON_DARK : BUTTON_LIGHT, button_coverage(x, y));
 		}
 	}
 }
@@ -506,7 +512,7 @@ static int menu_row_y(int i) {
 }
 
 static void draw_menu(void) {
-	const char* const* items = sMenuPage ? kSysItems : kAppItems;
+	const char* const* items = menu_items();
 	const int rowH = MENU_ROW_H, count = menu_count(), h = count * rowH + 2 * MENU_PAD;
 	const int y0 = (PANEL_W - h) / 2, top = y0 + MENU_PAD;
 	int i, capacity, charging;
@@ -530,18 +536,19 @@ static void draw_menu(void) {
 			char label[32];
 			int len, x;
 
-			if (sMenuPage && i == SYS_PERF) {
+			if (sMenuPage == 3 && i == SET_PERF) {
 				static const char* const modes[] = { "Off", "Full", "FPS" };
 				snprintf(label, sizeof(label), "%s: %s", items[i], modes[sPerf]);
-			} else if (sMenuPage && i == SYS_BACK && sMenuLauncher) {
+			} else if (sMenuPage == 1 && i == SYS_BACK && sMenuLauncher) {
 				snprintf(label, sizeof(label), "Close");
 			} else {
 				snprintf(label, sizeof(label), "%s", items[i]);
 			}
 			len = (int)strlen(label);
 			x = MENU_X + (MENU_W - len * 8) / 2;
-			draw_text(label, x, y + (rowH - 16) / 2, 1, argb(0xffffff, 1.0f));
-			if (sMenuPage ? i == SYS_BACK : i == APP_RESUME) {
+			draw_text(label, x, y + (rowH - 16) / 2, 1,
+			          argb(sMenuPage == 4 && i < USB_TEXT_ROWS ? 0xc0c0c0 : 0xffffff, 1.0f));
+			if (i == menu_back_row()) {
 				draw_button(x - 6 - 14, y + (rowH - 14) / 2, kLetterB); // what B does
 			}
 		}
@@ -872,12 +879,6 @@ static void cal_mesh(uint32_t rgb, float a, uint32_t edgeRgb) {
 	}
 }
 
-/* The B/A/X buttons' letters, 6x8, for draw_button */
-static const char* const kLetterA[8] = { ".####.", "##..##", "##..##", "##..##", "######", "##..##", "##..##", "##..##" };
-static const char* const kLetterX[8] = { "##..##", "##..##", ".####.", "..##..", "..##..", ".####.", "##..##", "##..##" };
-
-static void draw_button(int x0, int y0, const char* const* letter);
-
 /* "[button] label" at (x, y); returns the x after it */
 static int cal_hint(int x, int y, const char* const* letter, const char* label) {
 	draw_button(x, y + 1, letter);
@@ -1137,7 +1138,7 @@ static void cal_close(int save) {
 		fclose(sCal.log);
 		sCal.log = NULL;
 	}
-	sMenuPage = 1;
+	sMenuPage = 3; // back to Settings
 }
 
 static void cal_input(const struct input_event* ev) {
@@ -1468,6 +1469,19 @@ static void run_system(const char* cmd) {
 	}
 }
 
+/* The marker s30-loader looks for at the next boot (see USB_MODE_FLAG there) */
+static int usb_mode_flag(void) {
+	int fd = open("/mnt/sd/boot/usb-mode", O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+
+	if (fd < 0) {
+		fprintf(stderr, "s30-display: usb-mode flag: %s\n", strerror(errno));
+		return -1;
+	}
+	close(fd);
+	sync();
+	return 0;
+}
+
 /* s2idle until a wakeup source (the power key) fires. The menu is cleared
    first so the panel doesn't come back showing it; the app is still stopped
    and resumes when the menu closes after waking. */
@@ -1496,10 +1510,19 @@ static void menu_redraw(void) {
 
 static void perf_save(void);
 
-/* B, or the system page's last row: the app page, or out of the menu */
+/* B, or a page's last row: settings to the system page, that to the app
+   page (over an app), else out of the menu */
 static void menu_back(void) {
 	sRepeatDir = 0;
-	if (sMenuPage && !sMenuLauncher) {
+	if (sMenuPage == 4) {
+		sMenuPage = 3;
+		sMenuSel = SET_USB;
+		menu_redraw();
+	} else if (sMenuPage == 3) {
+		sMenuPage = 1;
+		sMenuSel = SYS_SETTINGS;
+		menu_redraw();
+	} else if (sMenuPage == 1 && !sMenuLauncher) {
 		sMenuPage = 0;
 		sMenuSel = APP_SYSTEM;
 		menu_redraw();
@@ -1512,7 +1535,7 @@ static void menu_confirm(void) {
 	if (!sMenuPage) {
 		if (sMenuSel == APP_SYSTEM) {
 			sMenuPage = 1;
-			sMenuSel = SYS_BRIGHTNESS;
+			sMenuSel = SYS_SETTINGS;
 			menu_redraw();
 		} else if (sMenuSel == APP_SCREENSHOT) {
 			take_screenshot();
@@ -1522,25 +1545,55 @@ static void menu_confirm(void) {
 		}
 		return;
 	}
+	if (sMenuPage == 4) {
+		// Reboot into the loader's USB disk mode (as holding SELECT at power
+		// on): the card can't be exported live, the root squashfs is
+		// loop-mounted from it
+		if (sMenuSel == USB_OK && usb_mode_flag() == 0) {
+			menu_close(0);
+			run_system("reboot");
+		} else {
+			menu_back();
+		}
+		return;
+	}
+	if (sMenuPage == 1) {
+		switch (sMenuSel) {
+			case SYS_SETTINGS:
+				sMenuPage = 3;
+				sMenuSel = SET_BRIGHTNESS;
+				menu_redraw();
+				break;
+			case SYS_SLEEP:
+				system_sleep();
+				menu_close(0);
+				break;
+			case SYS_REBOOT:
+			case SYS_POWEROFF:
+				menu_close(0); // the app runs again, so init's SIGTERM reaches it
+				run_system(sMenuSel == SYS_REBOOT ? "reboot" : "poweroff");
+				break;
+			case SYS_BACK:
+				menu_back();
+				break;
+		}
+		return;
+	}
 	switch (sMenuSel) {
-		case SYS_PERF:
+		case SET_PERF:
 			sPerf = (sPerf + 1) % PERF_MODES;
 			perf_save();
 			menu_redraw();
 			break;
-		case SYS_CALIBRATE:
+		case SET_CALIBRATE:
 			cal_open(); // drawn by cal_frame
 			break;
-		case SYS_SLEEP:
-			system_sleep();
-			menu_close(0);
+		case SET_USB:
+			sMenuPage = 4; // confirm first: it reboots
+			sMenuSel = USB_CANCEL;
+			menu_redraw();
 			break;
-		case SYS_REBOOT:
-		case SYS_POWEROFF:
-			menu_close(0); // the app runs again, so init's SIGTERM reaches it
-			run_system(sMenuSel == SYS_REBOOT ? "reboot" : "poweroff");
-			break;
-		case SYS_BACK:
+		case SET_BACK:
 			menu_back();
 			break;
 	} // the brightness slider: left/right only
@@ -1704,6 +1757,9 @@ static void menu_input(void) {
 			case BTN_DPAD_UP:
 			case BTN_DPAD_DOWN:
 				sMenuSel = (sMenuSel + (ev[i].code == BTN_DPAD_UP ? menu_count() - 1 : 1)) % menu_count();
+				if (sMenuPage == 4 && sMenuSel < USB_TEXT_ROWS) {
+					sMenuSel = ev[i].code == BTN_DPAD_UP ? USB_CANCEL : USB_OK; // over the text
+				}
 				sRepeatDir = 0;
 				redraw = 1;
 				break;

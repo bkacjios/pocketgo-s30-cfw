@@ -4,13 +4,21 @@
  *
  * Based on the stock-firmware filebrowser by Bkacjios, ported to the
  * mainline system: SDL2 on KMS (the screen is drawn landscape and rotated
- * onto the portrait panel), the gamepad read straight from evdev, Ozone fonts
- * from retroarch-assets (ui.c).
+ * onto the portrait panel), the gamepad read straight from evdev, text in
+ * the system menu's font (ui.c).
  *
- * Opens /mnt/sd/apps (or argv[1]). D-pad/stick: move, A: open/run, B: parent
- * folder. Folders open; *.sh files run with /bin/sh; ELF binaries run
- * directly (on exFAT every file looks executable, so the file type decides).
- * While an app runs the launcher releases the display and waits for it.
+ * Opens /mnt/sd/apps (or argv[1]) as a grid of tiles. D-pad/stick: move,
+ * A: open/run, B: parent folder. Folders open; *.sh files run with /bin/sh;
+ * ELF binaries run directly (on exFAT every file looks executable, so the
+ * file type decides). While an app runs the launcher releases the display
+ * and waits for it.
+ *
+ * Icons: an image next to an entry with the same name (Ocarina of Time.png
+ * for Ocarina of Time.sh, Folder.png for Folder/) is its tile and is not
+ * listed itself. Other images (png, jpg, bmp) are listed as thumbnails and
+ * open in the viewer: left/right step through the folder's images, B goes
+ * back. The start folder gets a Screenshots entry for /mnt/sd/screenshots
+ * (where the system menu's Screenshot saves).
  */
 #include <dirent.h>
 #include <errno.h>
@@ -34,48 +42,169 @@
 
 #define SCRW UI_W
 #define SCRH UI_H
-#define ROW_H 22
-#define LIST_Y 36
-#define VISIBLE_ROWS ((SCRH - LIST_Y - 8) / ROW_H)
 
 #define DEFAULT_DIR "/mnt/sd/apps"
+#define SHOTS_DIR "/mnt/sd/screenshots"
+
+/* Grid: 4 x 2 tiles under the header, the footer below */
+#define HEADER_H 34
+#define FOOTER_Y (SCRH - 22)
+#define COLS 4
+#define ROWS 2
+#define TILE_W 104
+#define TILE_H 116
+#define PITCH_X 112
+#define PITCH_Y 124
+#define GRID_X ((SCRW - (COLS * PITCH_X - (PITCH_X - TILE_W))) / 2)
+#define GRID_Y 40
+#define ICON_BOX 72  // the icon's square inside a tile (thumbnails: the tile's width)
+#define LABEL_COLS ((TILE_W - 8) / UI_CHAR_W) // label lines of 12 characters
+#define THUMB_DIM 160 // thumbnails are decoded to at most this (2x the box)
+#define LOADS_PER_FRAME 2
+
+static const SDL_Color kBgTop = { 34, 30, 64, 255 };
+static const SDL_Color kBgBottom = { 4, 4, 10, 255 };
+static const SDL_Color kTile = { 32, 30, 52, 255 };
+static const SDL_Color kTileEdge = { 60, 56, 90, 255 };
+static const SDL_Color kSelected = { 0x80, 0x60, 0xe0, 110 }; // as the overlay menus
+static const SDL_Color kSelectedEdge = { 0x80, 0x60, 0xe0, 255 };
+static const SDL_Color kLine = { 70, 64, 110, 255 };
 
 /* ---------------------------------------------------------------------------
  * Directory listing
  * ------------------------------------------------------------------------- */
 
+typedef enum { K_DIR, K_APP, K_IMAGE, K_FILE } Kind;
+
 typedef struct {
-    char* name;
-    bool isDir;
+    char* name;     // as listed
+    char* path;     // full path
+    char* iconPath; // image shown on the tile (images: the file itself), or NULL
+    Kind kind;
+    SDL_Texture* icon;
+    int iconW, iconH;
+    bool iconTried;
 } Entry;
 
 static struct {
     char path[PATH_MAX];
     Entry* entries;
-    int count;
+    int count, cap;
     int selected;
-    int scroll;
+    int scroll; // first visible row
 } sDir;
+
+static char sStartDir[PATH_MAX];
+
+static const char* extension(const char* name) {
+    const char* dot = strrchr(name, '.');
+    return dot != NULL && dot != name ? dot : "";
+}
+
+static bool is_image_name(const char* name) {
+    const char* ext = extension(name);
+    return strcasecmp(ext, ".png") == 0 || strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0 ||
+           strcasecmp(ext, ".bmp") == 0;
+}
+
+/* Name without the extension, for matching icons to entries and for labels */
+static void stem(const Entry* e, char* out, size_t size) {
+    size_t n = strlen(e->name);
+
+    if (e->kind != K_DIR) {
+        n -= strlen(extension(e->name));
+    }
+    snprintf(out, size, "%.*s", (int)(n < size ? n : size - 1), e->name);
+}
 
 static int entry_cmp(const void* a, const void* b) {
     const Entry* ea = a;
     const Entry* eb = b;
 
-    if (ea->isDir != eb->isDir) {
-        return eb->isDir - ea->isDir; // folders first
+    if ((ea->kind == K_DIR) != (eb->kind == K_DIR)) {
+        return (eb->kind == K_DIR) - (ea->kind == K_DIR); // folders first
     }
     return strcasecmp(ea->name, eb->name);
+}
+
+static void entry_free(Entry* e) {
+    SDL_DestroyTexture(e->icon);
+    free(e->name);
+    free(e->path);
+    free(e->iconPath);
+    memset(e, 0, sizeof(*e));
 }
 
 static void dir_free(void) {
     int i;
 
     for (i = 0; i < sDir.count; i++) {
-        free(sDir.entries[i].name);
+        entry_free(&sDir.entries[i]);
     }
     free(sDir.entries);
     sDir.entries = NULL;
     sDir.count = 0;
+    sDir.cap = 0;
+}
+
+static Entry* entry_add(const char* name, const char* path, Kind kind) {
+    Entry* e;
+
+    if (sDir.count == sDir.cap) {
+        sDir.cap = sDir.cap ? sDir.cap * 2 : 32;
+        sDir.entries = realloc(sDir.entries, sDir.cap * sizeof(Entry));
+    }
+    e = &sDir.entries[sDir.count++];
+    memset(e, 0, sizeof(*e));
+    e->name = strdup(name);
+    e->path = strdup(path);
+    e->kind = kind;
+    return e;
+}
+
+/* Images named like another entry become its icon and leave the list */
+static void attach_icons(void) {
+    int i, j, n = 0;
+
+    for (i = 0; i < sDir.count; i++) {
+        Entry* img = &sDir.entries[i];
+        char s[NAME_MAX + 1];
+        bool used = false;
+
+        if (img->kind != K_IMAGE) {
+            continue;
+        }
+        stem(img, s, sizeof(s));
+        for (j = 0; j < sDir.count && !used; j++) {
+            Entry* e = &sDir.entries[j];
+            char t[NAME_MAX + 1];
+
+            if (e->name == NULL || e->kind == K_IMAGE || e->iconPath != NULL) {
+                continue; // dropped, an image, or has its icon
+            }
+            stem(e, t, sizeof(t));
+            if (strcasecmp(s, t) == 0) {
+                e->iconPath = img->path;
+                img->path = NULL;
+                used = true;
+            }
+        }
+        if (used) {
+            entry_free(img); // name NULL: dropped below
+        }
+    }
+    for (i = 0; i < sDir.count; i++) {
+        if (sDir.entries[i].name != NULL) {
+            sDir.entries[n++] = sDir.entries[i];
+        }
+    }
+    sDir.count = n;
+    for (i = 0; i < sDir.count; i++) {
+        Entry* e = &sDir.entries[i];
+        if (e->kind == K_IMAGE) {
+            e->iconPath = strdup(e->path);
+        }
+    }
 }
 
 /* Opens a folder; selects `select` if given (e.g. the folder we came from) */
@@ -83,7 +212,8 @@ static void dir_open(const char* path, const char* select) {
     char resolved[PATH_MAX];
     DIR* d;
     struct dirent* de;
-    int cap = 0, i;
+    struct stat st;
+    int i;
 
     if (realpath(path, resolved) == NULL || (d = opendir(resolved)) == NULL) {
         return;
@@ -92,7 +222,7 @@ static void dir_open(const char* path, const char* select) {
     snprintf(sDir.path, sizeof(sDir.path), "%s", resolved);
     while ((de = readdir(d)) != NULL) {
         char full[PATH_MAX];
-        struct stat st;
+        Kind kind;
 
         if (de->d_name[0] == '.') {
             continue; // hidden, ".", ".."
@@ -101,16 +231,21 @@ static void dir_open(const char* path, const char* select) {
         if (stat(full, &st) != 0) {
             continue;
         }
-        if (sDir.count == cap) {
-            cap = cap ? cap * 2 : 32;
-            sDir.entries = realloc(sDir.entries, cap * sizeof(Entry));
-        }
-        sDir.entries[sDir.count].name = strdup(de->d_name);
-        sDir.entries[sDir.count].isDir = S_ISDIR(st.st_mode);
-        sDir.count++;
+        kind = S_ISDIR(st.st_mode)                            ? K_DIR
+               : strcasecmp(extension(de->d_name), ".sh") == 0 ? K_APP
+               : is_image_name(de->d_name)                     ? K_IMAGE
+                                                               : K_FILE;
+        entry_add(de->d_name, full, kind);
     }
     closedir(d);
+    attach_icons();
     qsort(sDir.entries, sDir.count, sizeof(Entry), entry_cmp);
+    if (strcmp(resolved, sStartDir) == 0 && strcmp(resolved, SHOTS_DIR) != 0 && stat(SHOTS_DIR, &st) == 0 &&
+        S_ISDIR(st.st_mode)) {
+        Entry e = *entry_add("Screenshots", SHOTS_DIR, K_DIR);
+        memmove(&sDir.entries[1], &sDir.entries[0], (sDir.count - 1) * sizeof(Entry));
+        sDir.entries[0] = e;
+    }
     sDir.selected = 0;
     sDir.scroll = 0;
     for (i = 0; select != NULL && i < sDir.count; i++) {
@@ -126,6 +261,10 @@ static void dir_parent(void) {
     if (strcmp(sDir.path, "/") == 0) {
         return;
     }
+    if (strcmp(sDir.path, SHOTS_DIR) == 0 && strcmp(sStartDir, SHOTS_DIR) != 0) {
+        dir_open(sStartDir, "Screenshots"); // back to where its entry is
+        return;
+    }
     snprintf(cur, sizeof(cur), "%s", sDir.path);
     snprintf(name, sizeof(name), "%s", basename(cur));
     snprintf(cur, sizeof(cur), "%s", sDir.path);
@@ -137,19 +276,17 @@ static void dir_parent(void) {
  * Gamepad and display (ui.c)
  * ------------------------------------------------------------------------- */
 
-enum { IN_UP, IN_DOWN, IN_A, IN_B, IN_COUNT };
-static const int sPadCodes[IN_COUNT] = { BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_EAST, BTN_SOUTH };
+enum { IN_UP, IN_DOWN, IN_LEFT, IN_RIGHT, IN_A, IN_B, IN_COUNT };
+static const int sPadCodes[IN_COUNT] = { BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT, BTN_EAST, BTN_SOUTH };
 static int sPadFd = -1;
-static bool sHeld[IN_COUNT];
-static int sAxisY, sAxisYCentre;
+static bool sHeld[IN_COUNT], sPressed[IN_COUNT]; // pressed: since the last poll
+static int sAxisX, sAxisY, sAxisXCentre, sAxisYCentre;
 
 /* Drops input that built up while an app ran */
 static void pad_flush(void) {
-    int x = 0;
-
-    ui_pad_poll(sPadFd, sHeld, sPadCodes, IN_COUNT);
+    ui_pad_poll(sPadFd, sHeld, NULL, sPadCodes, IN_COUNT);
     memset(sHeld, 0, sizeof(sHeld));
-    ui_pad_axes(sPadFd, &x, &sAxisY);
+    ui_pad_axes(sPadFd, &sAxisX, &sAxisY);
 }
 
 /* Battery percentage from the AXP fuel gauge, -1 if none; *charging set
@@ -196,15 +333,10 @@ static void draw_battery(int right, int cy, int pct, bool charging) {
     int len, i, j;
 
     pct = pct > 100 ? 100 : pct;
-    SDL_Rect body = { x, y, bw, bh }, inner = { x + 1, y + 1, bw - 2, bh - 2 };
-    SDL_Rect fill = { x + 2, y + 2, (bw - 4) * pct / 100, bh - 4 }, nub = { x + bw, y + 5, 3, bh - 10 };
-    SDL_SetRenderDrawColor(gUiRenderer, 200, 200, 200, 255);
-    SDL_RenderFillRect(gUiRenderer, &body);
-    SDL_RenderFillRect(gUiRenderer, &nub);
-    SDL_SetRenderDrawColor(gUiRenderer, 30, 30, 30, 255);
-    SDL_RenderFillRect(gUiRenderer, &inner);
-    SDL_SetRenderDrawColor(gUiRenderer, c.r, c.g, c.b, 255);
-    SDL_RenderFillRect(gUiRenderer, &fill);
+    ui_fill((SDL_Rect){ x, y, bw, bh }, (SDL_Color){ 200, 200, 200, 255 });
+    ui_fill((SDL_Rect){ x + bw, y + 5, 3, bh - 10 }, (SDL_Color){ 200, 200, 200, 255 });
+    ui_fill((SDL_Rect){ x + 1, y + 1, bw - 2, bh - 2 }, (SDL_Color){ 30, 30, 30, 255 });
+    ui_fill((SDL_Rect){ x + 2, y + 2, (bw - 4) * pct / 100, bh - 4 }, c);
 
     // Percentage inside, shadowed (the digits are font rows 2-11: centred)
     len = snprintf(text, sizeof(text), "%d%%", pct);
@@ -212,55 +344,266 @@ static void draw_battery(int right, int cy, int pct, bool charging) {
     ui_text(text, UI_TEXT, x + (bw - len * 8) / 2, y + bh / 2 - 7, bw);
 
     if (charging) {
-        SDL_SetRenderDrawColor(gUiRenderer, 255, 255, 255, 255);
         for (j = 0; j < 7; j++) {
             for (i = 0; i < 5; i++) {
                 if (bolt[j][i] == '#') {
-                    SDL_Rect r = { x - 14 + i * 2, y + 2 + j * 2, 2, 2 };
-                    SDL_RenderFillRect(gUiRenderer, &r);
+                    ui_fill((SDL_Rect){ x - 14 + i * 2, y + 2 + j * 2, 2, 2 }, UI_TEXT);
                 }
             }
         }
     }
 }
 
-static void render(void) {
-    bool charging;
-    int pct = battery(&charging);
+/* Built-in icons, drawn into `box` */
+static void draw_default_icon(const Entry* e, SDL_Rect box, bool selected) {
+    const SDL_Color body = selected ? (SDL_Color){ 230, 225, 255, 255 } : (SDL_Color){ 170, 160, 220, 255 };
+    const SDL_Color shade = selected ? (SDL_Color){ 180, 170, 240, 255 } : (SDL_Color){ 120, 110, 170, 255 };
+    const int x = box.x, y = box.y, w = box.w, h = box.h;
     int i;
 
-    ui_begin();
-
-    // Header: current folder, battery
-    ui_text(sDir.path, UI_ACCENT, 10, 8, SCRW - 90);
-    if (pct >= 0) {
-        draw_battery(SCRW - 10, 16, pct, charging);
-    }
-    SDL_SetRenderDrawColor(gUiRenderer, 60, 60, 60, 255);
-    SDL_RenderDrawLine(gUiRenderer, 8, LIST_Y - 6, SCRW - 8, LIST_Y - 6);
-
-    // List, scrolled to keep the selection visible
-    if (sDir.selected < sDir.scroll) {
-        sDir.scroll = sDir.selected;
-    } else if (sDir.selected >= sDir.scroll + VISIBLE_ROWS) {
-        sDir.scroll = sDir.selected - VISIBLE_ROWS + 1;
-    }
-    if (sDir.count == 0) {
-        ui_text("(empty)", UI_DIM, 18, LIST_Y + 2, SCRW - 36);
-    }
-    for (i = sDir.scroll; i < sDir.count && i < sDir.scroll + VISIBLE_ROWS; i++) {
-        int y = LIST_Y + (i - sDir.scroll) * ROW_H;
-        char label[PATH_MAX + 2];
-
-        if (i == sDir.selected) {
-            SDL_Rect bar = { 8, y - 1, SCRW - 16, ROW_H };
-            SDL_SetRenderDrawColor(gUiRenderer, 0x80, 0x60, 0xe0, 255); // as the overlay menus
-            SDL_RenderFillRect(gUiRenderer, &bar);
+    switch (e->kind) {
+    case K_DIR: // folder: tab, back, front
+        ui_fill((SDL_Rect){ x + w / 8, y + h / 5, w / 3, h / 8 }, shade);
+        ui_fill((SDL_Rect){ x + w / 8, y + h / 5 + h / 8, w * 3 / 4, h / 2 }, shade);
+        ui_fill((SDL_Rect){ x + w / 8 + 2, y + h / 5 + h / 8 + h / 10, w * 3 / 4, h / 2 - h / 10 }, body);
+        if (strcmp(e->path, SHOTS_DIR) == 0) { // a small picture on the front
+            ui_fill((SDL_Rect){ x + w / 2 - w / 8, y + h / 2 - h / 12, w / 4, h / 5 }, (SDL_Color){ 60, 50, 90, 255 });
+            ui_fill((SDL_Rect){ x + w / 2 - w / 8 + 2, y + h / 2 - h / 12 + 2, w / 4 - 4, h / 5 - 4 },
+                    (SDL_Color){ 120, 200, 240, 255 });
         }
-        snprintf(label, sizeof(label), "%s%s", sDir.entries[i].name, sDir.entries[i].isDir ? "/" : "");
-        ui_text(label, i == sDir.selected ? UI_TEXT : sDir.entries[i].isDir ? UI_DIM : UI_TEXT,
-                18, y + 2, SCRW - 36);
+        break;
+    case K_APP: // play triangle in a tile
+        ui_fill((SDL_Rect){ x + w / 6, y + h / 6, w * 2 / 3, h * 2 / 3 }, shade);
+        for (i = 0; i < h / 3; i++) {
+            int half = i < h / 6 ? i : h / 3 - 1 - i;
+            ui_fill((SDL_Rect){ x + w / 2 - w / 8, y + h / 3 + i, half * 4 / 3 + 1, 1 }, body);
+        }
+        break;
+    default: // a sheet with a folded corner
+        ui_fill((SDL_Rect){ x + w / 4, y + h / 6, w / 2, h * 2 / 3 }, body);
+        ui_fill((SDL_Rect){ x + w * 3 / 4 - w / 6, y + h / 6, w / 6, h / 6 }, shade);
+        for (i = 0; i < 3; i++) {
+            ui_fill((SDL_Rect){ x + w / 4 + 6, y + h / 2 - 4 + i * 8, w / 2 - 12, 2 }, shade);
+        }
+        break;
     }
+}
+
+/* Decodes up to LOADS_PER_FRAME missing icons among the visible tiles; true
+   while more are left (render again) */
+static bool load_icons(int first, int last) {
+    int i, loads = 0;
+
+    for (i = first; i <= last && i < sDir.count; i++) {
+        Entry* e = &sDir.entries[i];
+
+        if (e->iconTried || e->iconPath == NULL) {
+            continue;
+        }
+        if (loads == LOADS_PER_FRAME) {
+            return true;
+        }
+        e->icon = ui_image_load(e->iconPath, THUMB_DIM, &e->iconW, &e->iconH);
+        e->iconTried = true;
+        loads++;
+    }
+    return false;
+}
+
+/* Label on up to two lines, broken at a space where possible */
+static void draw_label(const char* text, SDL_Color color, int x, int y) {
+    char line[LABEL_COLS + 1];
+    int len = (int)strlen(text), n = len, i;
+
+    if (len > LABEL_COLS) {
+        n = 0;
+        for (i = 1; i <= LABEL_COLS && text[i] != '\0'; i++) {
+            if (text[i] == ' ') {
+                n = i;
+            }
+        }
+        if (n == 0) {
+            n = LABEL_COLS;
+        }
+    }
+    snprintf(line, sizeof(line), "%.*s", n, text);
+    ui_text(line, color, x + (TILE_W - n * UI_CHAR_W) / 2, y, TILE_W);
+    if (n < len) {
+        const char* rest = text + n + (text[n] == ' ');
+        int m = (int)strlen(rest) < LABEL_COLS ? (int)strlen(rest) : LABEL_COLS;
+        snprintf(line, sizeof(line), "%.*s", m, rest);
+        ui_text(line, color, x + (TILE_W - m * UI_CHAR_W) / 2, y + UI_CHAR_H, TILE_W);
+    }
+}
+
+static void draw_tile(const Entry* e, int x, int y, bool selected) {
+    const SDL_Rect tile = { x, y, TILE_W, TILE_H };
+    const SDL_Rect iconBox = e->kind == K_IMAGE ? (SDL_Rect){ x + 4, y + 6, TILE_W - 8, ICON_BOX }
+                                                : (SDL_Rect){ x + (TILE_W - ICON_BOX) / 2, y + 6, ICON_BOX, ICON_BOX };
+    char label[NAME_MAX + 1];
+
+    ui_fill(tile, kTile);
+    if (selected) {
+        ui_fill(tile, kSelected);
+        ui_box(tile, kSelectedEdge, 2);
+    } else {
+        ui_box(tile, kTileEdge, 1);
+    }
+    if (e->icon != NULL) {
+        ui_image_fit(e->icon, e->iconW, e->iconH, iconBox);
+    } else {
+        draw_default_icon(e, iconBox, selected);
+    }
+    stem(e, label, sizeof(label));
+    draw_label(label, selected ? UI_TEXT : UI_DIM, x, y + ICON_BOX + 12);
+}
+
+static void draw_header(const char* title) {
+    bool charging;
+    int pct = battery(&charging);
+
+    ui_text(title, UI_ACCENT, 12, (HEADER_H - UI_CHAR_H) / 2, SCRW - 90);
+    if (pct >= 0) {
+        draw_battery(SCRW - 10, HEADER_H / 2, pct, charging);
+    }
+    ui_fill((SDL_Rect){ 8, HEADER_H - 1, SCRW - 16, 1 }, kLine);
+}
+
+/* "(A) action   (B) Back" at the left, `name` right-aligned */
+static void draw_footer(const char* action, const char* name) {
+    const int ty = FOOTER_Y + 3, by = FOOTER_Y + 4;
+    int x = 12;
+
+    ui_fill((SDL_Rect){ 8, FOOTER_Y - 2, SCRW - 16, 1 }, kLine);
+    if (action != NULL) {
+        ui_button(kLetterA, x, by);
+        x += BUTTON_SIZE + 5;
+        ui_text(action, UI_DIM, x, ty, SCRW);
+        x += ui_text_width(action) + 14;
+    }
+    ui_button(kLetterB, x, by);
+    x += BUTTON_SIZE + 5;
+    ui_text("Back", UI_DIM, x, ty, SCRW);
+    x += ui_text_width("Back") + 16;
+    if (name != NULL) {
+        int w = ui_text_width(name), max = SCRW - 12 - x;
+        if (w > max) {
+            w = max;
+        }
+        ui_text(name, UI_TEXT, SCRW - 12 - w, ty, w);
+    }
+}
+
+static void render_grid(void) {
+    const int rows = (sDir.count + COLS - 1) / COLS;
+    char title[PATH_MAX];
+    const char* name = NULL;
+    int row = sDir.selected / COLS, first, last, i;
+    bool more;
+
+    // Keep the selected row visible
+    if (row < sDir.scroll) {
+        sDir.scroll = row;
+    } else if (row >= sDir.scroll + ROWS) {
+        sDir.scroll = row - ROWS + 1;
+    }
+    first = sDir.scroll * COLS;
+    last = first + COLS * ROWS - 1;
+    more = load_icons(first, last);
+
+    ui_begin();
+    ui_gradient((SDL_Rect){ 0, 0, SCRW, SCRH }, kBgTop, kBgBottom);
+    snprintf(title, sizeof(title), "%s", sDir.path);
+    draw_header(strcmp(sDir.path, sStartDir) == 0 ? "PocketGo S30" : basename(title));
+
+    if (sDir.count == 0) {
+        ui_text("(empty)", UI_DIM, GRID_X, GRID_Y + 4, SCRW);
+    }
+    for (i = first; i <= last && i < sDir.count; i++) {
+        int c = (i - first) % COLS, r = (i - first) / COLS;
+        draw_tile(&sDir.entries[i], GRID_X + c * PITCH_X, GRID_Y + r * PITCH_Y, i == sDir.selected);
+    }
+    if (rows > ROWS) { // scroll bar at the right edge
+        int track = ROWS * PITCH_Y - (PITCH_Y - TILE_H), th = track * ROWS / rows, ty = track * sDir.scroll / rows;
+        ui_fill((SDL_Rect){ SCRW - 8, GRID_Y, 3, track }, kTile);
+        ui_fill((SDL_Rect){ SCRW - 8, GRID_Y + ty, 3, th }, kSelectedEdge);
+    }
+    if (sDir.count > 0) {
+        name = sDir.entries[sDir.selected].name;
+    }
+    draw_footer(sDir.count == 0                               ? NULL
+                : sDir.entries[sDir.selected].kind == K_DIR   ? "Open"
+                : sDir.entries[sDir.selected].kind == K_IMAGE ? "View"
+                                                              : "Run",
+                name);
+    ui_present();
+    if (more) {
+        render_grid();
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Image viewer
+ * ------------------------------------------------------------------------- */
+
+#define VIEW_DIM 960 // pictures larger than this are downsampled
+
+static struct {
+    bool open;
+    SDL_Texture* tex;
+    int w, h;
+} sView;
+
+static void view_close(void) {
+    SDL_DestroyTexture(sView.tex);
+    sView.tex = NULL;
+    sView.open = false;
+}
+
+static void view_open(void) {
+    const Entry* e = &sDir.entries[sDir.selected];
+
+    view_close();
+    sView.tex = ui_image_load(e->path, VIEW_DIM, &sView.w, &sView.h);
+    sView.open = true;
+}
+
+/* The next image entry in `dir` (+1 / -1), or -1 */
+static int view_step(int dir) {
+    int i;
+
+    for (i = sDir.selected + dir; i >= 0 && i < sDir.count; i += dir) {
+        if (sDir.entries[i].kind == K_IMAGE) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void render_view(void) {
+    const Entry* e = &sDir.entries[sDir.selected];
+    char pos[32];
+    int i, n = 0, at = 0;
+
+    for (i = 0; i < sDir.count; i++) {
+        if (sDir.entries[i].kind == K_IMAGE) {
+            n++;
+            if (i == sDir.selected) {
+                at = n;
+            }
+        }
+    }
+    ui_begin();
+    if (sView.tex != NULL) {
+        ui_image_fit(sView.tex, sView.w, sView.h, (SDL_Rect){ 0, 0, SCRW, SCRH });
+    } else {
+        ui_text("Can't open this picture", UI_DIM, 12, SCRH / 2 - 8, SCRW);
+    }
+    // Name and position in a translucent strip
+    ui_fill((SDL_Rect){ 0, SCRH - 22, SCRW, 22 }, (SDL_Color){ 0, 0, 0, 150 });
+    ui_text(e->name, UI_TEXT, 10, SCRH - 19, SCRW - 90);
+    snprintf(pos, sizeof(pos), "%d/%d", at, n);
+    ui_text(pos, UI_DIM, SCRW - 10 - ui_text_width(pos), SCRH - 19, 80);
     ui_present();
 }
 
@@ -313,6 +656,14 @@ static void run(const char* path) {
     if (!ui_video_open()) {
         exit(1); // init respawns the frontend
     }
+    // Textures died with the renderer: decode again on the next frame
+    {
+        int i;
+        for (i = 0; i < sDir.count; i++) {
+            sDir.entries[i].icon = NULL;
+            sDir.entries[i].iconTried = false;
+        }
+    }
     pad_flush();
 }
 
@@ -322,10 +673,27 @@ static void run(const char* path) {
 
 #define REPEAT_DELAY_MS 350
 #define REPEAT_RATE_MS 70
+#define STICK_DEAD 50
+
+/* One step in the grid: left/right by one, up/down by a row (clamped; the
+   last row reachable from above even when short) */
+static void grid_move(int dx, int dy) {
+    int s = sDir.selected + dx + dy * COLS;
+
+    if (sDir.count == 0) {
+        return;
+    }
+    if (dy > 0 && s >= sDir.count && sDir.selected / COLS < (sDir.count - 1) / COLS) {
+        s = sDir.count - 1;
+    }
+    if (s >= 0 && s < sDir.count) {
+        sDir.selected = s;
+    }
+}
 
 int main(int argc, char** argv) {
     Uint32 nextRepeat = 0, lastRender = 0;
-    int moveDir = 0;
+    int moveX = 0, moveY = 0;
     bool dirty = true, prevA = false, prevB = false;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -334,67 +702,97 @@ int main(int argc, char** argv) {
     }
     sPadFd = ui_pad_open();
     pad_flush();
+    sAxisXCentre = sAxisX;
     sAxisYCentre = sAxisY;
-    dir_open(argc > 1 ? argv[1] : DEFAULT_DIR, NULL);
+    if (realpath(argc > 1 ? argv[1] : DEFAULT_DIR, sStartDir) == NULL) {
+        snprintf(sStartDir, sizeof(sStartDir), "/");
+    }
+    dir_open(sStartDir, NULL);
     if (sDir.path[0] == 0) {
         dir_open("/", NULL);
     }
 
     for (;;) {
         Uint32 now = SDL_GetTicks();
-        int dir;
-        bool a, b;
+        int dx, dy;
+        bool a, b, repeat = false;
 
         {
-            int x = 0, y = sAxisY;
-            if (ui_pad_poll(sPadFd, sHeld, sPadCodes, IN_COUNT)) {
+            int x = sAxisX, y = sAxisY;
+            if (ui_pad_poll(sPadFd, sHeld, sPressed, sPadCodes, IN_COUNT)) {
                 dirty = true;
             }
-            ui_pad_axes(sPadFd, &x, &sAxisY);
-            if (y != sAxisY) {
+            ui_pad_axes(sPadFd, &sAxisX, &sAxisY);
+            if (x != sAxisX || y != sAxisY) {
                 dirty = true;
             }
         }
-        // Up/down from the D-pad or the stick (raw 0-255, up = low)
-        dir = sHeld[IN_UP] || sAxisY < sAxisYCentre - 50 ? -1 : sHeld[IN_DOWN] || sAxisY > sAxisYCentre + 50 ? 1 : 0;
-        a = sHeld[IN_A];
-        b = sHeld[IN_B];
-        if (dir != moveDir) {
-            moveDir = dir;
-            if (dir != 0 && sDir.count > 0) {
-                sDir.selected = (sDir.selected + dir + sDir.count) % sDir.count;
-                nextRepeat = now + REPEAT_DELAY_MS;
-                dirty = true;
-            }
-        } else if (dir != 0 && sDir.count > 0 && now >= nextRepeat) {
-            int s = sDir.selected + dir;
-            if (s >= 0 && s < sDir.count) { // repeat stops at the ends
-                sDir.selected = s;
-                dirty = true;
-            }
+        // Direction from the D-pad (a tap counts even if it was released
+        // within the poll interval) or the stick (raw 0-255, up/left = low)
+        dy = sHeld[IN_UP] || sPressed[IN_UP] || sAxisY < sAxisYCentre - STICK_DEAD           ? -1
+             : sHeld[IN_DOWN] || sPressed[IN_DOWN] || sAxisY > sAxisYCentre + STICK_DEAD     ? 1
+                                                                                             : 0;
+        dx = sHeld[IN_LEFT] || sPressed[IN_LEFT] || sAxisX < sAxisXCentre - STICK_DEAD       ? -1
+             : sHeld[IN_RIGHT] || sPressed[IN_RIGHT] || sAxisX > sAxisXCentre + STICK_DEAD   ? 1
+                                                                                             : 0;
+        if (dy != 0) {
+            dx = 0; // one axis at a time
+        }
+        a = sHeld[IN_A] || sPressed[IN_A];
+        b = sHeld[IN_B] || sPressed[IN_B];
+        if (dx != moveX || dy != moveY) {
+            moveX = dx;
+            moveY = dy;
+            nextRepeat = now + REPEAT_DELAY_MS;
+            repeat = dx != 0 || dy != 0;
+        } else if ((dx != 0 || dy != 0) && now >= nextRepeat) {
             nextRepeat = now + REPEAT_RATE_MS;
+            repeat = true;
         }
 
-        if (a && !prevA && sDir.count > 0) {
-            Entry* e = &sDir.entries[sDir.selected];
-            char path[PATH_MAX * 2];
-            snprintf(path, sizeof(path), "%s/%s", strcmp(sDir.path, "/") == 0 ? "" : sDir.path, e->name);
-            if (e->isDir) {
-                dir_open(path, NULL);
-            } else {
-                run(path);
-                a = b = false;
+        if (sView.open) {
+            if (repeat && dx != 0) {
+                int i = view_step(dx);
+                if (i >= 0) {
+                    sDir.selected = i;
+                    view_open();
+                    dirty = true;
+                }
             }
-            dirty = true;
-        } else if (b && !prevB) {
-            dir_parent();
-            dirty = true;
+            if (b && !prevB) {
+                view_close();
+                dirty = true;
+            }
+        } else {
+            if (repeat) {
+                grid_move(dx, dy);
+                dirty = true;
+            }
+            if (a && !prevA && sDir.count > 0) {
+                Entry* e = &sDir.entries[sDir.selected];
+                if (e->kind == K_DIR) {
+                    dir_open(e->path, NULL);
+                } else if (e->kind == K_IMAGE) {
+                    view_open();
+                } else {
+                    run(e->path);
+                    a = b = false;
+                }
+                dirty = true;
+            } else if (b && !prevB) {
+                dir_parent();
+                dirty = true;
+            }
         }
         prevA = a;
         prevB = b;
 
         if (dirty || now - lastRender > 2000) { // battery refresh
-            render();
+            if (sView.open) {
+                render_view();
+            } else {
+                render_grid();
+            }
             lastRender = now;
             dirty = false;
         }
