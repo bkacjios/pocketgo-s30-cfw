@@ -354,6 +354,39 @@ static void draw_battery(int right, int cy, int pct, bool charging) {
     }
 }
 
+/* A triangle, anti-aliased: each pixel blended by its coverage (4x4
+   samples against the three edges) */
+static void fill_triangle(float ax, float ay, float bx, float by, float cx, float cy, SDL_Color c) {
+    const float area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    const int x0 = (int)SDL_floorf(SDL_min(ax, SDL_min(bx, cx))), x1 = (int)SDL_ceilf(SDL_max(ax, SDL_max(bx, cx)));
+    const int y0 = (int)SDL_floorf(SDL_min(ay, SDL_min(by, cy))), y1 = (int)SDL_ceilf(SDL_max(ay, SDL_max(by, cy)));
+    int x, y, i, j;
+
+    if (area == 0.0f) {
+        return;
+    }
+    for (y = y0; y < y1; y++) {
+        for (x = x0; x < x1; x++) {
+            int hits = 0;
+
+            for (j = 0; j < 4; j++) {
+                for (i = 0; i < 4; i++) {
+                    float px = x + (i + 0.5f) / 4, py = y + (j + 0.5f) / 4;
+                    // Same side of all three edges as the triangle's winding
+                    float e0 = ((bx - ax) * (py - ay) - (by - ay) * (px - ax)) / area;
+                    float e1 = ((cx - bx) * (py - by) - (cy - by) * (px - bx)) / area;
+                    float e2 = ((ax - cx) * (py - cy) - (ay - cy) * (px - cx)) / area;
+
+                    hits += e0 >= 0 && e1 >= 0 && e2 >= 0;
+                }
+            }
+            if (hits != 0) {
+                ui_fill((SDL_Rect){ x, y, 1, 1 }, (SDL_Color){ c.r, c.g, c.b, (Uint8)(c.a * hits / 16) });
+            }
+        }
+    }
+}
+
 /* Built-in icons, drawn into `box` */
 static void draw_default_icon(const Entry* e, SDL_Rect box, bool selected) {
     const SDL_Color body = selected ? (SDL_Color){ 230, 225, 255, 255 } : (SDL_Color){ 170, 160, 220, 255 };
@@ -366,19 +399,26 @@ static void draw_default_icon(const Entry* e, SDL_Rect box, bool selected) {
         ui_fill((SDL_Rect){ x + w / 8, y + h / 5, w / 3, h / 8 }, shade);
         ui_fill((SDL_Rect){ x + w / 8, y + h / 5 + h / 8, w * 3 / 4, h / 2 }, shade);
         ui_fill((SDL_Rect){ x + w / 8 + 2, y + h / 5 + h / 8 + h / 10, w * 3 / 4, h / 2 - h / 10 }, body);
-        if (strcmp(e->path, SHOTS_DIR) == 0) { // a small picture on the front
-            ui_fill((SDL_Rect){ x + w / 2 - w / 8, y + h / 2 - h / 12, w / 4, h / 5 }, (SDL_Color){ 60, 50, 90, 255 });
-            ui_fill((SDL_Rect){ x + w / 2 - w / 8 + 2, y + h / 2 - h / 12 + 2, w / 4 - 4, h / 5 - 4 },
-                    (SDL_Color){ 120, 200, 240, 255 });
+        if (strcmp(e->path, SHOTS_DIR) == 0) { // a small picture on the front: mountains and a sun
+            const SDL_Color frame = { 60, 50, 90, 255 }, sky = { 95, 85, 145, 255 };
+            const int pw = w * 3 / 8, ph = h / 4, px = x + w / 8 + 2 + (w * 3 / 4 - pw) / 2,
+                      py = y + h / 5 + h / 8 + h / 10 + (h / 2 - h / 10 - ph) / 2;
+            const float bot = (float)(py + ph - 2);
+
+            ui_fill((SDL_Rect){ px, py, pw, ph }, frame);
+            ui_fill((SDL_Rect){ px + 2, py + 2, pw - 4, ph - 4 }, sky);
+            fill_triangle(px + 2, bot, px + pw * 0.42f, py + ph * 0.35f, px + pw * 0.75f, bot, body);
+            fill_triangle(px + pw * 0.45f, bot, px + pw * 0.7f, py + ph * 0.55f, px + pw - 2, bot, body);
+            ui_fill((SDL_Rect){ px + pw - 2 - pw / 5, py + 2 + ph / 8, pw / 8, pw / 8 }, body);
         }
         break;
-    case K_APP: // play triangle in a tile
+    case K_APP: { // play triangle in a tile, centred on its centroid
+        const float th = h / 3.0f, tw = th * 0.87f, left = x + w / 2.0f - tw / 3;
+
         ui_fill((SDL_Rect){ x + w / 6, y + h / 6, w * 2 / 3, h * 2 / 3 }, shade);
-        for (i = 0; i < h / 3; i++) {
-            int half = i < h / 6 ? i : h / 3 - 1 - i;
-            ui_fill((SDL_Rect){ x + w / 2 - w / 8, y + h / 3 + i, half * 4 / 3 + 1, 1 }, body);
-        }
+        fill_triangle(left, y + h / 3.0f, left + tw, y + h / 2.0f, left, y + h * 2 / 3.0f, body);
         break;
+    }
     default: // a sheet with a folded corner
         ui_fill((SDL_Rect){ x + w / 4, y + h / 6, w / 2, h * 2 / 3 }, body);
         ui_fill((SDL_Rect){ x + w * 3 / 4 - w / 6, y + h / 6, w / 6, h / 6 }, shade);
