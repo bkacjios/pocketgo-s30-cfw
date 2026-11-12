@@ -10,8 +10,8 @@
  *
  * Home: the apps in /mnt/sd/apps (or argv[1]) as a grid of tiles, then
  * Screenshots (/mnt/sd/screenshots, where the system menu's Screenshot
- * saves) and Files, which browses the whole card (/mnt/sd): everything
- * listed, B at the card's top goes home. D-pad/stick: move, A: open/run, B:
+ * saves) and Files first, then the apps. Files opens a browser at the card
+ * (/mnt/sd): everything listed, up to /, where B goes home. D-pad/stick: move, A: open/run, B:
  * parent folder. Folders open; *.sh files run with /bin/sh;
  * ELF binaries run directly (on exFAT every file looks executable, so the
  * file type decides). While an app runs the launcher releases the display
@@ -48,7 +48,7 @@
 
 #define DEFAULT_DIR "/mnt/sd/apps"
 #define SHOTS_DIR "/mnt/sd/screenshots"
-#define FILES_DIR "/mnt/sd" // the Files tile's browser starts (and ends) here
+#define FILES_DIR "/mnt/sd" // where the Files tile's browser starts
 
 /* Grid: 4 x 2 tiles under the header, the footer below */
 #define HEADER_H 34
@@ -256,10 +256,21 @@ static void dir_open(const char* path, const char* select) {
         }
         sDir.count = n;
         qsort(sDir.entries, sDir.count, sizeof(Entry), entry_cmp);
+        // Screenshots and Files first
+        n = 0;
         if (stat(SHOTS_DIR, &st) == 0 && S_ISDIR(st.st_mode)) {
             entry_add("Screenshots", SHOTS_DIR, K_DIR);
+            n++;
         }
         entry_add("Files", FILES_DIR, K_DIR);
+        n++;
+        {
+            Entry front[2];
+
+            memcpy(front, &sDir.entries[sDir.count - n], n * sizeof(Entry));
+            memmove(&sDir.entries[n], &sDir.entries[0], (sDir.count - n) * sizeof(Entry));
+            memcpy(sDir.entries, front, n * sizeof(Entry));
+        }
     } else {
         qsort(sDir.entries, sDir.count, sizeof(Entry), entry_cmp);
     }
@@ -282,7 +293,7 @@ static void dir_parent(void) {
         dir_open(sStartDir, "Screenshots");
         return;
     }
-    if (strcmp(sDir.path, FILES_DIR) == 0 || strcmp(sDir.path, "/") == 0) { // the top of Files: home
+    if (strcmp(sDir.path, "/") == 0) { // the top: home
         sBrowsing = false;
         dir_open(sStartDir, "Files");
         return;
