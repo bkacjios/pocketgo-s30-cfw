@@ -685,7 +685,7 @@ static void menu_redraw(void);
  * the ring evenly all round.
  * ------------------------------------------------------------------------- */
 
-#define CAL_FILE "/mnt/sd/home/.config/joystick.cal"
+#define CAL_FILE "/mnt/sd/home/.config/s30/joystick.cal"
 #define CAL_SYSFS_GLOB "/sys/bus/i2c/drivers/pocketgo-s30-gamepad/*/calibration"
 #define CAL_IDENTITY "128 128 4096 0 0 4096 0" // no deadzone: raw values
 #define CAL_DEADZONE 10 // out of 127

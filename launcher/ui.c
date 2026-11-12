@@ -34,7 +34,7 @@ static const char* sShotPath; // S30_UI_SHOT: desktop testing, see ui_video_open
 static struct {
     const char* const* letter;
     SDL_Texture* tex;
-} sButtons[3];
+} sButtons[4];
 
 
 bool ui_init(void) {
@@ -133,7 +133,7 @@ bool ui_video_open(void) {
 void ui_video_close(void) {
     int i;
 
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < 4; i++) {
         SDL_DestroyTexture(sButtons[i].tex);
         sButtons[i].tex = NULL;
     }
@@ -235,12 +235,12 @@ void ui_button(const char* const* letter, int x, int y) {
     SDL_Rect dst = { x, y, BUTTON_SIZE, BUTTON_SIZE };
     int i;
 
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < 4; i++) {
         if (sButtons[i].letter == letter || sButtons[i].letter == NULL) {
             break;
         }
     }
-    if (i == 3) {
+    if (i == 4) {
         return;
     }
     if (sButtons[i].tex == NULL) {

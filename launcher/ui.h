@@ -33,7 +33,7 @@ int ui_text_width(const char* text);
 void ui_fill(SDL_Rect r, SDL_Color c);
 void ui_box(SDL_Rect r, SDL_Color c, int thickness);
 void ui_gradient(SDL_Rect r, SDL_Color top, SDL_Color bottom);
-void ui_button(const char* const* letter, int x, int y); // kLetterA/B/X (utils/osd_button.h), 14x14
+void ui_button(const char* const* letter, int x, int y); // kLetterA/B/X/Y (utils/osd_button.h), 14x14
 
 /* Images (PNG, JPEG, BMP): a texture, or NULL. With maxDim > 0 the picture is
    downsampled (box filter, whole factors) until its larger side fits:

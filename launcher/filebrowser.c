@@ -8,11 +8,12 @@
  * onto the portrait panel), the gamepad read straight from evdev, text in
  * the system menu's font (ui.c).
  *
- * Home: the apps in /mnt/sd/apps (or argv[1]) as a grid of tiles, then
- * Screenshots (/mnt/sd/screenshots, where the system menu's Screenshot
- * saves) and Files first, then the apps. Files opens a browser at the card
- * (/mnt/sd): everything listed, B up to /, X back home. D-pad/stick: move, A: open/run, B:
- * parent folder. Folders open; *.sh files run with /bin/sh;
+ * Home: Screenshots (/mnt/sd/screenshots, where the system menu's
+ * Screenshot saves) and Files, then the apps in /mnt/sd/apps (or argv[1]).
+ * Files opens a browser at the card (/mnt/sd): everything listed, B up to
+ * /, X back home. D-pad/stick: move, A: open/run, B: parent folder, Y: tiles
+ * or a list (saved in ~/.config/s30/launcher_view; the list pages with
+ * left/right). Folders open; *.sh files run with /bin/sh;
  * ELF binaries run directly (on exFAT every file looks executable, so the
  * file type decides). While an app runs the launcher releases the display
  * and waits for it.
@@ -65,6 +66,11 @@
 #define LABEL_COLS ((TILE_W - 8) / UI_CHAR_W) // label lines of 12 characters
 #define THUMB_DIM 160 // thumbnails are decoded to at most this (2x the box)
 #define LOADS_PER_FRAME 2
+/* List: a row per entry, a small icon and the name */
+#define LIST_ROW_H 24
+#define LIST_ROWS ((FOOTER_Y - 2 - GRID_Y) / LIST_ROW_H)
+#define LIST_ICON 20
+#define VIEW_FILE "/.config/s30/launcher_view" // under $HOME: "list" or "grid"
 
 static const SDL_Color kBgTop = { 34, 30, 64, 255 };
 static const SDL_Color kBgBottom = { 4, 4, 10, 255 };
@@ -100,6 +106,36 @@ static struct {
 
 static char sStartDir[PATH_MAX];
 static bool sBrowsing; // in Files: every entry listed; else home or Screenshots
+static bool sList;     // the list view, else tiles (Y)
+
+static void view_mode_path(char* path, size_t size) {
+    const char* home = getenv("HOME");
+    snprintf(path, size, "%s%s", home != NULL ? home : "", VIEW_FILE);
+}
+
+static void view_mode_load(void) {
+    char path[PATH_MAX], mode[8] = "";
+    FILE* f;
+
+    view_mode_path(path, sizeof(path));
+    f = fopen(path, "r");
+    if (f != NULL) {
+        sList = fscanf(f, "%7s", mode) == 1 && strcmp(mode, "list") == 0;
+        fclose(f);
+    }
+}
+
+static void view_mode_save(void) {
+    char path[PATH_MAX];
+    FILE* f;
+
+    view_mode_path(path, sizeof(path));
+    f = fopen(path, "w");
+    if (f != NULL) {
+        fputs(sList ? "list\n" : "grid\n", f);
+        fclose(f);
+    }
+}
 
 static const char* extension(const char* name) {
     const char* dot = strrchr(name, '.');
@@ -307,9 +343,9 @@ static void dir_parent(void) {
  * Gamepad and display (ui.c)
  * ------------------------------------------------------------------------- */
 
-enum { IN_UP, IN_DOWN, IN_LEFT, IN_RIGHT, IN_A, IN_B, IN_X, IN_COUNT };
+enum { IN_UP, IN_DOWN, IN_LEFT, IN_RIGHT, IN_A, IN_B, IN_X, IN_Y, IN_COUNT };
 static const int sPadCodes[IN_COUNT] = { BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT,
-                                         BTN_EAST,    BTN_SOUTH,     BTN_NORTH };
+                                         BTN_EAST,    BTN_SOUTH,     BTN_NORTH,     BTN_WEST };
 static int sPadFd = -1;
 static bool sHeld[IN_COUNT], sPressed[IN_COUNT]; // pressed: since the last poll
 static int sAxisX, sAxisY, sAxisXCentre, sAxisYCentre;
@@ -541,8 +577,9 @@ static void draw_header(const char* title) {
     ui_fill((SDL_Rect){ 8, HEADER_H - 1, SCRW - 16, 1 }, kLine);
 }
 
-/* "(A) action   (B) Back", in Files "(X) Exit" too, at the left; `name`
-   right-aligned */
+/* "(A) action   (B) Back" (where B goes somewhere: not home, not / in
+   Files), in Files "(X) Exit", then "(Y) List" or "(Y) Tiles" at the left;
+   `name` right-aligned */
 static void draw_footer(const char* action, const char* name) {
     const int ty = FOOTER_Y + 3, by = FOOTER_Y + 4;
     int x = 12;
@@ -554,17 +591,22 @@ static void draw_footer(const char* action, const char* name) {
         ui_text(action, UI_DIM, x, ty, SCRW);
         x += ui_text_width(action) + 14;
     }
-    ui_button(kLetterB, x, by);
-    x += BUTTON_SIZE + 5;
-    ui_text("Back", UI_DIM, x, ty, SCRW);
-    x += ui_text_width("Back") + 14;
+    if (sBrowsing ? strcmp(sDir.path, "/") != 0 : strcmp(sDir.path, sStartDir) != 0) {
+        ui_button(kLetterB, x, by);
+        x += BUTTON_SIZE + 5;
+        ui_text("Back", UI_DIM, x, ty, SCRW);
+        x += ui_text_width("Back") + 14;
+    }
     if (sBrowsing) {
         ui_button(kLetterX, x, by);
         x += BUTTON_SIZE + 5;
         ui_text("Exit", UI_DIM, x, ty, SCRW);
         x += ui_text_width("Exit") + 14;
     }
-    x += 2;
+    ui_button(kLetterY, x, by);
+    x += BUTTON_SIZE + 5;
+    ui_text(sList ? "Tiles" : "List", UI_DIM, x, ty, SCRW);
+    x += ui_text_width(sList ? "Tiles" : "List") + 16;
     if (name != NULL) {
         int w = ui_text_width(name), max = SCRW - 12 - x;
         if (w > max) {
@@ -574,21 +616,43 @@ static void draw_footer(const char* action, const char* name) {
     }
 }
 
-static void render_grid(void) {
-    const int rows = (sDir.count + COLS - 1) / COLS;
+/* A list row: the icon (or the built-in one) small, then the name */
+static void draw_row(const Entry* e, int y, bool selected) {
+    const SDL_Rect row = { 8, y, SCRW - 22, LIST_ROW_H - 2 };
+    const SDL_Rect iconBox = { row.x + 4, y + (LIST_ROW_H - 2 - LIST_ICON) / 2, LIST_ICON, LIST_ICON };
+    char label[NAME_MAX + 1];
+
+    if (selected) {
+        ui_fill(row, kSelected);
+        ui_box(row, kSelectedEdge, 1);
+    }
+    if (e->icon != NULL) {
+        ui_image_fit(e->icon, e->iconW, e->iconH, iconBox);
+    } else {
+        draw_default_icon(e, iconBox, selected);
+    }
+    stem(e, label, sizeof(label));
+    ui_text(label, selected ? UI_TEXT : UI_DIM, iconBox.x + LIST_ICON + 10, y + (LIST_ROW_H - 2 - UI_CHAR_H) / 2,
+            row.w - LIST_ICON - 22);
+}
+
+/* The folder as tiles or as a list, the header and the footer */
+static void render_dir(void) {
+    const int per = sList ? 1 : COLS, shown = sList ? LIST_ROWS : ROWS; // entries per row, rows shown
+    const int rows = (sDir.count + per - 1) / per;
     char title[PATH_MAX];
     const char* name = NULL;
-    int row = sDir.selected / COLS, first, last, i;
+    int row = sDir.selected / per, first, last, i;
     bool more;
 
     // Keep the selected row visible
     if (row < sDir.scroll) {
         sDir.scroll = row;
-    } else if (row >= sDir.scroll + ROWS) {
-        sDir.scroll = row - ROWS + 1;
+    } else if (row >= sDir.scroll + shown) {
+        sDir.scroll = row - shown + 1;
     }
-    first = sDir.scroll * COLS;
-    last = first + COLS * ROWS - 1;
+    first = sDir.scroll * per;
+    last = first + per * shown - 1;
     more = load_icons(first, last);
 
     ui_begin();
@@ -602,16 +666,21 @@ static void render_grid(void) {
         ui_text("(empty)", UI_DIM, GRID_X, GRID_Y + 4, SCRW);
     }
     for (i = first; i <= last && i < sDir.count; i++) {
-        int c = (i - first) % COLS, r = (i - first) / COLS;
-        draw_tile(&sDir.entries[i], GRID_X + c * PITCH_X, GRID_Y + r * PITCH_Y, i == sDir.selected);
+        if (sList) {
+            draw_row(&sDir.entries[i], GRID_Y + (i - first) * LIST_ROW_H, i == sDir.selected);
+        } else {
+            int c = (i - first) % COLS, r = (i - first) / COLS;
+            draw_tile(&sDir.entries[i], GRID_X + c * PITCH_X, GRID_Y + r * PITCH_Y, i == sDir.selected);
+        }
     }
-    if (rows > ROWS) { // scroll bar at the right edge
-        int track = ROWS * PITCH_Y - (PITCH_Y - TILE_H), th = track * ROWS / rows, ty = track * sDir.scroll / rows;
+    if (rows > shown) { // scroll bar at the right edge
+        int track = sList ? LIST_ROWS * LIST_ROW_H - 2 : ROWS * PITCH_Y - (PITCH_Y - TILE_H);
+        int th = track * shown / rows, ty = track * sDir.scroll / rows;
         ui_fill((SDL_Rect){ SCRW - 8, GRID_Y, 3, track }, kTile);
         ui_fill((SDL_Rect){ SCRW - 8, GRID_Y + ty, 3, th }, kSelectedEdge);
     }
-    if (sDir.count > 0) {
-        name = sDir.entries[sDir.selected].name;
+    if (sDir.count > 0 && !sList) {
+        name = sDir.entries[sDir.selected].name; // the list shows it already
     }
     draw_footer(sDir.count == 0                               ? NULL
                 : sDir.entries[sDir.selected].kind == K_DIR   ? "Open"
@@ -620,7 +689,7 @@ static void render_grid(void) {
                 name);
     ui_present();
     if (more) {
-        render_grid();
+        render_dir();
     }
 }
 
@@ -758,11 +827,17 @@ static void run(const char* path) {
 #define STICK_DEAD 50
 
 /* One step in the grid: left/right by one, up/down by a row (clamped; the
-   last row reachable from above even when short) */
+   last row reachable from above even when short). In the list: up/down by
+   one, left/right by a page (clamped to the ends). */
 static void grid_move(int dx, int dy) {
     int s = sDir.selected + dx + dy * COLS;
 
     if (sDir.count == 0) {
+        return;
+    }
+    if (sList) {
+        s = sDir.selected + dy + dx * LIST_ROWS;
+        sDir.selected = s < 0 ? 0 : s >= sDir.count ? sDir.count - 1 : s;
         return;
     }
     if (dy > 0 && s >= sDir.count && sDir.selected / COLS < (sDir.count - 1) / COLS) {
@@ -776,12 +851,13 @@ static void grid_move(int dx, int dy) {
 int main(int argc, char** argv) {
     Uint32 nextRepeat = 0, lastRender = 0;
     int moveX = 0, moveY = 0;
-    bool dirty = true, prevA = false, prevB = false, prevX = false;
+    bool dirty = true, prevA = false, prevB = false, prevX = false, prevY = false;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (!ui_init()) {
         return 1;
     }
+    view_mode_load();
     sPadFd = ui_pad_open();
     pad_flush();
     sAxisXCentre = sAxisX;
@@ -797,7 +873,7 @@ int main(int argc, char** argv) {
     for (;;) {
         Uint32 now = SDL_GetTicks();
         int dx, dy;
-        bool a, b, xb, repeat = false;
+        bool a, b, xb, yb, repeat = false;
 
         {
             int x = sAxisX, y = sAxisY;
@@ -823,6 +899,7 @@ int main(int argc, char** argv) {
         a = sHeld[IN_A] || sPressed[IN_A];
         b = sHeld[IN_B] || sPressed[IN_B];
         xb = sHeld[IN_X] || sPressed[IN_X];
+        yb = sHeld[IN_Y] || sPressed[IN_Y];
         if (dx != moveX || dy != moveY) {
             moveX = dx;
             moveY = dy;
@@ -869,6 +946,11 @@ int main(int argc, char** argv) {
             } else if (b && !prevB) {
                 dir_parent();
                 dirty = true;
+            } else if (yb && !prevY) { // tiles or list
+                sList = !sList;
+                sDir.scroll = 0; // render_dir brings the selection into view
+                view_mode_save();
+                dirty = true;
             } else if (xb && !prevX && sBrowsing) { // out of Files, from anywhere
                 sBrowsing = false;
                 dir_open(sStartDir, "Files");
@@ -878,12 +960,13 @@ int main(int argc, char** argv) {
         prevA = a;
         prevB = b;
         prevX = xb;
+        prevY = yb;
 
         if (dirty || now - lastRender > 2000) { // battery refresh
             if (sView.open) {
                 render_view();
             } else {
-                render_grid();
+                render_dir();
             }
             lastRender = now;
             dirty = false;

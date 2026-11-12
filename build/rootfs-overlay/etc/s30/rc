@@ -11,6 +11,9 @@ s30-splash 5
 . /etc/profile.d/s30.sh
 mkdir -p -m 0700 "$XDG_RUNTIME_DIR"
 mkdir -p "$HOME/roms"
+# The system's own settings (brightness, volume, overlay, stick calibration,
+# USB functions, launcher view)
+mkdir -p "$HOME/.config/s30"
 
 # udevd: device properties (ID_INPUT_JOYSTICK etc.) for RetroArch's udev
 # input/joypad drivers
@@ -72,9 +75,9 @@ done
 
 # Joystick calibration (saved by s30-display, System > Calibrate stick),
 # applied by the gamepad driver
-if [ -f "$HOME/.config/joystick.cal" ]; then
+if [ -f "$HOME/.config/s30/joystick.cal" ]; then
 	for f in /sys/bus/i2c/drivers/pocketgo-s30-gamepad/*/calibration; do
-		cat "$HOME/.config/joystick.cal" > "$f"
+		cat "$HOME/.config/s30/joystick.cal" > "$f"
 	done
 fi
 

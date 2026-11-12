@@ -14,7 +14,7 @@
 # ep5 IN: the only endpoint with a 1024-byte FIFO (kernel patch 0002).
 . /etc/profile.d/s30.sh
 G=/sys/kernel/config/usb_gadget/s30
-SAVED=$HOME/.config/usb_gadget
+SAVED=$HOME/.config/s30/usb_gadget
 ORDER="serial network audio video"
 MAX=5
 

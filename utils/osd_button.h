@@ -13,6 +13,8 @@
 static const char* const kLetterA[8] = { ".####.", "##..##", "##..##", "##..##", "######", "##..##", "##..##", "##..##" };
 static const char* const kLetterB[8] = { "#####.", "##..##", "##..##", "#####.", "##..##", "##..##", "##..##", "#####." };
 static const char* const kLetterX[8] = { "##..##", "##..##", ".####.", "..##..", "..##..", ".####.", "##..##", "##..##" };
+static const char* const kLetterY[8] __attribute__((unused)) = // the launcher's only
+	{ "##..##", "##..##", ".####.", "..##..", "..##..", "..##..", "..##..", "..##.." };
 
 /* How much of pixel (x, y) of the glyph the disc covers, 0..1 */
 static inline float button_coverage(int x, int y) {

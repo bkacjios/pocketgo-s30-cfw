@@ -4,9 +4,9 @@
 ::sysinit:/etc/s30/rc
 
 # s30-display first: the frontend's apps get the display from it (DRM lease)
-::respawn:/usr/bin/s30-display /mnt/sd/home/.config/brightness
+::respawn:/usr/bin/s30-display /mnt/sd/home/.config/s30/brightness
 ::respawn:/usr/libexec/s30/frontend
-::respawn:/usr/bin/s30-volumed /mnt/sd/home/.config/volume
+::respawn:/usr/bin/s30-volumed /mnt/sd/home/.config/s30/volume
 ttyS0::respawn:-/bin/sh
 ttyGS0::respawn:-/bin/sh
 
