@@ -444,7 +444,7 @@ static const char* const kAppItems[] = { "Exit game", "Screenshot", "System", "R
 enum { SYS_SETTINGS, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_BACK };
 static const char* const kSysItems[] = { "Settings", "Sleep", "Reboot", "Shut down", "Back" };
 enum { SET_BRIGHTNESS, SET_PERF, SET_USB, SET_CALIBRATE, SET_BACK };
-static const char* const kSetItems[] = { NULL, "Overlay", "USB", "Calibrate stick", "Back" };
+static const char* const kSetItems[] = { NULL, "Overlay", "USB Devices", "Calibrate stick", "Back" };
 /* The USB page: the endpoint slots in use (a bar, not selectable), the
    gadget's functions in usb-gadget's order (each with its cost in pips),
    then USB storage */
