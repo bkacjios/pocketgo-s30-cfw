@@ -36,6 +36,7 @@
 #include "n64/gs2dex.h"
 #include "s30_display.h"
 #include "s30_gfx.h"
+#include "gfx_internal.h"
 
 #define SCREEN_W 320
 #define SCREEN_H 240
@@ -52,7 +53,6 @@
 #define WIDE_XSCALE (320.0f / 360.0f)
 #define FB_SCALE ((float)S30_FB_H / SCREEN_H) // both axes
 
-#define MAX_VERTS 64
 #define MAX_LIGHTS 7
 #define MTX_STACK 32
 #define DL_DEPTH 18
@@ -79,6 +79,9 @@ void* pc_resolve_addr(uint32_t addr) {
     if (addr == 0) {
         return NULL;
     }
+    if (sCfg.rdram != NULL && addr >= 0x80000000u) {
+        return sCfg.rdram + (addr & 0x00FFFFFF); // KSEG0/KSEG1: the RDP's 24-bit address
+    }
     if (seg <= 0x0F) {
         if (gSegments[seg] == 0 && seg != 0) {
             return NULL;
@@ -101,14 +104,6 @@ static inline uintptr_t tex_xor(const void* p) {
 /* ---------------------------------------------------------------------------
  * State
  * ------------------------------------------------------------------------- */
-
-typedef struct {
-    float x, y, z, w;
-    float r, g, b, a;
-    float u, v; // texture coords, 10.5 texels (after the G_TEXTURE scale)
-    u8 clip; // outside x/y planes (bits 0-3); CLIP_NEAR: in front of the near plane
-} RspVtx;
-#define CLIP_NEAR 0x10
 
 typedef struct {
     float col[3];
@@ -177,9 +172,70 @@ static void on_sigusr2(int sig) {
 static void flush(void);
 // sWide: this frame is widescreen (declared above frame_copies)
 static int sHadBg; // an S2DEX background was drawn this frame
+/* Where the VI shows the frame (S30Gfx_SetVi): frame pixel (x, y) is N64
+   screen pixel (sFrameX + x * sFrameScale, sFrameY + y * sFrameScaleY). A
+   640-wide (high resolution) or letterboxed frame draws into the same
+   320x240 space. */
+static float sFrameX, sFrameY, sFrameScale = 1.0f, sFrameScaleY = 1.0f;
+static int sWide;
+/* The side of the screen the current 2D element sits on (gfx_set_rect_side) */
+static int sRectSide;
+/* The game set the primitive depth this frame (G_SETPRIMDEPTH) */
+static int sPrimDepthSet;
+static u32 sPrimWord = 0xFFFFFFFF; // the last G_SETPRIMCOLOR color
+static int sBatchScreen;
+static u32 sDbg;
+static float rect_depth(void);
+
+void gfx_set_rect_side(int side) {
+    sRectSide = side;
+}
+
+/* Widescreen: a full-width rectangle (a screen overlay) reaches the panel's
+   edges; an element anchored to a side moves out to that edge with it */
+static void wide_rect(float* ulx, float* lrx, int aux) {
+    if (!sWide || aux) {
+        return;
+    }
+    if (*ulx <= 0.0f && *lrx >= SCREEN_W) {
+        *ulx = -WIDE_PAD;
+        *lrx = SCREEN_W + WIDE_PAD;
+    } else if (sRectSide == 1 || sRectSide == 2) {
+        float d = sRectSide == 1 ? -WIDE_PAD : WIDE_PAD;
+        *ulx += d;
+        *lrx += d;
+    }
+}
+static struct {
+    float x, y, kx, ky;
+    int stride;
+} sVi = { 0, 0, 0, 0, 0 };
+
+void S30Gfx_SetVi(float x, float y, float kx, float ky, int stride) {
+    sVi.x = x;
+    sVi.y = y;
+    sVi.kx = kx;
+    sVi.ky = ky;
+    sVi.stride = stride;
+}
+
+/* The VI mapping for a frame `width` pixels wide */
+static void frame_mapping(u32 width) {
+    if (sVi.kx <= 0.0f || sVi.ky <= 0.0f) {
+        sFrameX = sFrameY = 0.0f;
+        sFrameScale = (float)SCREEN_W / width;
+        sFrameScaleY = sFrameScale;
+        return;
+    }
+    sFrameX = sVi.x;
+    sFrameY = sVi.y;
+    sFrameScale = sVi.kx;
+    // A line stride of two rows (one field of an interlaced frame) shows every other row
+    sFrameScaleY = sVi.stride > 0 ? sVi.ky * width / sVi.stride : sVi.ky;
+}
 static void aux_sync(const u8* src, u32 bytes);
 
-static u8 sTmem[4096];
+static u8 sTmem[4096] __attribute__((aligned(8)));
 static u16 sTlut[256];
 /* Combiner bits of the first cycle (a0 c0 Aa0 Ac0 | b0 d0 Ab0 Ad0) */
 #define COMB1_W0 0x00FFFE00u
@@ -187,6 +243,11 @@ static u16 sTlut[256];
 
 static u32 sTmemGen = 1;
 static int sBatchTile; // render tile of the pending batch (texture coordinates, binding)
+static int sBatchAtlas = -1; // atlas page of the pending batch (-1: its tile's own texture)
+static float sAtlasRect[2][4], sAtlasWrap[4]; // the current triangle's textures on that page
+/* Texture state changes end the pending draw, except an atlas draw's: its
+   vertices already carry their textures */
+#define flush_tex(r) (sBatchAtlas < 0 ? flush_for(r) : (void)0)
 /* Why batches end (<PREFIX>_GFXSTATS): the draw count is what costs on lima */
 enum {
     FR_AUXSYNC,
@@ -507,6 +568,7 @@ enum {
     SF_DBG_ALPHA = 1 << 6,    // debug: output alpha as grey
     SF_3POINT = 1 << 7,       // N64 3-point bilinear filter (textures are GL_NEAREST)
     SF_CVG_ALPHA = 1 << 8,    // antialiased coverage times alpha: no coverage, no write (depth either)
+    SF_ATLAS = 1 << 9,        // textures from an atlas page: per-vertex rectangle and wrap
 };
 
 typedef struct {
@@ -525,7 +587,7 @@ static Shader sShaders[MAX_SHADERS];
 static int sNumShaders;
 static Shader* sCurShader;
 
-enum { ATTR_POS, ATTR_COLOR, ATTR_UV0, ATTR_UV1, ATTR_FOG, ATTR_PRIM, ATTR_ENV };
+enum { ATTR_POS, ATTR_COLOR, ATTR_UV0, ATTR_UV1, ATTR_FOG, ATTR_PRIM, ATTR_ENV, ATTR_RECT0, ATTR_RECT1, ATTR_WRAP };
 
 static void emit_cycle(char* s, size_t n, const int c[4], const int a[4], int last) {
     size_t len = strlen(s);
@@ -557,9 +619,11 @@ static Shader* get_shader(u32 w0, u32 w1, u32 flags) {
     static const char* vs =
         "attribute vec4 aPos; attribute vec4 aColor; attribute vec2 aUv0; attribute vec2 aUv1;\n"
         "attribute float aFog; attribute vec4 aPrim; attribute vec4 aEnv;\n"
+        "attribute vec4 aRect0; attribute vec4 aRect1; attribute vec4 aWrap;\n"
         "varying vec4 vShade; varying vec2 vUv0; varying vec2 vUv1; varying float vFog;\n"
-        "varying vec4 vPrim; varying vec4 vEnv;\n"
+        "varying vec4 vPrim; varying vec4 vEnv; varying vec4 vRect0; varying vec4 vRect1; varying vec4 vWrap;\n"
         "void main() { vShade = aColor; vUv0 = aUv0; vUv1 = aUv1; vFog = aFog; vPrim = aPrim; vEnv = aEnv;\n"
+        "  vRect0 = aRect0; vRect1 = aRect1; vWrap = aWrap;\n"
         "  gl_Position = aPos; }\n";
     char fs[4096];
     int c[2][4], a[2][4];
@@ -607,8 +671,17 @@ static Shader* get_shader(u32 w0, u32 w1, u32 flags) {
     snprintf(fs, sizeof(fs),
              "precision mediump float;\n"
              "varying vec4 vShade; varying vec2 vUv0; varying vec2 vUv1; varying float vFog;\n"
-             "varying vec4 vPrim; varying vec4 vEnv;\n"
+             "varying vec4 vPrim; varying vec4 vEnv; varying vec4 vRect0; varying vec4 vRect1; varying vec4 vWrap;\n"
              "uniform sampler2D uTex0; uniform sampler2D uTex1;\n"
+             /* Atlas: wrap per axis (0 repeat, 1 clamp, 2 mirror) inside the
+                texture's rectangle of the page */
+             "vec2 atlasUv(vec2 uv, vec4 rect, vec2 mode) {\n"
+             "  vec2 r = fract(uv);\n"
+             "  vec2 c = clamp(uv, 0.0, 0.999);\n"
+             "  vec2 m = 1.0 - abs(mod(uv, 2.0) - 1.0);\n"
+             "  vec2 w = mix(mix(r, c, step(0.5, mode)), m, step(1.5, mode));\n"
+             "  return rect.xy + min(w, 0.999) * rect.zw;\n"
+             "}\n"
              "uniform vec4 uFog; uniform vec4 uBlend;\n"
              "uniform vec4 uFill; uniform float uPrimLod; uniform vec2 uNoise; uniform sampler2D uNoiseTex;\n"
              "uniform vec2 uTexSize0; uniform vec2 uTexSize1;\n"
@@ -634,12 +707,14 @@ static Shader* get_shader(u32 w0, u32 w1, u32 flags) {
         sh->usesTex[0] = uses_input(c, a, ncyc, IN_TEX0, IN_TEX0_A);
         sh->usesTex[1] = uses_input(c, a, ncyc, IN_TEX1, IN_TEX1_A);
         if (sh->usesTex[0]) {
-            strcat(fs, (flags & SF_3POINT) ? "  t0 = tex3(uTex0, vUv0, uTexSize0);\n"
-                                           : "  t0 = texture2D(uTex0, vUv0);\n");
+            strcat(fs, (flags & SF_ATLAS)    ? "  t0 = texture2D(uTex0, atlasUv(vUv0, vRect0, vWrap.xy));\n"
+                       : (flags & SF_3POINT) ? "  t0 = tex3(uTex0, vUv0, uTexSize0);\n"
+                                             : "  t0 = texture2D(uTex0, vUv0);\n");
         }
         if (sh->usesTex[1]) {
-            strcat(fs, (flags & SF_3POINT) ? "  t1 = tex3(uTex1, vUv1, uTexSize1);\n"
-                                           : "  t1 = texture2D(uTex1, vUv1);\n");
+            strcat(fs, (flags & SF_ATLAS)    ? "  t1 = texture2D(uTex1, atlasUv(vUv1, vRect1, vWrap.zw));\n"
+                       : (flags & SF_3POINT) ? "  t1 = tex3(uTex1, vUv1, uTexSize1);\n"
+                                             : "  t1 = texture2D(uTex1, vUv1);\n");
         }
         for (i = 0; i < ncyc; i++) {
             emit_cycle(fs, sizeof(fs), c[i], a[i], i == ncyc - 1);
@@ -690,6 +765,9 @@ static Shader* get_shader(u32 w0, u32 w1, u32 flags) {
         glBindAttribLocation(p, ATTR_POS, "aPos");
         glBindAttribLocation(p, ATTR_COLOR, "aColor");
         glBindAttribLocation(p, ATTR_UV0, "aUv0");
+        glBindAttribLocation(p, ATTR_RECT0, "aRect0");
+        glBindAttribLocation(p, ATTR_RECT1, "aRect1");
+        glBindAttribLocation(p, ATTR_WRAP, "aWrap");
         glBindAttribLocation(p, ATTR_UV1, "aUv1");
         glBindAttribLocation(p, ATTR_FOG, "aFog");
         glBindAttribLocation(p, ATTR_PRIM, "aPrim");
@@ -836,7 +914,6 @@ void S30Gfx_FrameCopy(const void* dst, int x, int y, int w, int h) {
     }
 }
 
-static int sWide;
 
 /* Pending S30Gfx_FrameCopy: the last frame's rectangles into their textures
    (before this frame draws over it). Widescreen frames show more of the world
@@ -960,11 +1037,15 @@ static void color16(u8* d, u16 c, u32 tlutMode) {
 /* Texel (x, y) of a tile from TMEM, decoded to RGBA8 */
 static void decode_texel(u8* d, const Tile* t, u32 pitch, int x, int y, u32 tlutMode) {
     u32 base = t->tmem * 8 + y * pitch;
+    // Odd rows are read with the 32-bit halves of each 64-bit word swapped
+    // (undoing the swap of the loads, see tmem_swap_words); for 32-bit
+    // texels, kept linearly here, that is texel x ^ 2
+    u32 sw = (y & 1) && t->siz != G_IM_SIZ_32b ? 4 : 0;
     u8 b, n;
 
     switch (t->siz) {
         case G_IM_SIZ_4b:
-            b = sTmem[(base + (x >> 1)) & 0xFFF];
+            b = sTmem[((base + (x >> 1)) ^ sw) & 0xFFF];
             n = (x & 1) ? (b & 0xF) : (b >> 4);
             switch (t->fmt) {
                 case G_IM_FMT_CI:
@@ -981,7 +1062,7 @@ static void decode_texel(u8* d, const Tile* t, u32 pitch, int x, int y, u32 tlut
             }
             break;
         case G_IM_SIZ_8b:
-            b = sTmem[(base + x) & 0xFFF];
+            b = sTmem[((base + x) ^ sw) & 0xFFF];
             switch (t->fmt) {
                 case G_IM_FMT_CI:
                     color16(d, sTlut[b], tlutMode);
@@ -995,7 +1076,7 @@ static void decode_texel(u8* d, const Tile* t, u32 pitch, int x, int y, u32 tlut
             }
             break;
         case G_IM_SIZ_16b: {
-            u32 o = base + x * 2;
+            u32 o = (base + x * 2) ^ sw;
             u16 c = (sTmem[o & 0xFFF] << 8) | sTmem[(o + 1) & 0xFFF];
             if (t->fmt == G_IM_FMT_IA) {
                 put_rgba(d, c >> 8, c >> 8, c >> 8, c & 0xFF);
@@ -1007,7 +1088,7 @@ static void decode_texel(u8* d, const Tile* t, u32 pitch, int x, int y, u32 tlut
             break;
         }
         default: { // 32b RGBA, stored linearly (see load_block / load_tile)
-            u32 o = base + x * 4;
+            u32 o = base + (u32)(x ^ ((y & 1) ? 2 : 0)) * 4;
             put_rgba(d, sTmem[o & 0xFFF], sTmem[(o + 1) & 0xFFF], sTmem[(o + 2) & 0xFFF], sTmem[(o + 3) & 0xFFF]);
             break;
         }
@@ -1063,36 +1144,12 @@ static GLint wrap_mode(int cm, int mask, int dim) {
     return (cm & G_TX_MIRROR) ? GL_MIRRORED_REPEAT : GL_REPEAT;
 }
 
-static TexEntry* tex_lookup(int tileIdx, int* outW, int* outH) {
-    Tile* t = &rdp.tiles[tileIdx & 7];
-    TileCache* tc = &sTileCache[tileIdx & 7];
-    u32 tlutMode = rdp.otherH & (3 << G_MDSFT_TEXTLUT);
-    int w, h, x, y;
-    u32 pitch = tile_pitch(t);
+/* Content hash of the TMEM bytes a w x h texture of the tile covers, its
+   layout and (CI) palette */
+static u64 tex_hash(const Tile* t, int w, int h, u32 pitch, u32 tlutMode) {
+    size_t bytes = pitch * h;
     u64 hash;
-    TexEntry* e;
-    TexEntry* victim = NULL;
-    size_t bytes;
-    int i;
 
-    tile_dims(t, &w, &h);
-    if (w * h * 4 > (int)sizeof(sDecodeBuf)) {
-        h = sizeof(sDecodeBuf) / 4 / w;
-    }
-    *outW = w;
-    *outH = h;
-    if (sTexOverrideCount != 0 && (e = tex_override(t, w, h)) != NULL) {
-        return e;
-    }
-    if (tc->entry != NULL && tc->entry->hash == tc->hash && tc->gen == sTmemGen && tc->tlutMode == tlutMode &&
-        memcmp(&tc->tile, t, sizeof(Tile)) == 0) {
-        tc->entry->lastUse = sFrame;
-        return tc->entry;
-    }
-
-    double tt = stat_ms();
-    // Content hash of the TMEM bytes the tile covers (+ palette for CI)
-    bytes = pitch * h;
     if (t->tmem * 8 + bytes > 4096) {
         bytes = 4096 - t->tmem * 8;
     }
@@ -1114,7 +1171,37 @@ static TexEntry* tex_lookup(int tileIdx, int* outW, int* outH) {
             hash = hash_bytes((const u8*)sTlut, sizeof(sTlut), hash);
         }
     }
+    return hash;
+}
 
+static TexEntry* tex_lookup(int tileIdx, int* outW, int* outH) {
+    Tile* t = &rdp.tiles[tileIdx & 7];
+    TileCache* tc = &sTileCache[tileIdx & 7];
+    u32 tlutMode = rdp.otherH & (3 << G_MDSFT_TEXTLUT);
+    int w, h, x, y;
+    u32 pitch = tile_pitch(t);
+    u64 hash;
+    TexEntry* e;
+    TexEntry* victim = NULL;
+    int i;
+
+    tile_dims(t, &w, &h);
+    if (w * h * 4 > (int)sizeof(sDecodeBuf)) {
+        h = sizeof(sDecodeBuf) / 4 / w;
+    }
+    *outW = w;
+    *outH = h;
+    if (sTexOverrideCount != 0 && (e = tex_override(t, w, h)) != NULL) {
+        return e;
+    }
+    if (tc->entry != NULL && tc->entry->hash == tc->hash && tc->gen == sTmemGen && tc->tlutMode == tlutMode &&
+        memcmp(&tc->tile, t, sizeof(Tile)) == 0) {
+        tc->entry->lastUse = sFrame;
+        return tc->entry;
+    }
+
+    double tt = stat_ms();
+    hash = tex_hash(t, w, h, pitch, tlutMode);
     e = &sTexCache[hash % TEX_CACHE_SIZE];
     for (i = 0; i < 8; i++) {
         TexEntry* c = &sTexCache[(hash + i) % TEX_CACHE_SIZE];
@@ -1183,9 +1270,14 @@ static void bind_tile(int unit, int tileIdx, float size[2]) {
     Tile* t = &rdp.tiles[tileIdx & 7];
     int w, h;
     TexEntry* e = tex_lookup(tileIdx, &w, &h);
-    int point = (rdp.otherH & (3 << G_MDSFT_TEXTFILT)) == G_TF_POINT ||
-                (rdp.otherH & (3 << G_MDSFT_CYCLETYPE)) == G_CYC_COPY;
-    GLint filter = (point || s3Point) ? GL_NEAREST : GL_LINEAR;
+    // Point sampling, unless a rectangle of a high resolution frame is drawn
+    // smaller than the game drew it: nearest texels would drop whole rows of
+    // its menus' text. 3D keeps it (Rogue Squadron's sky samples a texture
+    // whose every other texel is black, exactly between them)
+    int point = ((rdp.otherH & (3 << G_MDSFT_TEXTFILT)) == G_TF_POINT ||
+                 (rdp.otherH & (3 << G_MDSFT_CYCLETYPE)) == G_CYC_COPY) &&
+                !(sBatchScreen && rdp.cimgIsFrame && (sFrameScale < 1.0f || sFrameScaleY < 1.0f));
+    GLint filter = (point || s3Point || (sDbg & 16)) ? GL_NEAREST : GL_LINEAR;
     GLint ws = wrap_mode(t->cms, t->masks, w), wt = wrap_mode(t->cmt, t->maskt, h);
 
     if (sGL.tex[unit] != e->tex) {
@@ -1198,7 +1290,7 @@ static void bind_tile(int unit, int tileIdx, float size[2]) {
         glBindTexture(GL_TEXTURE_2D, e->tex);
         if (e->filter != filter) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                            (e->mipmapped && filter == GL_LINEAR) ? GL_LINEAR_MIPMAP_LINEAR : filter);
+                            (e->mipmapped && filter == GL_LINEAR && !(sDbg & 2)) ? GL_LINEAR_MIPMAP_LINEAR : filter);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
         }
         if (e->wrapS != ws) {
@@ -1213,6 +1305,199 @@ static void bind_tile(int unit, int tileIdx, float size[2]) {
     }
     size[0] = (float)w;
     size[1] = (float)h;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Texture atlas (S30GfxConfig.atlas): point-sampled 3D textures are decoded
+ * into shared pages when their triangles are added, each vertex carrying its
+ * texture's rectangle and wrap modes (the shader wraps inside the
+ * rectangle), so loading another texture or palette doesn't end the draw.
+ * Pages are 512 square: Mali-400 fragment math is 16-bit. A texture is
+ * decoded into the page's copy in RAM, and the page goes to the GPU whole, as
+ * a new texture object, at the start of the next frame: lima stalls on any
+ * write to a texture that queued draws read. Until then the texture draws
+ * the usual way.
+ * ------------------------------------------------------------------------- */
+
+#define ATLAS_SIZE 512
+#define ATLAS_PAGES 8
+#define ATLAS_CACHE 1024
+
+typedef struct {
+    u64 hash;
+    u32 gen;
+    u16 x, y, w, h;
+    u8 page;
+    u8 ready; // on the GPU's copy of the page
+} AtlasEntry;
+
+static GLuint sAtlasTex[ATLAS_PAGES];
+static struct {
+    int x, y, rowH;
+} sAtlasFill[ATLAS_PAGES];
+static u32 sAtlasGen = 1; // entries of an older generation are gone (pages refilled)
+static int sAtlasPage;    // the page being filled
+static int sAtlasFull;    // a texture found no room this frame: start over next frame
+static AtlasEntry sAtlasCache[ATLAS_CACHE];
+static u8* sAtlasRam;                 // the pages' contents, RGBA
+static u8 sAtlasDirty[ATLAS_PAGES];   // decoded into since the last upload
+static struct {
+    u32 gen, tmemGen, tlutMode;
+    Tile tile;
+    AtlasEntry* e;
+} sAtlasTile[8];
+
+static void atlas_init(void) {
+    sAtlasRam = calloc(ATLAS_PAGES, ATLAS_SIZE * ATLAS_SIZE * 4);
+}
+
+/* Start of a frame: each page decoded into goes to the GPU as a new texture
+   object (the old one may still be read by queued draws), and its textures
+   become usable */
+static void atlas_upload(void) {
+    int p, i;
+
+    for (p = 0; p < ATLAS_PAGES; p++) {
+        if (!sAtlasDirty[p]) {
+            continue;
+        }
+        if (sAtlasTex[p] != 0) {
+            glDeleteTextures(1, &sAtlasTex[p]);
+        }
+        glGenTextures(1, &sAtlasTex[p]);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, sAtlasTex[p]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ATLAS_SIZE, ATLAS_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                     sAtlasRam + (size_t)p * ATLAS_SIZE * ATLAS_SIZE * 4);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glActiveTexture(GL_TEXTURE0);
+        sStats.uploads++;
+        for (i = 0; i < ATLAS_CACHE; i++) {
+            if (sAtlasCache[i].gen == sAtlasGen && sAtlasCache[i].page == p) {
+                sAtlasCache[i].ready = 1;
+            }
+        }
+        sAtlasDirty[p] = 0;
+    }
+}
+
+static void atlas_clear(void) {
+    sAtlasGen++;
+    memset(sAtlasFill, 0, sizeof(sAtlasFill));
+    memset(sAtlasDirty, 0, sizeof(sAtlasDirty));
+    sAtlasPage = 0;
+    sAtlasFull = 0;
+}
+
+/* Shelf packing: room for w x h on the page */
+static int atlas_place(int page, int w, int h, int* ox, int* oy) {
+    if (sAtlasFill[page].x + w > ATLAS_SIZE) {
+        sAtlasFill[page].x = 0;
+        sAtlasFill[page].y += sAtlasFill[page].rowH;
+        sAtlasFill[page].rowH = 0;
+    }
+    if (sAtlasFill[page].y + h > ATLAS_SIZE) {
+        return 0;
+    }
+    *ox = sAtlasFill[page].x;
+    *oy = sAtlasFill[page].y;
+    sAtlasFill[page].x += w;
+    if (h > sAtlasFill[page].rowH) {
+        sAtlasFill[page].rowH = h;
+    }
+    return 1;
+}
+
+/* The tile's texture on an atlas page (any page if page < 0); NULL when it
+   doesn't fit. Usable once ->ready (the frame after it was decoded). */
+static AtlasEntry* atlas_lookup(int tileIdx, int page) {
+    Tile* t = &rdp.tiles[tileIdx & 7];
+    u32 tlutMode = rdp.otherH & (3 << G_MDSFT_TEXTLUT);
+    u32 pitch = tile_pitch(t);
+    int w, h, x, y, ax, ay, i, p;
+    u64 hash;
+    AtlasEntry* e = NULL;
+
+    if (sAtlasTile[tileIdx & 7].e != NULL && sAtlasTile[tileIdx & 7].gen == sAtlasGen &&
+        sAtlasTile[tileIdx & 7].tmemGen == sTmemGen && sAtlasTile[tileIdx & 7].tlutMode == tlutMode &&
+        memcmp(&sAtlasTile[tileIdx & 7].tile, t, sizeof(Tile)) == 0 &&
+        (page < 0 || sAtlasTile[tileIdx & 7].e->page == page)) {
+        return sAtlasTile[tileIdx & 7].e;
+    }
+    tile_dims(t, &w, &h);
+    if (w > ATLAS_SIZE || h > ATLAS_SIZE || w * h * 4 > (int)sizeof(sDecodeBuf)) {
+        return NULL;
+    }
+    hash = tex_hash(t, w, h, pitch, tlutMode);
+    for (i = 0; i < 8; i++) {
+        AtlasEntry* c = &sAtlasCache[(hash + (u64)i) % ATLAS_CACHE];
+        if (c->gen == sAtlasGen && c->hash == hash && (page < 0 || c->page == page)) {
+            e = c;
+            goto found;
+        }
+        if (e == NULL && c->gen != sAtlasGen) {
+            e = c;
+        }
+    }
+    if (e == NULL) {
+        e = &sAtlasCache[hash % ATLAS_CACHE]; // a live entry of this generation: its texture stays on its page
+    }
+    p = page >= 0 ? page : sAtlasPage;
+    if (!atlas_place(p, w, h, &ax, &ay)) {
+        if (page >= 0 || sAtlasPage + 1 >= ATLAS_PAGES) {
+            sAtlasFull = 1;
+            return NULL;
+        }
+        p = ++sAtlasPage;
+        if (!atlas_place(p, w, h, &ax, &ay)) {
+            return NULL;
+        }
+    }
+    double tt = stat_ms();
+    for (y = 0; y < h; y++) {
+        u8* row = sAtlasRam + ((size_t)p * ATLAS_SIZE * ATLAS_SIZE + (size_t)(ay + y) * ATLAS_SIZE + ax) * 4;
+        for (x = 0; x < w; x++) {
+            decode_texel(&row[x * 4], t, pitch, tile_texel(x, t->masks, t->cms), tile_texel(y, t->maskt, t->cmt),
+                         tlutMode);
+        }
+    }
+    sAtlasDirty[p] = 1;
+    sTTex += stat_ms() - tt;
+    e->ready = 0;
+    e->hash = hash;
+    e->gen = sAtlasGen;
+    e->page = (u8)p;
+    e->x = (u16)ax;
+    e->y = (u16)ay;
+    e->w = (u16)w;
+    e->h = (u16)h;
+found:
+    if (!e->ready) {
+        return e; // next frame
+    }
+    sAtlasTile[tileIdx & 7].e = e;
+    sAtlasTile[tileIdx & 7].gen = sAtlasGen;
+    sAtlasTile[tileIdx & 7].tmemGen = sTmemGen;
+    sAtlasTile[tileIdx & 7].tlutMode = tlutMode;
+    sAtlasTile[tileIdx & 7].tile = *t;
+    return e;
+}
+
+/* Wrap mode of a tile axis for the shader: 0 repeat, 1 clamp, 2 mirror */
+static float atlas_wrap(int cm, int mask, int dim) {
+    GLint m = wrap_mode(cm, mask, dim);
+    return m == GL_REPEAT ? 0.0f : m == GL_MIRRORED_REPEAT ? 2.0f : 1.0f;
+}
+
+static void atlas_rect(const AtlasEntry* e, float r[4]) {
+    r[0] = e->x / (float)ATLAS_SIZE;
+    r[1] = e->y / (float)ATLAS_SIZE;
+    r[2] = e->w / (float)ATLAS_SIZE;
+    r[3] = e->h / (float)ATLAS_SIZE;
 }
 
 static void set_uniform4(Shader* sh, GLint loc, int slot, const float v[4]) {
@@ -1231,7 +1516,7 @@ static struct {
 static void set_tile(int ti, const Tile* n) {
     if (memcmp(&rdp.tiles[ti], n, sizeof(Tile)) != 0) {
         if (ti == (sBatchTile & 7) || ti == ((sBatchTile + 1) & 7)) {
-            flush_for(FR_TILE);
+            flush_tex(FR_TILE);
         }
         rdp.tiles[ti] = *n;
         sTileUv[ti].valid = 0;
@@ -1322,6 +1607,14 @@ static void copy_swapped(u8* dst, const u8* src, u32 n) {
             w = __builtin_bswap64(w);
             memcpy(dst + i, &w, 8);
         }
+    } else if (x == 3 && ((uintptr_t)src & 3) == 0) {
+        // u32 elements (a static recompilation's RDRAM)
+        for (; i + 4 <= n; i += 4) {
+            u32 w;
+            memcpy(&w, src + i, 4);
+            w = __builtin_bswap32(w);
+            memcpy(dst + i, &w, 4);
+        }
     } else if (x == 1 && ((uintptr_t)src & 1) == 0) {
         for (; i + 2 <= n; i += 2) {
             dst[i] = src[i + 1];
@@ -1362,6 +1655,33 @@ static const u8* texture_src(void) {
     return src;
 }
 
+/* The RDP stores odd lines of a load with the 32-bit halves of each 64-bit
+   word swapped (and its sampler swaps them back on odd rows): n bytes of
+   TMEM at dst. 32-bit texels, kept linearly here, swap in pairs (the two
+   halves of each 16 bytes). */
+static void tmem_swap_words(u32 dst, u32 n, int siz) {
+    u32 i;
+
+    // sTmem is 8-aligned and dst a multiple of 8: whole u32s
+    if (siz == G_IM_SIZ_32b) {
+        for (i = 0; i + 16 <= n && dst + i + 16 <= 4096; i += 16) {
+            u32* w = (u32*)&sTmem[dst + i];
+            u32 a = w[0], b = w[1];
+            w[0] = w[2];
+            w[1] = w[3];
+            w[2] = a;
+            w[3] = b;
+        }
+    } else {
+        for (i = 0; i + 8 <= n && dst + i + 8 <= 4096; i += 8) {
+            u32* w = (u32*)&sTmem[dst + i];
+            u32 a = w[0];
+            w[0] = w[1];
+            w[1] = a;
+        }
+    }
+}
+
 static void load_block(int tileIdx, u32 uls, u32 lrs, u32 dxt) {
     Tile* t = &rdp.tiles[tileIdx & 7];
     const u8* base = texture_src();
@@ -1370,7 +1690,6 @@ static void load_block(int tileIdx, u32 uls, u32 lrs, u32 dxt) {
     u32 bytes = rdp.timgSiz == G_IM_SIZ_4b ? (texels + 1) / 2 : texels << (rdp.timgSiz - 1);
     u32 dst = t->tmem * 8;
 
-    (void)dxt;
     if (src == NULL) {
         return;
     }
@@ -1386,9 +1705,20 @@ static void load_block(int tileIdx, u32 uls, u32 lrs, u32 dxt) {
     if (same_load(t->tmem, src, bytes, 0, 1)) {
         return;
     }
-    flush_for(FR_LOADBLOCK);
+    flush_tex(FR_LOADBLOCK);
     sTmemSrc[t->tmem & 511] = base; // after the flush: queued draws still use the old texture
     copy_swapped(&sTmem[dst], src, bytes);
+    {
+        // A line ends each time the dxt counter (1.11, one step per 64-bit
+        // word) passes a whole number; a dxt of 0 never does (data stored
+        // with its odd rows pre-swapped)
+        u32 unit = rdp.timgSiz == G_IM_SIZ_32b ? 16 : 8, i;
+        for (i = 0; i * unit < bytes; i++) {
+            if ((((i * unit / 8) * dxt) >> 11) & 1) {
+                tmem_swap_words(dst + i * unit, unit, rdp.timgSiz);
+            }
+        }
+    }
     sTmemGen++;
 }
 
@@ -1409,13 +1739,16 @@ static void load_tile(int tileIdx, u32 uls, u32 ult, u32 lrs, u32 lrt) {
     if (same_load(t->tmem, src + y0 * srcPitch + (x0 * bpt2) / 2, rowBytes * (y1 - y0 + 1), pitch, 2)) {
         return;
     }
-    flush_for(FR_LOADTILE);
+    flush_tex(FR_LOADTILE);
     sTmemSrc[t->tmem & 511] = src; // after the flush: queued draws still use the old texture
     for (y = y0; y <= y1; y++) {
         const u8* s = src + y * srcPitch + (x0 * bpt2) / 2;
         u32 d = t->tmem * 8 + (y - y0) * pitch;
         if (d < 4096) {
             copy_swapped(&sTmem[d], s, d + rowBytes > 4096 ? 4096 - d : rowBytes);
+            if ((y - y0) & 1) {
+                tmem_swap_words(d, (rowBytes + 15) & ~15u, rdp.timgSiz);
+            }
         }
     }
     sTmemGen++;
@@ -1438,7 +1771,7 @@ static void load_tlut(int tileIdx, u32 count) {
         u16 c = (rd8x(src + i * 2, x) << 8) | rd8x(src + i * 2 + 1, x);
         if (sTlut[first + i] != c) {
             if (!changed) {
-                flush_for(FR_TLUT);
+                flush_tex(FR_TLUT);
                 changed = 1;
             }
             sTlut[first + i] = c;
@@ -1453,7 +1786,7 @@ static void load_tlut(int tileIdx, u32 count) {
  * Batching and draw state
  * ------------------------------------------------------------------------- */
 
-#define VSTRIDE 21 // pos4 color4 uv0 2 uv1 2 fog1 prim4 env4
+#define VSTRIDE 33 // pos4 color4 uv0 2 uv1 2 fog1 prim4 env4 rect0 4 rect1 4 wrap4
 #define MAX_BATCH 3072
 static float sBatch[MAX_BATCH * VSTRIDE];
 static int sBatchVerts;
@@ -1474,7 +1807,7 @@ static int sVboNext = VBO_VERTS; // next free vertex; VBO_VERTS: orphan first
 static PFNGLMAPBUFFERRANGEEXTPROC sMapRange;
 static PFNGLUNMAPBUFFEROESPROC sUnmap;
 static int sVboOn = -1;
-static int sBatchScreen; // batch is screen-space (rects): full-screen viewport
+static int sBatchScreen; // batch is screen-space (rects): 1 in the 2D layer, 2 in the full-resolution frame
 
 /* ---------------------------------------------------------------------------
  * Auxiliary color images: an RGBA16 color image other than the 320-wide frame
@@ -1634,6 +1967,9 @@ static void apply_state(void) {
     if (s3Point && cyc < G_CYC_COPY && (rdp.otherH & (3 << G_MDSFT_TEXTFILT)) != G_TF_POINT) {
         flags |= SF_3POINT;
     }
+    if (sBatchAtlas >= 0) {
+        flags = (flags & ~SF_3POINT) | SF_ATLAS;
+    }
     if (sBatchScreen && S30_Getenv("DBG_ALPHA")) {
         flags = (flags & ~(SF_ALPHA_THRESH | SF_TEX_EDGE)) | SF_DBG_ALPHA;
         blend = 0;
@@ -1681,6 +2017,12 @@ static void apply_state(void) {
                 glBindTexture(GL_TEXTURE_2D, sBgTex);
                 sGL.tex[0] = sBgTex;
             }
+        } else if (sh->usesTex[i] && sBatchAtlas >= 0) {
+            if (sGL.tex[i] != sAtlasTex[sBatchAtlas]) {
+                glActiveTexture(GL_TEXTURE0 + i);
+                glBindTexture(GL_TEXTURE_2D, sAtlasTex[sBatchAtlas]);
+                sGL.tex[i] = sAtlasTex[sBatchAtlas];
+            }
         } else if (sh->usesTex[i]) {
             bind_tile(i, sBatchTile + i, size);
             if ((flags & SF_3POINT) && memcmp(sh->curSize[i], size, sizeof(size)) != 0) {
@@ -1713,7 +2055,7 @@ static void apply_state(void) {
             } else {
                 gl_blend_func(GL_ONE, GL_ZERO, GL_CONSTANT_ALPHA, GL_ZERO);
             }
-        } else if (sBatchScreen) {
+        } else if (sBatchScreen == 1) {
             gl_enable(GL_BLEND, 1, &sGL.blend);
             if (blend) {
                 gl_blend_func(src, dst, dst == GL_ONE ? GL_ZERO : GL_ONE, dst == GL_ONE ? GL_ONE : dst);
@@ -1729,10 +2071,22 @@ static void apply_state(void) {
     }
 
     // Depth (the 2D layer has none)
-    gl_enable(GL_DEPTH_TEST, !sBatchScreen && (rsp.geom & G_ZBUFFER) && (l & Z_CMP) && cyc < G_CYC_COPY,
+    // Depth: a draw that updates without comparing (Factor 5's terrain, which
+    // its microcode depth-sorts) still writes it; GL writes depth only with
+    // the test on, so it passes always
+    gl_enable(GL_DEPTH_TEST, !sBatchScreen && (rsp.geom & G_ZBUFFER) && (l & (Z_CMP | Z_UPD)) && cyc < G_CYC_COPY,
               &sGL.depthTest);
     {
-        int mask = !sBatchScreen && (l & Z_UPD) && cyc < G_CYC_COPY;
+        GLenum func = (l & Z_CMP) ? GL_LEQUAL : GL_ALWAYS;
+        if (sGL.depthFunc != func) {
+            glDepthFunc(func);
+            sGL.depthFunc = func;
+        }
+    }
+    {
+        // A primitive-depth draw without a primitive depth (Factor 5's sky)
+        // writes none rather than its own
+        int mask = !sBatchScreen && (l & Z_UPD) && cyc < G_CYC_COPY && !((l & G_ZS_PRIM) && !sPrimDepthSet);
         if (sGL.depthMask != mask) {
             glDepthMask(mask ? GL_TRUE : GL_FALSE);
             sGL.depthMask = mask;
@@ -1755,14 +2109,16 @@ static void apply_state(void) {
         gl_enable(GL_SCISSOR_TEST, 1, &sGL.scissor);
         gl_scissor(rdp.scX, AUX_H - rdp.scY - rdp.scH, rdp.scW, rdp.scH);
     } else {
-        float s = sBatchScreen ? 1.0f : FB_SCALE, w = sBatchScreen ? S30_2D_W : S30_FB_W;
+        float s = sBatchScreen == 1 ? 1.0f : FB_SCALE, w = sBatchScreen == 1 ? S30_2D_W : S30_FB_W;
         int m = sCfg.overscan;
         int fullScissor = rdp.scX <= m && rdp.scX + rdp.scW >= SCREEN_W - m;
         int fullScissorY = m > 0 && fullScissor && rdp.scY <= m && rdp.scY + rdp.scH >= SCREEN_H - m;
         int scY = fullScissorY ? 0 : rdp.scY, scH = fullScissorY ? SCREEN_H : rdp.scH;
 
-        if (sBatchScreen) {
+        if (sBatchScreen == 1) {
             gl_viewport(0, 0, S30_2D_W, S30_2D_H);
+        } else if (sBatchScreen == 2) {
+            gl_viewport(0, 0, S30_FB_W, S30_FB_H); // the 2D layer's mapping, 4:3 more pixels
         } else if (sWide && rsp.vpX <= 0.0f && rsp.vpX + rsp.vpW >= SCREEN_W) {
             gl_viewport(0, (int)((SCREEN_H - rsp.vpY - rsp.vpH) * s), S30_FB_W, (int)(rsp.vpH * s));
         } else {
@@ -1778,10 +2134,42 @@ static void apply_state(void) {
     }
 }
 
+/* Debug: /tmp/s30_skip holds "first last [bits]": those draws (numbered
+   from 1 in the frame, as the trace numbers them) are dropped, and the bits
+   switch parts of the renderer off (sDbg: 1 culling, 2 mipmaps, 4 the
+   near-plane split, 8 shade (white), 16 texture filtering). Re-read every 30
+   frames, so they can be bisected while the game runs. */
+
+static int skip_draw(void) {
+    static u32 first, last, readAt;
+
+    if (sFrame - readAt >= 30) {
+        FILE* f = fopen("/tmp/s30_skip", "r");
+        readAt = sFrame;
+        first = last = 0;
+        sDbg = 0;
+        if (f != NULL) {
+            unsigned a, b, c = 0;
+            if (fscanf(f, "%u %u %u", &a, &b, &c) >= 2) {
+                first = a;
+                last = b;
+                sDbg = c;
+            }
+            fclose(f);
+        }
+    }
+    return first != 0 && sStats.draws + 1 >= first && sStats.draws + 1 <= last;
+}
+
 static void flush(void) {
     double tf;
 
     if (sBatchVerts == 0) {
+        return;
+    }
+    if (skip_draw()) {
+        sStats.draws++;
+        sBatchVerts = 0;
         return;
     }
     if (sFlushReason >= 0) {
@@ -1794,7 +2182,7 @@ static void flush(void) {
             sBatchAux->rows = rdp.scY + rdp.scH < AUX_H ? rdp.scY + rdp.scH : AUX_H;
         }
         sBatchAux->dirty = 1;
-    } else if (sBatchScreen) {
+    } else if (sBatchScreen == 1) {
         S30Display_Bind2D();
     } else if (S30Display_Bind3D()) {
         gl_cache_reset(); // the 2D composite changed GL state
@@ -1829,10 +2217,11 @@ static void flush(void) {
         } attrs[] = {
             { ATTR_POS, 4, 0 }, { ATTR_COLOR, 4, 4 }, { ATTR_UV0, 2, 8 },   { ATTR_UV1, 2, 10 },
             { ATTR_FOG, 1, 12 }, { ATTR_PRIM, 4, 13 }, { ATTR_ENV, 4, 17 },
+            { ATTR_RECT0, 4, 21 }, { ATTR_RECT1, 4, 25 }, { ATTR_WRAP, 4, 29 },
         };
         int a;
         glBindBuffer(GL_ARRAY_BUFFER, sVboOn ? sVbo : 0);
-        for (a = 0; a < 7; a++) {
+        for (a = 0; a < 10; a++) {
             glEnableVertexAttribArray(attrs[a].idx);
             glVertexAttribPointer(attrs[a].idx, attrs[a].n, GL_FLOAT, GL_FALSE, VSTRIDE * 4,
                                   sVboOn ? (const void*)(uintptr_t)(attrs[a].ofs * 4) : (const void*)(sBatch + attrs[a].ofs));
@@ -1915,14 +2304,59 @@ static void flush(void) {
 }
 
 /* Draw commands go to the frame or an auxiliary image, never the z-buffer */
+/* The color image is the depth buffer (a z clear); KSEG0 and physical
+   addresses of one buffer compare equal */
+/* An image address as RAM: segmented ones (segments 1-15; Diddy Kong Racing
+   names its framebuffer and z-buffer by segment, both at offset 0) through
+   the segment table */
+static u32 image_addr(u32 addr) {
+    u32 seg = addr >> 24;
+
+    return seg >= 1 && seg <= 15 ? (u32)(uintptr_t)pc_resolve_addr(addr) : addr;
+}
+
+static int cimg_is_zimg(void) {
+    return ((image_addr(rdp.cimg) ^ image_addr(rdp.zimg)) & 0x00FFFFFF) == 0;
+}
+
 static int drawing_enabled(void) {
-    return rdp.cimg != rdp.zimg && (rdp.cimgIsFrame || sAuxCur != NULL);
+    return !cimg_is_zimg() && (rdp.cimgIsFrame || sAuxCur != NULL);
 }
 
 /* Vertices about to be added: a batch is one draw, so it needs one target,
    one space (screen or 3D) and one render tile */
 static void begin_batch_tile(int screen, int tile) {
-    if (sBatchScreen != screen || sBatchAux != sAuxCur || sBatchTile != tile || sBatchVerts + 6 > MAX_BATCH) {
+    int page = -1;
+
+    // Atlas: point-sampled, textured 3D in the frame
+    if (sCfg.atlas && !screen && sAuxCur == NULL && rsp.texOn && sTexOverrideCount == 0 && !s3Point &&
+        (rdp.otherH & (3 << G_MDSFT_TEXTFILT)) == G_TF_POINT && (rdp.otherH & (3 << G_MDSFT_CYCLETYPE)) != G_CYC_COPY) {
+        AtlasEntry* e0 = atlas_lookup(tile, -1);
+        AtlasEntry* e1 = e0 != NULL ? atlas_lookup(tile + 1, e0->page) : NULL;
+
+        // A texture decoded this frame draws the usual way until its page is uploaded
+        if (e0 != NULL && (!e0->ready || (e1 != NULL && !e1->ready))) {
+            e0 = NULL;
+        }
+        if (e0 != NULL) {
+            Tile* t0 = &rdp.tiles[tile & 7];
+            Tile* t1 = &rdp.tiles[(tile + 1) & 7];
+
+            if (e1 == NULL) {
+                e1 = e0;
+                t1 = t0;
+            }
+            page = e0->page;
+            atlas_rect(e0, sAtlasRect[0]);
+            atlas_rect(e1, sAtlasRect[1]);
+            sAtlasWrap[0] = atlas_wrap(t0->cms, t0->masks, e0->w);
+            sAtlasWrap[1] = atlas_wrap(t0->cmt, t0->maskt, e0->h);
+            sAtlasWrap[2] = atlas_wrap(t1->cms, t1->masks, e1->w);
+            sAtlasWrap[3] = atlas_wrap(t1->cmt, t1->maskt, e1->h);
+        }
+    }
+    if (sBatchScreen != screen || sBatchAux != sAuxCur || sBatchAtlas != page || (page < 0 && sBatchTile != tile) ||
+        sBatchVerts + 6 > MAX_BATCH) {
         flush_for(sBatchVerts + 6 > MAX_BATCH ? FR_BATCH_FULL
                   : sBatchTile != tile         ? FR_BATCH_TILE
                                                : FR_BATCH_SPACE);
@@ -1930,6 +2364,14 @@ static void begin_batch_tile(int screen, int tile) {
     sBatchScreen = screen;
     sBatchAux = sAuxCur;
     sBatchTile = tile;
+    sBatchAtlas = page;
+}
+
+/* Where rectangles go: the 2D layer (1:1 with N64 pixels), or the
+   full-resolution frame when the game's frame is finer than that (its menus
+   at 512 or 640 wide would lose rows in the 2D layer) */
+static int rect_space(void) {
+    return sAuxCur == NULL && (sFrameScale < 1.0f || sFrameScaleY < 1.0f) ? 2 : 1;
 }
 
 static void begin_batch(int screen) {
@@ -1955,6 +2397,12 @@ static void push_vertex(float x, float y, float z, float w, const float col[4], 
     d[12] = fog;
     memcpy(&d[13], rdp.prim, sizeof(rdp.prim));
     memcpy(&d[17], rdp.env, sizeof(rdp.env));
+    if (sBatchAtlas >= 0) {
+        memcpy(&d[21], sAtlasRect, sizeof(sAtlasRect));
+        memcpy(&d[29], sAtlasWrap, sizeof(sAtlasWrap));
+    } else {
+        memset(&d[21], 0, 12 * sizeof(float));
+    }
     sBatchVerts++;
 }
 
@@ -1989,10 +2437,7 @@ static void handle_vtx(u32 w0, u32 w1) {
         d->y = x * m[0][1] + y * m[1][1] + z * m[2][1] + m[3][1];
         d->z = x * m[0][2] + y * m[1][2] + z * m[2][2] + m[3][2];
         d->w = x * m[0][3] + y * m[1][3] + z * m[2][3] + m[3][3];
-        if (sWide && rsp.vpX <= 0.0f && rsp.vpX + rsp.vpW >= SCREEN_W) {
-            d->x *= WIDE_XSCALE; // full-screen 3D: widescreen field of view
-        }
-        d->clip = (d->x < -d->w) | ((d->x > d->w) << 1) | ((d->y < -d->w) << 2) | ((d->y > d->w) << 3);
+        gfx_finish_vtx(d);
 
         d->u = (float)(v->v.tc[0] * rsp.texScaleS >> 16);
         d->v = (float)(v->v.tc[1] * rsp.texScaleT >> 16);
@@ -2030,21 +2475,57 @@ static void handle_vtx(u32 w0, u32 w1) {
         }
         d->a = v->v.cn[3] / 255.0f;
         if (rsp.geom & G_FOG) {
-            // Fog factor replaces shade alpha, as on the RSP
-            float w = fabsf(d->w) < 0.001f ? 0.001f : d->w;
-            float winv = w < 0.0f ? 32767.0f : 1.0f / w; // RSP: behind the eye
-            float f = d->z * winv * rsp.fogMul + rsp.fogOfs;
-            f = f < 0.0f ? 0.0f : f > 255.0f ? 255.0f : f;
-            d->a = f / 255.0f;
+            d->a = gfx_fog(d); // the fog factor replaces shade alpha, as on the RSP
         }
-        // F3DEX2 NoN: no near-plane clipping (first-person items between the
-        // eye and the near plane still draw), the RDP clamping each pixel's
-        // depth. Done in tri() (split at the plane): clamping this vertex
-        // alone would pull the depth of a whole large triangle (ground
-        // crossing the near plane) forward over everything
-        if (d->w > 0.0f && d->z < -d->w) {
-            d->clip |= CLIP_NEAR;
-        }
+    }
+}
+
+float gfx_fog(const RspVtx* d) {
+    float w = fabsf(d->w) < 0.001f ? 0.001f : d->w;
+    float winv = w < 0.0f ? 32767.0f : 1.0f / w; // RSP: behind the eye
+    float f = d->z * winv * rsp.fogMul + rsp.fogOfs;
+
+    f = f < 0.0f ? 0.0f : f > 255.0f ? 255.0f : f;
+    return f / 255.0f;
+}
+
+u32 gfx_geometry(void) {
+    return rsp.geom;
+}
+
+u32 gfx_prim_color(void) {
+    return sPrimWord;
+}
+
+u32 gfx_othermode_l(void) {
+    return rdp.otherL;
+}
+
+u8* gfx_rdram(void) {
+    return sCfg.rdram;
+}
+
+int gfx_tracing(void) {
+    return sTraceFrame != 0 && sFrame == sTraceFrame;
+}
+
+RspVtx* gfx_vtx(int i) {
+    return &rsp.vtx[i % MAX_VERTS];
+}
+
+/* A vertex in clip space: the widescreen field of view and its clip flags */
+void gfx_finish_vtx(RspVtx* d) {
+    if (sWide && rsp.vpX <= 0.0f && rsp.vpX + rsp.vpW >= SCREEN_W) {
+        d->x *= WIDE_XSCALE; // full-screen 3D: widescreen field of view
+    }
+    d->clip = (d->x < -d->w) | ((d->x > d->w) << 1) | ((d->y < -d->w) << 2) | ((d->y > d->w) << 3);
+    // F3DEX2 NoN: no near-plane clipping (first-person items between the
+    // eye and the near plane still draw), the RDP clamping each pixel's
+    // depth. Done in tri() (split at the plane): clamping this vertex
+    // alone would pull the depth of a whole large triangle (ground
+    // crossing the near plane) forward over everything
+    if (d->w > 0.0f && d->z < -d->w) {
+        d->clip |= CLIP_NEAR;
     }
 }
 
@@ -2075,11 +2556,18 @@ static void emit_vertex(const RspVtx* p, int nearest) {
     float u0 = 0, v0 = 0, u1 = 0, v1 = 0;
     float col[4] = { p->r, p->g, p->b, p->a };
 
+    if (sDbg & 8) {
+        col[0] = col[1] = col[2] = 1.0f;
+    }
+
     if (rsp.texOn) {
         tile_uv_fast(rsp.texTile, p->u, p->v, &u0, &v0);
         tile_uv_fast(rsp.texTile + 1, p->u, p->v, &u1, &v1);
     }
-    push_vertex(p->x, p->y, depth_z(p, nearest), p->w, col, u0, v0, u1, v1, (rsp.geom & G_FOG) ? p->a : 0.0f);
+    // Depth source: the primitive depth (constant), when the game set one
+    float z = (rdp.otherL & G_ZS_PRIM) && sPrimDepthSet && p->w > 0.0f ? depth_ndc(rect_depth()) * p->w : depth_z(p, nearest);
+
+    push_vertex(p->x, p->y, z, p->w, col, u0, v0, u1, v1, (rsp.geom & G_FOG) ? p->a : 0.0f);
 }
 
 /* A polygon (3-4 vertices, in order) as a fan */
@@ -2114,7 +2602,7 @@ static RspVtx near_point(const RspVtx* a, const RspVtx* b) {
     return r;
 }
 
-static void tri(int i0, int i1, int i2) {
+void gfx_tri(int i0, int i1, int i2) {
     const RspVtx* v[3] = { &rsp.vtx[i0 % MAX_VERTS], &rsp.vtx[i1 % MAX_VERTS], &rsp.vtx[i2 % MAX_VERTS] };
     int k, near;
 
@@ -2127,7 +2615,7 @@ static void tri(int i0, int i1, int i2) {
         sStats.trisClipped++;
         return; // all outside the same plane
     }
-    if (rsp.geom & G_CULL_BOTH) {
+    if ((rsp.geom & G_CULL_BOTH) && !(sDbg & 1)) {
         // Face culling here rather than in GL, so cull mode changes don't end
         // the batch. The sign of det(x, y, w) is the facing in window space
         // (counter-clockwise front in GL's y-up NDC), also for triangles
@@ -2142,6 +2630,13 @@ static void tri(int i0, int i1, int i2) {
         }
     }
     near = (v[0]->clip & v[1]->clip & v[2]->clip & CLIP_NEAR) != 0;
+    if (sDbg & 4) {
+        begin_batch(0);
+        for (k = 0; k < 3; k++) {
+            emit_vertex(v[k], 0);
+        }
+        return;
+    }
     if (near || !((v[0]->clip | v[1]->clip | v[2]->clip) & CLIP_NEAR) || v[0]->w <= 0.0f || v[1]->w <= 0.0f ||
         v[2]->w <= 0.0f) {
         // Wholly in front of the near plane: in the near slice (see
@@ -2230,6 +2725,20 @@ static void handle_mtx(u32 w0, u32 w1) {
     rsp.mvpDirty = 1;
 }
 
+void gfx_set_viewport(float x, float y, float w, float h) {
+    x = sFrameX + x * sFrameScale;
+    y = sFrameY + y * sFrameScaleY;
+    w *= sFrameScale;
+    h *= sFrameScaleY;
+    if (x != rsp.vpX || y != rsp.vpY || w != rsp.vpW || h != rsp.vpH) {
+        flush_for(FR_VIEWPORT);
+        rsp.vpX = x;
+        rsp.vpY = y;
+        rsp.vpW = w;
+        rsp.vpH = h;
+    }
+}
+
 static void handle_movemem(u32 w0, u32 w1) {
     u32 idx = w0 & 0xFF;
     u32 ofs = ((w0 >> 8) & 0xFF) * 8;
@@ -2243,11 +2752,7 @@ static void handle_movemem(u32 w0, u32 w1) {
         float sx = vp->vp.vscale[0] / 4.0f, sy = vp->vp.vscale[1] / 4.0f;
         float tx = vp->vp.vtrans[0] / 4.0f, ty = vp->vp.vtrans[1] / 4.0f;
 
-        flush_for(FR_VIEWPORT);
-        rsp.vpX = tx - sx;
-        rsp.vpY = ty - sy;
-        rsp.vpW = 2.0f * sx;
-        rsp.vpH = 2.0f * sy;
+        gfx_set_viewport(tx - sx, ty - sy, 2.0f * sx, 2.0f * sy);
     } else if (idx == G_MV_LIGHT) {
         if (ofs == G_MVO_LOOKATX || ofs == G_MVO_LOOKATY) {
             float* la = rsp.lookat[ofs == G_MVO_LOOKATY];
@@ -2378,7 +2883,7 @@ static void handle_fillrect(u32 w0, u32 w1) {
     u32 cyc = rdp.otherH & (3 << G_MDSFT_CYCLETYPE);
     float zero[2] = { 0, 0 };
 
-    if (rdp.cimg == rdp.zimg) {
+    if (cimg_is_zimg()) {
         // Clearing the depth buffer (the game fills the z image)
         flush_for(FR_ZCLEAR);
         S30Display_Bind3D();
@@ -2395,13 +2900,21 @@ static void handle_fillrect(u32 w0, u32 w1) {
     (void)cyc;
     lrx += 1.0f;
     lry += 1.0f;
+    if (sAuxCur == NULL) {
+        ulx = sFrameX + ulx * sFrameScale;
+        uly = sFrameY + uly * sFrameScaleY;
+        lrx = sFrameX + lrx * sFrameScale;
+        lry = sFrameY + lry * sFrameScaleY;
+    }
     if (sAuxCur == NULL && ulx <= 0.0f && lrx >= SCREEN_W) {
         // Full-width fill (fade, letterbox bar): to the panel's edges
         ulx = -WIDE_PAD;
         lrx = SCREEN_W + WIDE_PAD;
+    } else {
+        wide_rect(&ulx, &lrx, sAuxCur != NULL);
     }
     sStats.fills++;
-    begin_batch(1);
+    begin_batch(rect_space());
     {
         static const float none[4] = { 0, 0, 0, 0 };
 
@@ -2455,7 +2968,7 @@ static void hud_trace_frame(void) {
     sHudLine[0] = 0;
 }
 
-static void handle_texrect(u32 w0, u32 w1, u32 h1, u32 h2, int flip) {
+void gfx_texrect(u32 w0, u32 w1, u32 h1, u32 h2, int flip) {
     float lrx = ((w0 >> 12) & 0xFFF) / 4.0f, lry = (w0 & 0xFFF) / 4.0f;
     int tile = (w1 >> 24) & 7;
     float ulx = ((w1 >> 12) & 0xFFF) / 4.0f, uly = (w1 & 0xFFF) / 4.0f;
@@ -2478,11 +2991,18 @@ static void handle_texrect(u32 w0, u32 w1, u32 h1, u32 h2, int flip) {
     // 10.5 texel coords at the far corners
     s1 = s + (flip ? h : w) * dsdx * 32.0f;
     t1 = t + (flip ? w : h) * dtdy * 32.0f;
+    if (sAuxCur == NULL) {
+        ulx = sFrameX + ulx * sFrameScale;
+        uly = sFrameY + uly * sFrameScaleY;
+        lrx = sFrameX + lrx * sFrameScale;
+        lry = sFrameY + lry * sFrameScaleY;
+    }
+    wide_rect(&ulx, &lrx, sAuxCur != NULL);
 
     // Rects name their own tile; consecutive ones with the same tile and state
     // share a draw (state changes and texture loads flush as for triangles)
     sStats.rects++;
-    begin_batch_tile(1, tile);
+    begin_batch_tile(rect_space(), tile);
     tile_uv(tile, s, t, &a0[0], &a0[1]);
     tile_uv(tile, s1, t1, &a1[0], &a1[1]);
     if (sTraceFrame != 0 && sFrame == sTraceFrame) {
@@ -2596,7 +3116,7 @@ static void handle_bg(u32 w1, int copy) {
     sStats.rects++;
     sBgTex = tex;
     sHadBg = 1;
-    begin_batch(1);
+    begin_batch(rect_space());
     push_rect(x0, y0, x1, y1, a0, a1, zero, zero, 0);
     flush_for(FR_BG);
     sBgTex = 0;
@@ -2675,7 +3195,7 @@ static u32 f3dex_geom(u32 g) {
 }
 
 /* Rewrites an F3DEX command in place as F3DEX2. Returns 0 to skip it. */
-static int f3dex_to_f3dex2(u32* pw0, u32* pw1) {
+int gfx_f3dex_to_f3dex2(u32* pw0, u32* pw1) {
     u32 w0 = *pw0, w1 = *pw1;
     u8 cmd = w0 >> 24;
 
@@ -2799,6 +3319,267 @@ static int f3dex_to_f3dex2(u32* pw0, u32* pw1) {
     return 1;
 }
 
+/* One F3DEX2 command that isn't flow control (G_DL, G_ENDDL, ...): the
+   number of following 8-byte words it took as well */
+int gfx_command(const Gfx* dl, u32 w0, u32 w1) {
+    u8 cmd = w0 >> 24;
+
+    switch (cmd) {
+        case G_VTX:
+            handle_vtx(w0, w1);
+            break;
+        case G_MODIFYVTX:
+            handle_modifyvtx(w0, w1);
+            break;
+        case G_TRI1:
+            gfx_tri(((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
+            break;
+        case G_TRI2:
+        case G_QUAD:
+            gfx_tri(((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
+            gfx_tri(((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
+            break;
+        case G_MTX:
+            handle_mtx(w0, w1);
+            break;
+        case G_POPMTX: {
+            u32 n = w1 / 64;
+            rsp.mvTop = (u32)rsp.mvTop >= n ? rsp.mvTop - (int)n : 0;
+            rsp.mvpDirty = 1;
+            rsp.lightsDirty = 1;
+            break;
+        }
+        case G_GEOMETRYMODE: {
+            u32 g = (rsp.geom & w0) | w1;
+            if (g != rsp.geom) {
+                // Lighting/fog/texgen are applied per vertex at G_VTX and
+                // culling per triangle; only the z-buffer is draw state
+                if ((g ^ rsp.geom) & G_ZBUFFER) {
+                    flush_for(FR_GEOM);
+                }
+                if ((g ^ rsp.geom) & (G_LIGHTING | G_TEXTURE_GEN)) {
+                    rsp.lightsDirty = 1;
+                }
+                rsp.geom = g;
+            }
+            break;
+        }
+        case G_MOVEMEM:
+            handle_movemem(w0, w1);
+            break;
+        case G_MOVEWORD:
+            handle_moveword(w0, w1);
+            break;
+        case G_TEXTURE: {
+            int on = (w0 >> 1) & 0x7F;
+            int tile = (w0 >> 8) & 7;
+            if (on != rsp.texOn || tile != rsp.texTile) {
+                flush_for(FR_TEXTURE);
+            }
+            rsp.texScaleS = w1 >> 16;
+            rsp.texScaleT = w1 & 0xFFFF;
+            rsp.texOn = on;
+            rsp.texTile = tile;
+            break;
+        }
+        case G_RDPHALF_1:
+            rsp.rdpHalf1 = w1;
+            break;
+        case G_RDPHALF_2:
+            rsp.rdpHalf2 = w1;
+            break;
+        case G_TEXRECT:
+        case G_TEXRECTFLIP: {
+            // Followed by RDPHALF_1 (s, t) and RDPHALF_2 (dsdx, dtdy)
+            u32 h1 = dl[1].words.w1, h2 = dl[2].words.w1;
+            gfx_texrect(w0, w1, h1, h2, cmd == G_TEXRECTFLIP);
+            return 2;
+        }
+        case G_FILLRECT:
+            handle_fillrect(w0, w1);
+            break;
+        case G_SETCIMG: {
+            u32 width = (w0 & 0xFFF) + 1;
+
+            sStats.cimgs++;
+            flush_for(FR_CIMG);
+            rdp.cimg = w1;
+            // A frame: the screen-wide image (320, or a high resolution 512 or 640)
+            rdp.cimgIsFrame = width >= SCREEN_W;
+            if (rdp.cimgIsFrame) {
+                frame_mapping(width);
+            }
+            sAuxCur = NULL;
+            if (!rdp.cimgIsFrame && ((w0 >> 19) & 3) == G_IM_SIZ_16b && width <= AUX_MAX_W) {
+                sAuxCur = aux_get(pc_resolve_addr(w1), width);
+            }
+            break;
+        }
+        case G_SETZIMG:
+            rdp.zimg = w1;
+            if (sAuxCur != NULL) {
+                // Rendering to an auxiliary image with its own z-buffer
+                // (cleared by the game just before)
+                flush_for(FR_ZIMG);
+                aux_bind(sAuxCur);
+                gl_cache_reset();
+                glDisable(GL_SCISSOR_TEST);
+                glDepthMask(GL_TRUE);
+                glClear(GL_DEPTH_BUFFER_BIT);
+            }
+            break;
+        case G_SETTIMG:
+            rdp.timgFmt = (w0 >> 21) & 7;
+            rdp.timgSiz = (w0 >> 19) & 3;
+            rdp.timgWidth = (w0 & 0xFFF) + 1;
+            rdp.timgAddr = w1;
+            sTimgCmd = dl;
+            break;
+        case G_SETCOMBINE: {
+            // 1-cycle draws read only the first cycle's terms: a change in
+            // the second alone needs no new draw (a switch to 2-cycle
+            // flushes as a mode change)
+            int one = (rdp.otherH & (3 << G_MDSFT_CYCLETYPE)) == G_CYC_1CYCLE;
+            u32 m0 = one ? COMB1_W0 : 0xFFFFFF, m1 = one ? COMB1_W1 : 0xFFFFFFFF;
+
+            if (((w0 ^ rdp.combW0) & m0) || ((w1 ^ rdp.combW1) & m1)) {
+                flush_for(FR_COMBINE);
+            }
+            rdp.combW0 = w0 & 0xFFFFFF;
+            rdp.combW1 = w1;
+            break;
+        }
+        case G_SETOTHERMODE_H: {
+            u32 m = rdp.otherH;
+            set_othermode(&m, w0, w1);
+            if ((m ^ rdp.otherH) & OTHERH_USED) {
+                flush_for(FR_OMODEH);
+            }
+            rdp.otherH = m;
+            break;
+        }
+        case G_SETOTHERMODE_L: {
+            u32 m = rdp.otherL;
+            set_othermode(&m, w0, w1);
+            if ((m ^ rdp.otherL) & OTHERL_USED) {
+                flush_for(FR_OMODEL);
+            }
+            rdp.otherL = m;
+            break;
+        }
+        case G_RDPSETOTHERMODE:
+            if (((w0 & 0xFFFFFF) ^ rdp.otherH) & OTHERH_USED || (w1 ^ rdp.otherL) & OTHERL_USED) {
+                flush_for(FR_RDPOMODE);
+            }
+            rdp.otherH = w0 & 0xFFFFFF;
+            rdp.otherL = w1;
+            break;
+        case G_SETPRIMCOLOR:
+            // per-vertex attribute: no flush needed
+            color_from_word(rdp.prim, w1);
+            sPrimWord = w1;
+            if (rdp.primLod != (w0 & 0xFF) / 255.0f) {
+                flush_for(FR_PRIMLOD);
+                rdp.primLod = (w0 & 0xFF) / 255.0f;
+            }
+            break;
+        case G_SETENVCOLOR:
+            color_from_word(rdp.env, w1);
+            break;
+        case G_SETFOGCOLOR: {
+            float c[4];
+            color_from_word(c, w1);
+            if (memcmp(c, rdp.fog, sizeof(c)) != 0) {
+                flush_for(FR_FOGCOL);
+                memcpy(rdp.fog, c, sizeof(c));
+            }
+            break;
+        }
+        case G_SETBLENDCOLOR: {
+            float c[4];
+            color_from_word(c, w1);
+            if (memcmp(c, rdp.blend, sizeof(c)) != 0) {
+                flush_for(FR_BLENDCOL);
+                memcpy(rdp.blend, c, sizeof(c));
+            }
+            break;
+        }
+        case G_SETFILLCOLOR: {
+            u16 c = w1 & 0xFFFF;
+            u8 r = (c >> 11) & 31, g = (c >> 6) & 31, b = (c >> 1) & 31;
+            float f[4] = { r / 31.0f, g / 31.0f, b / 31.0f, (c & 1) ? 1.0f : 0.0f };
+            if (memcmp(f, rdp.fill, sizeof(f)) != 0) {
+                flush_for(FR_FILLCOL);
+                memcpy(rdp.fill, f, sizeof(f));
+            }
+            break;
+        }
+        case G_SETPRIMDEPTH:
+            rdp.primDepth = w1 >> 16;
+            sPrimDepthSet = 1;
+            break;
+        case G_SETSCISSOR: {
+            int x = ((w0 >> 12) & 0xFFF) / 4, y = (w0 & 0xFFF) / 4;
+            int w = ((w1 >> 12) & 0xFFF) / 4 - x, h = (w1 & 0xFFF) / 4 - y;
+            x = (int)(sFrameX + x * sFrameScale);
+            y = (int)(sFrameY + y * sFrameScaleY);
+            w = (int)(w * sFrameScale);
+            h = (int)(h * sFrameScaleY);
+            if (x != rdp.scX || y != rdp.scY || w != rdp.scW || h != rdp.scH) {
+                flush_for(FR_SCISSOR);
+                rdp.scX = x;
+                rdp.scY = y;
+                rdp.scW = w;
+                rdp.scH = h;
+            }
+            break;
+        }
+        case G_SETTILE: {
+            int ti = (w1 >> 24) & 7;
+            Tile n = rdp.tiles[ti];
+            n.fmt = (w0 >> 21) & 7;
+            n.siz = (w0 >> 19) & 3;
+            n.line = (w0 >> 9) & 0x1FF;
+            n.tmem = w0 & 0x1FF;
+            n.palette = (w1 >> 20) & 0xF;
+            n.cmt = (w1 >> 18) & 3;
+            n.maskt = (w1 >> 14) & 0xF;
+            n.shiftt = (w1 >> 10) & 0xF;
+            n.cms = (w1 >> 8) & 3;
+            n.masks = (w1 >> 4) & 0xF;
+            n.shifts = w1 & 0xF;
+            set_tile(ti, &n);
+            break;
+        }
+        case G_SETTILESIZE: {
+            int ti = (w1 >> 24) & 7;
+            Tile n = rdp.tiles[ti];
+            n.uls = (w0 >> 12) & 0xFFF;
+            n.ult = w0 & 0xFFF;
+            n.lrs = (w1 >> 12) & 0xFFF;
+            n.lrt = w1 & 0xFFF;
+            set_tile(ti, &n);
+            break;
+        }
+        case G_LOADBLOCK:
+            load_block((w1 >> 24) & 7, (w0 >> 12) & 0xFFF, (w1 >> 12) & 0xFFF, w1 & 0xFFF);
+            break;
+        case G_LOADTILE:
+            load_tile((w1 >> 24) & 7, (w0 >> 12) & 0xFFF, w0 & 0xFFF, (w1 >> 12) & 0xFFF, w1 & 0xFFF);
+            break;
+        case G_BG_COPY:
+        case G_BG_1CYC:
+            handle_bg(w1, cmd == G_BG_COPY);
+            break;
+        case G_LOADTLUT:
+            load_tlut((w1 >> 24) & 7, ((w1 >> 14) & 0x3FF) + 1);
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
 static void walk(Gfx* dl, int depth) {
     if (dl == NULL || depth > DL_DEPTH || ((uintptr_t)dl & 3)) {
         return;
@@ -2807,7 +3588,7 @@ static void walk(Gfx* dl, int depth) {
         u32 w0 = dl->words.w0, w1 = dl->words.w1;
         u8 cmd;
 
-        if (sCfg.ucode != S30_UCODE_F3DEX2 && !f3dex_to_f3dex2(&w0, &w1)) {
+        if (sCfg.ucode != S30_UCODE_F3DEX2 && !gfx_f3dex_to_f3dex2(&w0, &w1)) {
             continue;
         }
         cmd = w0 >> 24;
@@ -2832,63 +3613,6 @@ static void walk(Gfx* dl, int depth) {
             continue;
         }
         switch (cmd) {
-            case G_VTX:
-                handle_vtx(w0, w1);
-                break;
-            case G_MODIFYVTX:
-                handle_modifyvtx(w0, w1);
-                break;
-            case G_TRI1:
-                tri(((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
-                break;
-            case G_TRI2:
-            case G_QUAD:
-                tri(((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
-                tri(((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
-                break;
-            case G_MTX:
-                handle_mtx(w0, w1);
-                break;
-            case G_POPMTX: {
-                u32 n = w1 / 64;
-                rsp.mvTop = (u32)rsp.mvTop >= n ? rsp.mvTop - (int)n : 0;
-                rsp.mvpDirty = 1;
-                rsp.lightsDirty = 1;
-                break;
-            }
-            case G_GEOMETRYMODE: {
-                u32 g = (rsp.geom & w0) | w1;
-                if (g != rsp.geom) {
-                    // Lighting/fog/texgen are applied per vertex at G_VTX and
-                    // culling per triangle; only the z-buffer is draw state
-                    if ((g ^ rsp.geom) & G_ZBUFFER) {
-                        flush_for(FR_GEOM);
-                    }
-                    if ((g ^ rsp.geom) & (G_LIGHTING | G_TEXTURE_GEN)) {
-                        rsp.lightsDirty = 1;
-                    }
-                    rsp.geom = g;
-                }
-                break;
-            }
-            case G_MOVEMEM:
-                handle_movemem(w0, w1);
-                break;
-            case G_MOVEWORD:
-                handle_moveword(w0, w1);
-                break;
-            case G_TEXTURE: {
-                int on = (w0 >> 1) & 0x7F;
-                int tile = (w0 >> 8) & 7;
-                if (on != rsp.texOn || tile != rsp.texTile) {
-                    flush_for(FR_TEXTURE);
-                }
-                rsp.texScaleS = w1 >> 16;
-                rsp.texScaleT = w1 & 0xFFFF;
-                rsp.texOn = on;
-                rsp.texTile = tile;
-                break;
-            }
             case G_DL:
                 sStats.dls++;
                 if (sTraceFrame != 0 && sFrame == sTraceFrame) {
@@ -2915,190 +3639,8 @@ static void walk(Gfx* dl, int depth) {
                 }
                 break;
             }
-            case G_RDPHALF_1:
-                rsp.rdpHalf1 = w1;
-                break;
-            case G_RDPHALF_2:
-                rsp.rdpHalf2 = w1;
-                break;
-            case G_TEXRECT:
-            case G_TEXRECTFLIP: {
-                // Followed by RDPHALF_1 (s, t) and RDPHALF_2 (dsdx, dtdy)
-                u32 h1 = dl[1].words.w1, h2 = dl[2].words.w1;
-                handle_texrect(w0, w1, h1, h2, cmd == G_TEXRECTFLIP);
-                dl += 2;
-                break;
-            }
-            case G_FILLRECT:
-                handle_fillrect(w0, w1);
-                break;
-            case G_SETCIMG: {
-                u32 width = (w0 & 0xFFF) + 1;
-
-                sStats.cimgs++;
-                flush_for(FR_CIMG);
-                rdp.cimg = w1;
-                rdp.cimgIsFrame = width == SCREEN_W;
-                sAuxCur = NULL;
-                if (!rdp.cimgIsFrame && ((w0 >> 19) & 3) == G_IM_SIZ_16b && width <= AUX_MAX_W) {
-                    sAuxCur = aux_get(pc_resolve_addr(w1), width);
-                }
-                break;
-            }
-            case G_SETZIMG:
-                rdp.zimg = w1;
-                if (sAuxCur != NULL) {
-                    // Rendering to an auxiliary image with its own z-buffer
-                    // (cleared by the game just before)
-                    flush_for(FR_ZIMG);
-                    aux_bind(sAuxCur);
-                    gl_cache_reset();
-                    glDisable(GL_SCISSOR_TEST);
-                    glDepthMask(GL_TRUE);
-                    glClear(GL_DEPTH_BUFFER_BIT);
-                }
-                break;
-            case G_SETTIMG:
-                rdp.timgFmt = (w0 >> 21) & 7;
-                rdp.timgSiz = (w0 >> 19) & 3;
-                rdp.timgWidth = (w0 & 0xFFF) + 1;
-                rdp.timgAddr = w1;
-                sTimgCmd = dl;
-                break;
-            case G_SETCOMBINE: {
-                // 1-cycle draws read only the first cycle's terms: a change in
-                // the second alone needs no new draw (a switch to 2-cycle
-                // flushes as a mode change)
-                int one = (rdp.otherH & (3 << G_MDSFT_CYCLETYPE)) == G_CYC_1CYCLE;
-                u32 m0 = one ? COMB1_W0 : 0xFFFFFF, m1 = one ? COMB1_W1 : 0xFFFFFFFF;
-
-                if (((w0 ^ rdp.combW0) & m0) || ((w1 ^ rdp.combW1) & m1)) {
-                    flush_for(FR_COMBINE);
-                }
-                rdp.combW0 = w0 & 0xFFFFFF;
-                rdp.combW1 = w1;
-                break;
-            }
-            case G_SETOTHERMODE_H: {
-                u32 m = rdp.otherH;
-                set_othermode(&m, w0, w1);
-                if ((m ^ rdp.otherH) & OTHERH_USED) {
-                    flush_for(FR_OMODEH);
-                }
-                rdp.otherH = m;
-                break;
-            }
-            case G_SETOTHERMODE_L: {
-                u32 m = rdp.otherL;
-                set_othermode(&m, w0, w1);
-                if ((m ^ rdp.otherL) & OTHERL_USED) {
-                    flush_for(FR_OMODEL);
-                }
-                rdp.otherL = m;
-                break;
-            }
-            case G_RDPSETOTHERMODE:
-                if (((w0 & 0xFFFFFF) ^ rdp.otherH) & OTHERH_USED || (w1 ^ rdp.otherL) & OTHERL_USED) {
-                    flush_for(FR_RDPOMODE);
-                }
-                rdp.otherH = w0 & 0xFFFFFF;
-                rdp.otherL = w1;
-                break;
-            case G_SETPRIMCOLOR:
-                // per-vertex attribute: no flush needed
-                color_from_word(rdp.prim, w1);
-                if (rdp.primLod != (w0 & 0xFF) / 255.0f) {
-                    flush_for(FR_PRIMLOD);
-                    rdp.primLod = (w0 & 0xFF) / 255.0f;
-                }
-                break;
-            case G_SETENVCOLOR:
-                color_from_word(rdp.env, w1);
-                break;
-            case G_SETFOGCOLOR: {
-                float c[4];
-                color_from_word(c, w1);
-                if (memcmp(c, rdp.fog, sizeof(c)) != 0) {
-                    flush_for(FR_FOGCOL);
-                    memcpy(rdp.fog, c, sizeof(c));
-                }
-                break;
-            }
-            case G_SETBLENDCOLOR: {
-                float c[4];
-                color_from_word(c, w1);
-                if (memcmp(c, rdp.blend, sizeof(c)) != 0) {
-                    flush_for(FR_BLENDCOL);
-                    memcpy(rdp.blend, c, sizeof(c));
-                }
-                break;
-            }
-            case G_SETFILLCOLOR: {
-                u16 c = w1 & 0xFFFF;
-                u8 r = (c >> 11) & 31, g = (c >> 6) & 31, b = (c >> 1) & 31;
-                float f[4] = { r / 31.0f, g / 31.0f, b / 31.0f, (c & 1) ? 1.0f : 0.0f };
-                if (memcmp(f, rdp.fill, sizeof(f)) != 0) {
-                    flush_for(FR_FILLCOL);
-                    memcpy(rdp.fill, f, sizeof(f));
-                }
-                break;
-            }
-            case G_SETPRIMDEPTH:
-                rdp.primDepth = w1 >> 16;
-                break;
-            case G_SETSCISSOR: {
-                int x = ((w0 >> 12) & 0xFFF) / 4, y = (w0 & 0xFFF) / 4;
-                int w = ((w1 >> 12) & 0xFFF) / 4 - x, h = (w1 & 0xFFF) / 4 - y;
-                if (x != rdp.scX || y != rdp.scY || w != rdp.scW || h != rdp.scH) {
-                    flush_for(FR_SCISSOR);
-                    rdp.scX = x;
-                    rdp.scY = y;
-                    rdp.scW = w;
-                    rdp.scH = h;
-                }
-                break;
-            }
-            case G_SETTILE: {
-                int ti = (w1 >> 24) & 7;
-                Tile n = rdp.tiles[ti];
-                n.fmt = (w0 >> 21) & 7;
-                n.siz = (w0 >> 19) & 3;
-                n.line = (w0 >> 9) & 0x1FF;
-                n.tmem = w0 & 0x1FF;
-                n.palette = (w1 >> 20) & 0xF;
-                n.cmt = (w1 >> 18) & 3;
-                n.maskt = (w1 >> 14) & 0xF;
-                n.shiftt = (w1 >> 10) & 0xF;
-                n.cms = (w1 >> 8) & 3;
-                n.masks = (w1 >> 4) & 0xF;
-                n.shifts = w1 & 0xF;
-                set_tile(ti, &n);
-                break;
-            }
-            case G_SETTILESIZE: {
-                int ti = (w1 >> 24) & 7;
-                Tile n = rdp.tiles[ti];
-                n.uls = (w0 >> 12) & 0xFFF;
-                n.ult = w0 & 0xFFF;
-                n.lrs = (w1 >> 12) & 0xFFF;
-                n.lrt = w1 & 0xFFF;
-                set_tile(ti, &n);
-                break;
-            }
-            case G_LOADBLOCK:
-                load_block((w1 >> 24) & 7, (w0 >> 12) & 0xFFF, (w1 >> 12) & 0xFFF, w1 & 0xFFF);
-                break;
-            case G_LOADTILE:
-                load_tile((w1 >> 24) & 7, (w0 >> 12) & 0xFFF, w0 & 0xFFF, (w1 >> 12) & 0xFFF, w1 & 0xFFF);
-                break;
-            case G_BG_COPY:
-            case G_BG_1CYC:
-                handle_bg(w1, cmd == G_BG_COPY);
-                break;
-            case G_LOADTLUT:
-                load_tlut((w1 >> 24) & 7, ((w1 >> 14) & 0x3FF) + 1);
-                break;
             default:
+                dl += gfx_command(dl, w0, w1);
                 break;
         }
     }
@@ -3178,6 +3720,16 @@ int S30Gfx_DepthVisible(float x, float y, float z) {
    list walk + GL calls (CPU), GPU finish, present */
 static double sTGame, sTWalk, sTGpu, sTPresent, sTLast, sTMax;
 
+/* S30GfxConfig.deferPresent: the frame drawn last, waiting for S30Gfx_Present */
+static int sPresentPending;
+
+void S30Gfx_Present(void) {
+    if (sPresentPending) {
+        sPresentPending = 0;
+        S30Display_EndFrame();
+    }
+}
+
 void pc_process_displaylist(void* displayList) {
     Gfx* dl = displayList;
     int i;
@@ -3188,6 +3740,7 @@ void pc_process_displaylist(void* displayList) {
     }
 
     frame_copies(); // the last frame, sWide still its
+    S30Gfx_Present(); // a deferred frame first
     S30Display_BeginFrame();
     sFrame++;
     sWide = !sHadBg;
@@ -3215,6 +3768,22 @@ void pc_process_displaylist(void* displayList) {
     rdp.scW = SCREEN_W;
     rdp.scH = SCREEN_H;
     sLoadGen++;
+    sPrimDepthSet = 0;
+    sBatchAtlas = -1;
+    if (sCfg.atlas) {
+        if (sAtlasRam == NULL) {
+            atlas_init();
+        }
+        // A frame ran out of pages: refill from empty
+        if (sAtlasFull) {
+            static u32 sClears;
+            if (sStatsOn > 0) {
+                printf("gfx: atlas full, cleared (%u times)\n", ++sClears);
+            }
+            atlas_clear();
+        }
+        atlas_upload();
+    }
     rdp.cimg = 0;
     rdp.cimgIsFrame = 1;
     sAuxCur = NULL;
@@ -3241,7 +3810,13 @@ void pc_process_displaylist(void* displayList) {
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    walk(dl, 0);
+    if (sCfg.ucode == S30_UCODE_F3DFACTOR5) {
+        gfx_f5_walk(displayList);
+    } else if (sCfg.ucode == S30_UCODE_F3DDKR) {
+        gfx_dkr_walk(displayList);
+    } else {
+        walk(dl, 0);
+    }
     flush_for(FR_FRAME);
     t1 = now_ms();
     if (sStatsOn > 1) {
@@ -3286,7 +3861,11 @@ void pc_process_displaylist(void* displayList) {
     memset(&sStats, 0, sizeof(sStats));
     prof_tick(sFrame);
     hud_trace_frame();
-    S30Display_EndFrame();
+    if (sCfg.deferPresent) {
+        sPresentPending = 1;
+    } else {
+        S30Display_EndFrame();
+    }
     t3 = now_ms();
     sTWalk += t1 - t0;
     if ((t2 - t0) + (sTLast != 0 ? t0 - sTLast : 0) > sTMax) {

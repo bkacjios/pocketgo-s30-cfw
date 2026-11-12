@@ -13,6 +13,14 @@ typedef enum {
     // F3DEX 0.95 (Mario Kart 64): F3DEX with G_QUAD where LINE3D is, the old
     // G_CULLDL vertex encoding, and texrects ending in RDPHALF_CONT (0xB2)
     S30_UCODE_F3DEX_OLD,
+    // Factor 5's microcode (Rogue Squadron): 0x108-byte chunked display
+    // lists, 8-byte vertices, per-face colors and texcoords, terrain records
+    // (gfx_f5.c). Needs `rdram`.
+    S30_UCODE_F3DFACTOR5,
+    // Rare's F3DDKR (Diddy Kong Racing): Fast3D with whole MVP matrices in
+    // slots, 10-byte vertices, triangles that carry their texture coords,
+    // billboards and counted display lists (gfx_dkr.c)
+    S30_UCODE_F3DDKR,
 } S30Ucode;
 
 typedef struct {
@@ -34,14 +42,34 @@ typedef struct {
     // as reaching it, so the game's full-screen scissor opens the whole frame
     // (Star Fox 64 clips to the screen minus 8 pixels on every side)
     int overscan;
+    // RDRAM image for games whose display lists hold N64 addresses (a static
+    // recompilation): KSEG0/KSEG1 addresses resolve to rdram + (addr &
+    // 0xFFFFFF). Stored as native u32 words (texElemSize 4). NULL: none.
+    uint8_t* rdram;
+    // Point-sampled 3D textures go to shared atlas pages, so texture and
+    // palette loads don't end a draw (hundreds of terrain tiles a frame in
+    // Rogue Squadron become a few draws). 0: a GL texture per texture.
+    int atlas;
+    // pc_process_displaylist returns once the frame is drawn, without waiting
+    // for its flip: the caller presents it with S30Gfx_Present (a recompiled
+    // game builds its next frame meanwhile, as with the N64's RDP)
+    int deferPresent;
 } S30GfxConfig;
 
 // Call once, after S30Display_Init (the config is copied)
 void S30Gfx_Configure(const S30GfxConfig* config);
+
+// Where the VI shows the frame, for games whose frame isn't 320x240: frame
+// pixel (x, y) at N64 screen pixel (x0 + x * kx, y0 + y * ky), and the VI's
+// line stride in pixels (an interlaced field reads every other row; 0: the
+// frame's width). kx <= 0: the frame is scaled to 320 wide at the origin.
+void S30Gfx_SetVi(float x0, float y0, float kx, float ky, int stride);
 void S30Gfx_Init(void);
 
-// Draws a frame's display list and presents it (S30Display_EndFrame)
+// Draws a frame's display list and presents it (S30Display_EndFrame), or
+// leaves the present to S30Gfx_Present (deferPresent)
 void pc_process_displaylist(void* displayList);
+void S30Gfx_Present(void);
 
 // Segmented address (top byte 0x00-0x0F, through the segment table) or a real
 // pointer to memory
