@@ -1,14 +1,18 @@
 /*
- * PocketGo S30 launcher: a file browser that starts apps (RetroArch, Ocarina
- * of Time, anything with a launch script). Started by init (/usr/libexec/s30/frontend).
+ * PocketGo S30 launcher: starts apps (RetroArch, Ocarina of Time, anything
+ * with a launch script) and shows screenshots, with a file browser behind its
+ * Files tile. Started by init (/usr/libexec/s30/frontend).
  *
  * Based on the stock-firmware filebrowser by Bkacjios, ported to the
  * mainline system: SDL2 on KMS (the screen is drawn landscape and rotated
  * onto the portrait panel), the gamepad read straight from evdev, text in
  * the system menu's font (ui.c).
  *
- * Opens /mnt/sd/apps (or argv[1]) as a grid of tiles. D-pad/stick: move,
- * A: open/run, B: parent folder. Folders open; *.sh files run with /bin/sh;
+ * Home: the apps in /mnt/sd/apps (or argv[1]) as a grid of tiles, then
+ * Screenshots (/mnt/sd/screenshots, where the system menu's Screenshot
+ * saves) and Files, which browses the whole card (/mnt/sd): everything
+ * listed, B at the card's top goes home. D-pad/stick: move, A: open/run, B:
+ * parent folder. Folders open; *.sh files run with /bin/sh;
  * ELF binaries run directly (on exFAT every file looks executable, so the
  * file type decides). While an app runs the launcher releases the display
  * and waits for it.
@@ -17,8 +21,7 @@
  * for Ocarina of Time.sh, Folder.png for Folder/) is its tile and is not
  * listed itself. Other images (png, jpg, bmp) are listed as thumbnails and
  * open in the viewer: left/right step through the folder's images, B goes
- * back. The start folder gets a Screenshots entry for /mnt/sd/screenshots
- * (where the system menu's Screenshot saves).
+ * back.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -45,6 +48,7 @@
 
 #define DEFAULT_DIR "/mnt/sd/apps"
 #define SHOTS_DIR "/mnt/sd/screenshots"
+#define FILES_DIR "/mnt/sd" // the Files tile's browser starts (and ends) here
 
 /* Grid: 4 x 2 tiles under the header, the footer below */
 #define HEADER_H 34
@@ -95,6 +99,7 @@ static struct {
 } sDir;
 
 static char sStartDir[PATH_MAX];
+static bool sBrowsing; // in Files: every entry listed; else home or Screenshots
 
 static const char* extension(const char* name) {
     const char* dot = strrchr(name, '.');
@@ -239,12 +244,24 @@ static void dir_open(const char* path, const char* select) {
     }
     closedir(d);
     attach_icons();
-    qsort(sDir.entries, sDir.count, sizeof(Entry), entry_cmp);
-    if (strcmp(resolved, sStartDir) == 0 && strcmp(resolved, SHOTS_DIR) != 0 && stat(SHOTS_DIR, &st) == 0 &&
-        S_ISDIR(st.st_mode)) {
-        Entry e = *entry_add("Screenshots", SHOTS_DIR, K_DIR);
-        memmove(&sDir.entries[1], &sDir.entries[0], (sDir.count - 1) * sizeof(Entry));
-        sDir.entries[0] = e;
+    if (!sBrowsing && strcmp(resolved, sStartDir) == 0) { // home: the apps only
+        int n = 0;
+
+        for (i = 0; i < sDir.count; i++) {
+            if (sDir.entries[i].kind == K_APP) {
+                sDir.entries[n++] = sDir.entries[i];
+            } else {
+                entry_free(&sDir.entries[i]);
+            }
+        }
+        sDir.count = n;
+        qsort(sDir.entries, sDir.count, sizeof(Entry), entry_cmp);
+        if (stat(SHOTS_DIR, &st) == 0 && S_ISDIR(st.st_mode)) {
+            entry_add("Screenshots", SHOTS_DIR, K_DIR);
+        }
+        entry_add("Files", FILES_DIR, K_DIR);
+    } else {
+        qsort(sDir.entries, sDir.count, sizeof(Entry), entry_cmp);
     }
     sDir.selected = 0;
     sDir.scroll = 0;
@@ -258,11 +275,16 @@ static void dir_open(const char* path, const char* select) {
 static void dir_parent(void) {
     char cur[PATH_MAX], name[PATH_MAX], parent[PATH_MAX];
 
-    if (strcmp(sDir.path, "/") == 0) {
+    if (!sBrowsing && strcmp(sDir.path, sStartDir) == 0) {
+        return; // home
+    }
+    if (!sBrowsing) { // Screenshots: back home, to its tile
+        dir_open(sStartDir, "Screenshots");
         return;
     }
-    if (strcmp(sDir.path, SHOTS_DIR) == 0 && strcmp(sStartDir, SHOTS_DIR) != 0) {
-        dir_open(sStartDir, "Screenshots"); // back to where its entry is
+    if (strcmp(sDir.path, FILES_DIR) == 0 || strcmp(sDir.path, "/") == 0) { // the top of Files: home
+        sBrowsing = false;
+        dir_open(sStartDir, "Files");
         return;
     }
     snprintf(cur, sizeof(cur), "%s", sDir.path);
@@ -554,7 +576,9 @@ static void render_grid(void) {
     ui_begin();
     ui_gradient((SDL_Rect){ 0, 0, SCRW, SCRH }, kBgTop, kBgBottom);
     snprintf(title, sizeof(title), "%s", sDir.path);
-    draw_header(strcmp(sDir.path, sStartDir) == 0 ? "PocketGo S30" : basename(title));
+    draw_header(!sBrowsing && strcmp(sDir.path, sStartDir) == 0 ? "PocketGo S30"
+                : sBrowsing && strcmp(sDir.path, FILES_DIR) == 0 ? "Files"
+                                                                  : basename(title));
 
     if (sDir.count == 0) {
         ui_text("(empty)", UI_DIM, GRID_X, GRID_Y + 4, SCRW);
@@ -811,6 +835,10 @@ int main(int argc, char** argv) {
             if (a && !prevA && sDir.count > 0) {
                 Entry* e = &sDir.entries[sDir.selected];
                 if (e->kind == K_DIR) {
+                    if (!sBrowsing && strcmp(sDir.path, sStartDir) == 0 && strcmp(e->name, "Files") == 0 &&
+                        strcmp(e->path, FILES_DIR) == 0) {
+                        sBrowsing = true; // the Files tile
+                    }
                     dir_open(e->path, NULL);
                 } else if (e->kind == K_IMAGE) {
                     view_open();
