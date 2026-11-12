@@ -388,7 +388,8 @@ static const char* const kBolt[7] = { "...##", "..##.", ".##..", "#####", "..##.
    filled to the level (green, yellow, red) with the percentage inside, and
    a bolt to its left while `charging` (the battery itself never moves) */
 static void draw_battery(int capacity, int charging, float alpha) {
-	const int bw = 42, bh = 18, right = PANEL_H - 10, y = 16 - bh / 2, pad = 5;
+	// Centred on 17: the launcher's header centre (HEADER_H 34 / 2), so it doesn't move between them
+	const int bw = 42, bh = 18, right = PANEL_H - 10, y = 17 - bh / 2, pad = 5;
 	int len, x, left, i, j;
 	char text[8];
 	uint32_t level;
