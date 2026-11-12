@@ -11,7 +11,7 @@
  * Home: the apps in /mnt/sd/apps (or argv[1]) as a grid of tiles, then
  * Screenshots (/mnt/sd/screenshots, where the system menu's Screenshot
  * saves) and Files first, then the apps. Files opens a browser at the card
- * (/mnt/sd): everything listed, up to /, where B goes home. D-pad/stick: move, A: open/run, B:
+ * (/mnt/sd): everything listed, B up to /, X back home. D-pad/stick: move, A: open/run, B:
  * parent folder. Folders open; *.sh files run with /bin/sh;
  * ELF binaries run directly (on exFAT every file looks executable, so the
  * file type decides). While an app runs the launcher releases the display
@@ -293,10 +293,8 @@ static void dir_parent(void) {
         dir_open(sStartDir, "Screenshots");
         return;
     }
-    if (strcmp(sDir.path, "/") == 0) { // the top: home
-        sBrowsing = false;
-        dir_open(sStartDir, "Files");
-        return;
+    if (strcmp(sDir.path, "/") == 0) {
+        return; // the top (X leaves Files)
     }
     snprintf(cur, sizeof(cur), "%s", sDir.path);
     snprintf(name, sizeof(name), "%s", basename(cur));
@@ -309,8 +307,9 @@ static void dir_parent(void) {
  * Gamepad and display (ui.c)
  * ------------------------------------------------------------------------- */
 
-enum { IN_UP, IN_DOWN, IN_LEFT, IN_RIGHT, IN_A, IN_B, IN_COUNT };
-static const int sPadCodes[IN_COUNT] = { BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT, BTN_EAST, BTN_SOUTH };
+enum { IN_UP, IN_DOWN, IN_LEFT, IN_RIGHT, IN_A, IN_B, IN_X, IN_COUNT };
+static const int sPadCodes[IN_COUNT] = { BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT,
+                                         BTN_EAST,    BTN_SOUTH,     BTN_NORTH };
 static int sPadFd = -1;
 static bool sHeld[IN_COUNT], sPressed[IN_COUNT]; // pressed: since the last poll
 static int sAxisX, sAxisY, sAxisXCentre, sAxisYCentre;
@@ -542,7 +541,8 @@ static void draw_header(const char* title) {
     ui_fill((SDL_Rect){ 8, HEADER_H - 1, SCRW - 16, 1 }, kLine);
 }
 
-/* "(A) action   (B) Back" at the left, `name` right-aligned */
+/* "(A) action   (B) Back", in Files "(X) Exit" too, at the left; `name`
+   right-aligned */
 static void draw_footer(const char* action, const char* name) {
     const int ty = FOOTER_Y + 3, by = FOOTER_Y + 4;
     int x = 12;
@@ -557,7 +557,14 @@ static void draw_footer(const char* action, const char* name) {
     ui_button(kLetterB, x, by);
     x += BUTTON_SIZE + 5;
     ui_text("Back", UI_DIM, x, ty, SCRW);
-    x += ui_text_width("Back") + 16;
+    x += ui_text_width("Back") + 14;
+    if (sBrowsing) {
+        ui_button(kLetterX, x, by);
+        x += BUTTON_SIZE + 5;
+        ui_text("Exit", UI_DIM, x, ty, SCRW);
+        x += ui_text_width("Exit") + 14;
+    }
+    x += 2;
     if (name != NULL) {
         int w = ui_text_width(name), max = SCRW - 12 - x;
         if (w > max) {
@@ -769,7 +776,7 @@ static void grid_move(int dx, int dy) {
 int main(int argc, char** argv) {
     Uint32 nextRepeat = 0, lastRender = 0;
     int moveX = 0, moveY = 0;
-    bool dirty = true, prevA = false, prevB = false;
+    bool dirty = true, prevA = false, prevB = false, prevX = false;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (!ui_init()) {
@@ -790,7 +797,7 @@ int main(int argc, char** argv) {
     for (;;) {
         Uint32 now = SDL_GetTicks();
         int dx, dy;
-        bool a, b, repeat = false;
+        bool a, b, xb, repeat = false;
 
         {
             int x = sAxisX, y = sAxisY;
@@ -815,6 +822,7 @@ int main(int argc, char** argv) {
         }
         a = sHeld[IN_A] || sPressed[IN_A];
         b = sHeld[IN_B] || sPressed[IN_B];
+        xb = sHeld[IN_X] || sPressed[IN_X];
         if (dx != moveX || dy != moveY) {
             moveX = dx;
             moveY = dy;
@@ -861,10 +869,15 @@ int main(int argc, char** argv) {
             } else if (b && !prevB) {
                 dir_parent();
                 dirty = true;
+            } else if (xb && !prevX && sBrowsing) { // out of Files, from anywhere
+                sBrowsing = false;
+                dir_open(sStartDir, "Files");
+                dirty = true;
             }
         }
         prevA = a;
         prevB = b;
+        prevX = xb;
 
         if (dirty || now - lastRender > 2000) { // battery refresh
             if (sView.open) {
