@@ -73,6 +73,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <dirent.h>
 #include <linux/input.h>
 #include <linux/netlink.h>
@@ -431,13 +432,13 @@ static int osd_is_battery(void) {
    row closes the menu instead of going back. The system page: the brightness
    slider (NULL), the performance overlay switch, the stick calibration (its
    own screen, page 2), sleep, reboot, power off. */
-enum { APP_EXIT, APP_SYSTEM, APP_RESUME };
-static const char* const kAppItems[] = { "Exit game", "System", "Resume" };
+enum { APP_EXIT, APP_SCREENSHOT, APP_SYSTEM, APP_RESUME };
+static const char* const kAppItems[] = { "Exit game", "Screenshot", "System", "Resume" };
 enum { SYS_BRIGHTNESS, SYS_PERF, SYS_CALIBRATE, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_BACK };
 static const char* const kSysItems[] = { NULL, "Overlay", "Calibrate stick", "Sleep", "Reboot", "Shut down", "Back" };
 
 static int menu_count(void) {
-	return sMenuPage ? 7 : 3;
+	return sMenuPage ? 7 : 4;
 }
 
 static int on_brightness_row(void) {
@@ -1408,6 +1409,55 @@ static void menu_close(int exitApp) {
 	}
 }
 
+/* The game's picture (its primary plane, without the OSD or the menu) as
+   /mnt/sd/screenshots/<app>-NNNN.png, numbered after the highest one there
+   (no RTC: the clock restarts at 1970 every boot). The app is stopped under
+   the menu, so the plane still shows its last frame. */
+static void take_screenshot(void) {
+	static const char kDir[] = "/mnt/sd/screenshots";
+	char app[32] = "app", path[128], comm[64];
+	int next = 1;
+	size_t appLen;
+	DIR* d;
+	FILE* f;
+	pid_t pid;
+
+	snprintf(comm, sizeof(comm), "/proc/%d/comm", (int)sAppPid);
+	f = fopen(comm, "r");
+	if (f != NULL) {
+		if (fgets(app, sizeof(app), f) != NULL) {
+			app[strcspn(app, "\n")] = 0;
+		}
+		fclose(f);
+	}
+	appLen = strlen(app);
+	mkdir(kDir, 0755);
+	d = opendir(kDir);
+	if (d != NULL) {
+		struct dirent* e;
+
+		while ((e = readdir(d)) != NULL) {
+			int n;
+
+			if (strncmp(e->d_name, app, appLen) == 0 && e->d_name[appLen] == '-' &&
+			    sscanf(e->d_name + appLen + 1, "%d.png", &n) == 1 && n >= next) {
+				next = n + 1;
+			}
+		}
+		closedir(d);
+	}
+	snprintf(path, sizeof(path), "%s/%s-%04d.png", kDir, app, next);
+	pid = fork();
+	if (pid == 0) {
+		execlp("s30-screenshot", "s30-screenshot", "-g", path, (char*)NULL);
+		_exit(127);
+	}
+	if (pid > 0) {
+		waitpid(pid, NULL, 0);
+	}
+	fprintf(stderr, "s30-display: screenshot %s\n", path);
+}
+
 /* Reboot or power off through init (which stops everything and syncs) */
 static void run_system(const char* cmd) {
 	pid_t pid = fork();
@@ -1464,6 +1514,9 @@ static void menu_confirm(void) {
 			sMenuPage = 1;
 			sMenuSel = SYS_BRIGHTNESS;
 			menu_redraw();
+		} else if (sMenuSel == APP_SCREENSHOT) {
+			take_screenshot();
+			menu_close(0);
 		} else {
 			menu_close(sMenuSel == APP_EXIT);
 		}

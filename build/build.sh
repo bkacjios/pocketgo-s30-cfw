@@ -235,7 +235,7 @@ ensure_sysroot() {
 # starts RetroArch, OoT and other apps, with ui.c. SDL2 (KMS), text in
 # utils/osd_font.h. Utilities (utils/): s30-fel, s30-volumed, s30-splash,
 # s30-keyheld, s30-display (with the system menu and stick calibration) and its
-# preload libs30lease.so, s30-screenshot (the screen's KMS planes to a PPM). Output: $WORK/{launcher,s30-*}.bin, $WORK/libs30lease.so
+# preload libs30lease.so, s30-screenshot (the screen's KMS planes to a PNG). Output: $WORK/{launcher,s30-*}.bin, $WORK/libs30lease.so
 step_launcher() {
 	local app
 	ensure_sysroot
@@ -255,7 +255,7 @@ step_launcher() {
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-display.bin" "$PROJECT/utils/s30-display.c" \
 		-I"$WORK/sysroot/usr/include/libdrm" -ldrm -lm
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-screenshot.bin" "$PROJECT/utils/s30-screenshot.c" \
-		-I"$WORK/sysroot/usr/include/libdrm" -ldrm
+		-I"$WORK/sysroot/usr/include/libdrm" -ldrm -lz
 	"$WORK/bin/armv7-clang" -O2 -Wall -fPIC -shared -o "$WORK/libs30lease.so" "$PROJECT/utils/s30-lease.c"
 	llvm-strip "$WORK/s30-fel.bin" "$WORK/s30-volumed.bin" "$WORK/s30-splash.bin" \
 		"$WORK/s30-keyheld.bin" "$WORK/s30-display.bin" "$WORK/s30-screenshot.bin" "$WORK/libs30lease.so"
