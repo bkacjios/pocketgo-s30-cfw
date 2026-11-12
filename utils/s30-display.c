@@ -29,9 +29,9 @@
  * System page (straight away over the launcher) has Settings, Sleep, Reboot
  * and Shut down; Settings has a brightness slider (D-pad left/right; the
  * level is saved to the file given as argument and restored at start), the
- * performance overlay switch, USB video (the screen as a USB webcam,
- * /usr/libexec/s30/usb-video), the stick calibration and USB storage. The
- * battery (level, and a bolt while charging)
+ * performance overlay switch, USB (the gadget's functions, switched by
+ * /usr/libexec/s30/usb-gadget, and USB storage) and the stick calibration.
+ * The battery (level, and a bolt while charging)
  * shows in a small box in the screen's top right, where the launcher shows it. That process is frozen (SIGSTOP) and
  * the gamepad grabbed while the menu is open; Exit sends SIGTERM, then
  * SIGKILL if it hasn't gone after EXIT_GRACE_MS. The
@@ -148,7 +148,7 @@ static uint64_t sOsdUntil, sNextLeaseCheck;
 static pid_t sAppPid;         // process holding the lease
 static int sAppLauncher;      // ... and it is the launcher (no performance overlay)
 static int sMenu, sMenuSel;   // system menu open, selected item
-static int sMenuPage;         // 0: app, 1: system, 2: stick calibration, 3: settings, 4: USB confirmation
+static int sMenuPage;         // 0: app, 1: system, 2: stick calibration, 3: settings, 4: USB storage confirmation, 5: USB
 enum { PERF_OFF, PERF_FULL, PERF_FPS, PERF_MODES };
 static int sPerf;             // performance overlay (System > Overlay, saved)
 static char sPerfFile[320];   // where sPerf is saved ("" if nowhere)
@@ -434,35 +434,80 @@ static int osd_is_battery(void) {
    system page; over the launcher it opens on the system page, where the last
    row closes the menu instead of going back. The system page: Settings,
    sleep, reboot, power off. Settings (page 3): the brightness slider (NULL),
-   the performance overlay switch, USB video, the stick calibration (its own
-   screen, page 2), USB storage (confirmed on page 4). */
+   the performance overlay switch, USB (page 5), the stick calibration (its
+   own screen, page 2). USB: the gadget's functions (usb-gadget: serial,
+   network, audio, video, within its endpoint budget) and USB storage
+   (confirmed on page 4). */
 enum { APP_EXIT, APP_SCREENSHOT, APP_SYSTEM, APP_RESUME };
 static const char* const kAppItems[] = { "Exit game", "Screenshot", "System", "Resume" };
 enum { SYS_SETTINGS, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_BACK };
 static const char* const kSysItems[] = { "Settings", "Sleep", "Reboot", "Shut down", "Back" };
-enum { SET_BRIGHTNESS, SET_PERF, SET_USB_VIDEO, SET_CALIBRATE, SET_USB, SET_BACK };
-static const char* const kSetItems[] = { NULL, "Overlay", "USB video", "Calibrate stick", "USB storage", "Back" };
+enum { SET_BRIGHTNESS, SET_PERF, SET_USB, SET_CALIBRATE, SET_BACK };
+static const char* const kSetItems[] = { NULL, "Overlay", "USB", "Calibrate stick", "Back" };
+/* The gadget's functions, in usb-gadget's order, then USB storage */
+enum { USBF_SERIAL, USBF_NETWORK, USBF_AUDIO, USBF_VIDEO, USBF_FUNCS, USBF_STORAGE = USBF_FUNCS, USBF_BACK };
+static const char* const kUsbFnItems[] = { "Serial", "Network", "Audio", "Video", "USB storage", "Back" };
+static const char* const kUsbFnNames[USBF_FUNCS] = { "serial", "network", "audio", "video" };
 /* USB storage confirmation: two text rows (USB_TEXT_ROWS, not selectable), OK, Cancel */
 enum { USB_TEXT_ROWS = 2, USB_OK = 2, USB_CANCEL };
 static const char* const kUsbItems[] = { "USB storage mode", "reboots the device", "OK", "Cancel" };
 
 static const char* const* menu_items(void) {
-	return sMenuPage == 4 ? kUsbItems : sMenuPage == 3 ? kSetItems : sMenuPage == 1 ? kSysItems : kAppItems;
+	return sMenuPage == 5   ? kUsbFnItems
+	       : sMenuPage == 4 ? kUsbItems
+	       : sMenuPage == 3 ? kSetItems
+	       : sMenuPage == 1 ? kSysItems
+	                        : kAppItems;
 }
 
 static int menu_count(void) {
-	return sMenuPage == 0 || sMenuPage == 4 ? 4 : sMenuPage == 3 ? 6 : 5;
+	return sMenuPage == 0 || sMenuPage == 4 ? 4 : sMenuPage == 5 ? 6 : 5;
 }
 
 /* The row B returns from (its glyph is drawn there) */
 static int menu_back_row(void) {
-	return sMenuPage == 4 ? USB_CANCEL : sMenuPage == 3 ? SET_BACK : sMenuPage == 1 ? SYS_BACK : APP_RESUME;
+	return sMenuPage == 5   ? USBF_BACK
+	       : sMenuPage == 4 ? USB_CANCEL
+	       : sMenuPage == 3 ? SET_BACK
+	       : sMenuPage == 1 ? SYS_BACK
+	                        : APP_RESUME;
 }
 
-/* USB video is on while the UVC function is in the gadget's configuration
-   (usb-video owns the switch and saves it) */
-static int usb_video_on(void) {
-	return access("/sys/kernel/config/usb_gadget/s30/configs/c.1/uvc.usb0", F_OK) == 0;
+/* The gadget's functions as usb-gadget reports them (it owns the switches,
+   the endpoint costs and the budget): on, and whether there is room to turn
+   on one that is off */
+static int sUsbOn[USBF_FUNCS], sUsbRoom[USBF_FUNCS];
+
+static void usb_status(void) {
+	FILE* f = popen("/usr/libexec/s30/usb-gadget status", "r");
+	int cost[USBF_FUNCS] = { 0 }, room = 0, i;
+	char name[16], state[8];
+	int n;
+
+	memset(sUsbOn, 0, sizeof(sUsbOn));
+	while (f != NULL && fscanf(f, "%15s", name) == 1) {
+		if (strcmp(name, "free") == 0) {
+			if (fscanf(f, "%d", &room) != 1) {
+				room = 0;
+			}
+			continue;
+		}
+		if (fscanf(f, "%7s %d", state, &n) != 2) {
+			break;
+		}
+		for (i = 0; i < USBF_FUNCS; i++) {
+			if (strcmp(name, kUsbFnNames[i]) == 0) {
+				sUsbOn[i] = strcmp(state, "on") == 0;
+				cost[i] = n;
+			}
+		}
+	}
+	if (f != NULL) {
+		pclose(f);
+	}
+	for (i = 0; i < USBF_FUNCS; i++) {
+		sUsbRoom[i] = sUsbOn[i] || cost[i] <= room;
+	}
 }
 
 static int on_brightness_row(void) {
@@ -548,8 +593,8 @@ static void draw_menu(void) {
 			if (sMenuPage == 3 && i == SET_PERF) {
 				static const char* const modes[] = { "Off", "Full", "FPS" };
 				snprintf(label, sizeof(label), "%s: %s", items[i], modes[sPerf]);
-			} else if (sMenuPage == 3 && i == SET_USB_VIDEO) {
-				snprintf(label, sizeof(label), "%s: %s", items[i], usb_video_on() ? "On" : "Off");
+			} else if (sMenuPage == 5 && i < USBF_FUNCS) {
+				snprintf(label, sizeof(label), "%s: %s", items[i], sUsbOn[i] ? "On" : "Off");
 			} else if (sMenuPage == 1 && i == SYS_BACK && sMenuLauncher) {
 				snprintf(label, sizeof(label), "Close");
 			} else {
@@ -558,7 +603,10 @@ static void draw_menu(void) {
 			len = (int)strlen(label);
 			x = MENU_X + (MENU_W - len * 8) / 2;
 			draw_text(label, x, y + (rowH - 16) / 2, 1,
-			          argb(sMenuPage == 4 && i < USB_TEXT_ROWS ? 0xc0c0c0 : 0xffffff, 1.0f));
+			          argb((sMenuPage == 4 && i < USB_TEXT_ROWS) || (sMenuPage == 5 && i < USBF_FUNCS && !sUsbRoom[i])
+			                   ? 0xc0c0c0 // not selectable, or no endpoints left to turn it on
+			                   : 0xffffff,
+			               1.0f));
 			if (i == menu_back_row()) {
 				draw_button(x - 6 - 14, y + (rowH - 14) / 2, kLetterB); // what B does
 			}
@@ -1493,18 +1541,23 @@ static int usb_mode_flag(void) {
 	return 0;
 }
 
-/* USB video on or off; waits, as the label shows the result. The gadget
-   rebinds, which takes well under a second. */
-static void usb_video_toggle(void) {
-	pid_t pid = fork();
+/* A gadget function on or off (if there is room); waits, as the labels
+   show the result. The gadget rebinds, which takes well under a second. */
+static void usb_toggle(int fn) {
+	pid_t pid;
 
+	if (!sUsbRoom[fn]) {
+		return;
+	}
+	pid = fork();
 	if (pid == 0) {
-		execl("/usr/libexec/s30/usb-video", "usb-video", usb_video_on() ? "off" : "on", (char*)NULL);
+		execl("/usr/libexec/s30/usb-gadget", "usb-gadget", kUsbFnNames[fn], sUsbOn[fn] ? "off" : "on", (char*)NULL);
 		_exit(127);
 	}
 	if (pid > 0) {
 		waitpid(pid, NULL, 0);
 	}
+	usb_status();
 }
 
 /* s2idle until a wakeup source (the power key) fires. The menu is cleared
@@ -1540,6 +1593,10 @@ static void perf_save(void);
 static void menu_back(void) {
 	sRepeatDir = 0;
 	if (sMenuPage == 4) {
+		sMenuPage = 5;
+		sMenuSel = USBF_STORAGE;
+		menu_redraw();
+	} else if (sMenuPage == 5) {
 		sMenuPage = 3;
 		sMenuSel = SET_USB;
 		menu_redraw();
@@ -1582,6 +1639,19 @@ static void menu_confirm(void) {
 		}
 		return;
 	}
+	if (sMenuPage == 5) {
+		if (sMenuSel < USBF_FUNCS) {
+			usb_toggle(sMenuSel);
+			menu_redraw();
+		} else if (sMenuSel == USBF_STORAGE) {
+			sMenuPage = 4; // confirm first: it reboots
+			sMenuSel = USB_CANCEL;
+			menu_redraw();
+		} else {
+			menu_back();
+		}
+		return;
+	}
 	if (sMenuPage == 1) {
 		switch (sMenuSel) {
 			case SYS_SETTINGS:
@@ -1610,17 +1680,14 @@ static void menu_confirm(void) {
 			perf_save();
 			menu_redraw();
 			break;
-		case SET_USB_VIDEO:
-			usb_video_toggle();
+		case SET_USB:
+			usb_status();
+			sMenuPage = 5;
+			sMenuSel = USBF_SERIAL;
 			menu_redraw();
 			break;
 		case SET_CALIBRATE:
 			cal_open(); // drawn by cal_frame
-			break;
-		case SET_USB:
-			sMenuPage = 4; // confirm first: it reboots
-			sMenuSel = USB_CANCEL;
-			menu_redraw();
 			break;
 		case SET_BACK:
 			menu_back();
@@ -2448,7 +2515,7 @@ int main(int argc, char** argv) {
 	{
 		// Wake promptly after a vblank (short bursts; blocks otherwise).
 		// musl's sched_setscheduler() is a stub: the system call itself.
-		// Children (s30-screenshot, usb-video and the s30-uvc it starts)
+		// Children (s30-screenshot, usb-gadget and the daemons it starts)
 		// get the normal policy back.
 		struct sched_param sp = { .sched_priority = 1 };
 

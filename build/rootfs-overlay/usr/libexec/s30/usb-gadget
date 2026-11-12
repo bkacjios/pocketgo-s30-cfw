@@ -1,0 +1,157 @@
+#!/bin/sh
+# The USB gadget: which functions the host sees (Settings > USB).
+#   usb-gadget                  build the gadget with the saved functions (boot)
+#   usb-gadget FUNC on|off      switch one function and save the choice
+#   usb-gadget status           "FUNC on|off COST" per function, then "free N"
+# Functions and the IN endpoints they take (the musb controller has 5):
+#   serial   ACM shell, host /dev/ttyACM* (notify + data)      2
+#   network  NCM, ssh to 10.42.0.2 (notify + data)             2
+#   audio    UAC2 sound card: what the speaker plays (s30-uac) 1
+#   video    UVC webcam: the screen (s30-uvc)                  1
+# Turning one on past the 5 fails (exit 3). Every change rebinds the gadget,
+# so the links of the functions that stay on drop for a moment.
+# Functions are linked in this fixed order so that video, linked last, gets
+# ep5 IN: the only endpoint with a 1024-byte FIFO (kernel patch 0002).
+. /etc/profile.d/s30.sh
+G=/sys/kernel/config/usb_gadget/s30
+SAVED=$HOME/.config/usb_gadget
+ORDER="serial network audio video"
+MAX=5
+
+cost() { case $1 in serial|network) echo 2 ;; *) echo 1 ;; esac; }
+inst() { case $1 in serial) echo acm.usb0 ;; network) echo ncm.usb0 ;; audio) echo uac2.usb0 ;; video) echo uvc.usb0 ;; esac; }
+saved() { if [ -f "$SAVED" ]; then cat "$SAVED"; else echo serial network; fi; }
+enabled() { local e; for e in $(saved); do [ "$e" = "$1" ] && return 0; done; return 1; }
+
+used() {
+	local u n=0
+	for u in $(saved); do n=$((n + $(cost $u))); done
+	echo $n
+}
+
+# The gadget and every function instance (linked or not; ttyGS0 and usb0
+# exist from here on)
+create() {
+	[ -d $G ] && return
+	mount -t configfs configfs /sys/kernel/config 2>/dev/null
+	mkdir -p $G/strings/0x409 $G/configs/c.1/strings/0x409
+	echo 0x1d6b > $G/idVendor	# Linux Foundation
+	echo 0x0104 > $G/idProduct	# Multifunction Composite Gadget
+	echo PocketGo > $G/strings/0x409/manufacturer
+	echo "PocketGo S30" > $G/strings/0x409/product
+	echo s30 > $G/strings/0x409/serialnumber
+	echo "PocketGo S30" > $G/configs/c.1/strings/0x409/configuration
+
+	mkdir $G/functions/acm.usb0
+
+	# Fixed MACs so the host sees the same interface every boot
+	mkdir $G/functions/ncm.usb0
+	echo 02:53:33:30:00:02 > $G/functions/ncm.usb0/dev_addr
+	echo 02:53:33:30:00:01 > $G/functions/ncm.usb0/host_addr
+
+	# Audio to the host only (no host playback, no volume or mute, so no
+	# status endpoint): 48 kHz 16-bit stereo
+	A=$G/functions/uac2.usb0
+	mkdir $A
+	echo 3 > $A/p_chmask
+	echo 48000 > $A/p_srate
+	echo 2 > $A/p_ssize
+	echo 0 > $A/p_mute_present
+	echo 0 > $A/p_volume_present
+	echo 0 > $A/c_chmask
+	echo 0 > $A/c_mute_present
+	echo 0 > $A/c_volume_present
+	echo "PocketGo S30 audio" > $A/function_name
+
+	# Video: one format, YUYV 480x320 at 30 or 15 fps; no camera or
+	# processing controls (configfs lists are one per line) and no status
+	# endpoint
+	F=$G/functions/uvc.usb0
+	mkdir $F
+	echo 0 > $F/control/enable_interrupt_ep
+	printf '0\n0\n0\n' > $F/control/terminal/camera/default/bmControls
+	printf '0\n0\n' > $F/control/processing/default/bmControls
+	mkdir $F/control/header/h
+	ln -s $F/control/header/h $F/control/class/fs/h
+	ln -s $F/control/header/h $F/control/class/ss/h
+	U=$F/streaming/uncompressed/yuyv
+	mkdir -p $U/320p
+	echo 480 > $U/320p/wWidth
+	echo 320 > $U/320p/wHeight
+	echo 307200 > $U/320p/dwMaxVideoFrameBufferSize
+	echo 36864000 > $U/320p/dwMinBitRate	# 15 fps
+	echo 73728000 > $U/320p/dwMaxBitRate	# 30 fps
+	printf '333333\n666666\n' > $U/320p/dwFrameInterval
+	echo 333333 > $U/320p/dwDefaultFrameInterval
+	mkdir $F/streaming/header/h
+	ln -s $U $F/streaming/header/h/yuyv
+	ln -s $F/streaming/header/h $F/streaming/class/fs/h
+	ln -s $F/streaming/header/h $F/streaming/class/hs/h
+	ln -s $F/streaming/header/h $F/streaming/class/ss/h
+	echo 1024 > $F/streaming_maxpacket
+	echo 1 > $F/streaming_interval
+	echo "PocketGo S30 screen" > $F/function_name
+}
+
+# Rebind with the saved functions
+apply() {
+	create
+	killall s30-uvc s30-uac 2>/dev/null
+	echo > $G/UDC 2>/dev/null
+	for f in $ORDER; do rm -f $G/configs/c.1/$(inst $f); done
+	any=
+	for f in $ORDER; do
+		enabled $f || continue
+		ln -s $G/functions/$(inst $f) $G/configs/c.1/
+		any=1
+	done
+	[ -n "$any" ] || return 0
+	ls /sys/class/udc > $G/UDC || return 1
+	if enabled network; then
+		ifconfig usb0 10.42.0.2 netmask 255.255.255.0 up
+		touch /tmp/udhcpd.leases
+		pidof udhcpd >/dev/null || busybox-extras udhcpd /etc/udhcpd.conf
+	fi
+	enabled audio && s30-uac </dev/null >>/tmp/s30-uac.log 2>&1 &
+	# The video function keeps the whole gadget off the bus until s30-uvc
+	# is up
+	enabled video && s30-uvc </dev/null >>/tmp/s30-uvc.log 2>&1 &
+	return 0
+}
+
+case "$1" in
+	"")
+		apply
+		;;
+	status)
+		for f in $ORDER; do
+			if enabled $f; then echo "$f on $(cost $f)"; else echo "$f off $(cost $f)"; fi
+		done
+		echo "free $((MAX - $(used)))"
+		;;
+	serial|network|audio|video)
+		new=
+		for f in $(saved); do [ "$f" = "$1" ] || new="$new $f"; done
+		case "$2" in
+			on)
+				enabled $1 && exit 0
+				[ $(($(used) + $(cost $1))) -le $MAX ] || { echo "usb-gadget: no endpoints left for $1" >&2; exit 3; }
+				new="$new $1"
+				;;
+			off)
+				enabled $1 || exit 0
+				;;
+			*)
+				echo "usage: usb-gadget [status | FUNC on|off]" >&2
+				exit 2
+				;;
+		esac
+		mkdir -p "${SAVED%/*}"
+		echo $new > "$SAVED"
+		apply
+		;;
+	*)
+		echo "usage: usb-gadget [status | FUNC on|off]" >&2
+		exit 2
+		;;
+esac

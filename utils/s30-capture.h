@@ -85,6 +85,10 @@ static int s30_capture_open(S30Capture* c) {
 		drmModeFreeCrtc(crtc);
 	}
 	drmModeFreeResources(res);
+	// The first to open the card becomes its master, which would keep
+	// s30-display (the lessor) from becoming master; reading the planes
+	// needs only root
+	drmDropMaster(c->fd);
 	drmSetClientCap(c->fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
 	return 0;
 }

@@ -32,29 +32,11 @@ s30-splash 40
 	m "AIF1 Slot 0 Digital DAC Playback Switch" 1 1
 ) &
 
-# USB gadget: serial shell (ACM, host /dev/ttyACM*) plus NCM networking
-# (device 10.42.0.2, see /etc/udhcpd.conf). Fixed MACs so the host sees the
-# same interface every boot.
-G=/sys/kernel/config/usb_gadget/s30
-mount -t configfs configfs /sys/kernel/config
-mkdir -p $G/strings/0x409 $G/configs/c.1/strings/0x409 \
-	$G/functions/acm.usb0 $G/functions/ncm.usb0
-echo 0x1d6b > $G/idVendor	# Linux Foundation
-echo 0x0104 > $G/idProduct	# Multifunction Composite Gadget
-echo PocketGo > $G/strings/0x409/manufacturer
-echo "PocketGo S30" > $G/strings/0x409/product
-echo s30 > $G/strings/0x409/serialnumber
-echo "ACM + NCM" > $G/configs/c.1/strings/0x409/configuration
-echo 02:53:33:30:00:02 > $G/functions/ncm.usb0/dev_addr
-echo 02:53:33:30:00:01 > $G/functions/ncm.usb0/host_addr
-ln -s $G/functions/acm.usb0 $G/functions/ncm.usb0 $G/configs/c.1/
-ls /sys/class/udc > $G/UDC
-# USB video (the screen as a webcam), if switched on in System > USB video
-/usr/libexec/s30/usb-video
 ifconfig lo 127.0.0.1 up
-ifconfig usb0 10.42.0.2 netmask 255.255.255.0 up
-touch /tmp/udhcpd.leases
-busybox-extras udhcpd /etc/udhcpd.conf
+# USB gadget: the functions switched on in Settings > USB (default the
+# serial shell, host /dev/ttyACM*, and NCM networking, device 10.42.0.2;
+# see /etc/udhcpd.conf)
+/usr/libexec/s30/usb-gadget
 s30-splash 60
 
 # ssh (root, keys baked in by build.sh initramfs). Host key kept on the SD

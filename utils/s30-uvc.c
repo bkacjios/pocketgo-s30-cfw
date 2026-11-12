@@ -1,6 +1,6 @@
 /*
  * s30-uvc: the screen as a USB webcam. Feeds the UVC gadget function that
- * /usr/libexec/s30/usb-video adds to the USB gadget (System > USB video):
+ * /usr/libexec/s30/usb-gadget adds to the USB gadget (Settings > USB > Video):
  * answers the host's probe/commit requests and, while the host streams,
  * sends the screen as shown (s30-capture.h, every plane: game, OSD, menu)
  * as 480x320 YUYV (BT.601, limited range).
@@ -196,7 +196,8 @@ static void stream_on(void) {
 	rb.count = NBUFS;
 	rb.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
 	rb.memory = V4L2_MEMORY_MMAP;
-	if (ioctl(sVideo, VIDIOC_REQBUFS, &rb) != 0 || rb.count < NBUFS) {
+	// The gadget's REQBUFS returns the buffer count, not 0
+	if (ioctl(sVideo, VIDIOC_REQBUFS, &rb) < 0 || rb.count < NBUFS) {
 		perror("s30-uvc: REQBUFS");
 		return;
 	}
