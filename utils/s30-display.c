@@ -444,9 +444,12 @@ enum { SYS_SETTINGS, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_BACK };
 static const char* const kSysItems[] = { "Settings", "Sleep", "Reboot", "Shut down", "Back" };
 enum { SET_BRIGHTNESS, SET_PERF, SET_USB, SET_CALIBRATE, SET_BACK };
 static const char* const kSetItems[] = { NULL, "Overlay", "USB", "Calibrate stick", "Back" };
-/* The gadget's functions, in usb-gadget's order, then USB storage */
-enum { USBF_SERIAL, USBF_NETWORK, USBF_AUDIO, USBF_VIDEO, USBF_FUNCS, USBF_STORAGE = USBF_FUNCS, USBF_BACK };
-static const char* const kUsbFnItems[] = { "Serial", "Network", "Audio", "Video", "USB storage", "Back" };
+/* The USB page: the endpoint slots in use (a bar, not selectable), the
+   gadget's functions in usb-gadget's order (each with its cost in pips),
+   then USB storage */
+enum { USBF_SLOTS, USBF_SERIAL, USBF_NETWORK, USBF_AUDIO, USBF_VIDEO, USBF_STORAGE, USBF_BACK };
+enum { USBF_FUNCS = USBF_STORAGE - USBF_SERIAL };
+static const char* const kUsbFnItems[] = { "", "Serial", "Network", "Audio", "Video", "USB storage", "Back" };
 static const char* const kUsbFnNames[USBF_FUNCS] = { "serial", "network", "audio", "video" };
 /* USB storage confirmation: two text rows (USB_TEXT_ROWS, not selectable), OK, Cancel */
 enum { USB_TEXT_ROWS = 2, USB_OK = 2, USB_CANCEL };
@@ -461,7 +464,7 @@ static const char* const* menu_items(void) {
 }
 
 static int menu_count(void) {
-	return sMenuPage == 0 || sMenuPage == 4 ? 4 : sMenuPage == 5 ? 6 : 5;
+	return sMenuPage == 0 || sMenuPage == 4 ? 4 : sMenuPage == 5 ? 7 : 5;
 }
 
 /* The row B returns from (its glyph is drawn there) */
@@ -474,9 +477,9 @@ static int menu_back_row(void) {
 }
 
 /* The gadget's functions as usb-gadget reports them (it owns the switches,
-   the endpoint costs and the budget): on, and whether there is room to turn
-   on one that is off */
-static int sUsbOn[USBF_FUNCS], sUsbRoom[USBF_FUNCS];
+   the endpoint costs and the budget): on, cost, whether there is room to
+   turn on one that is off, and the slots in use of all there are */
+static int sUsbOn[USBF_FUNCS], sUsbRoom[USBF_FUNCS], sUsbCost[USBF_FUNCS], sUsbUsed, sUsbMax;
 
 static void usb_status(void) {
 	FILE* f = popen("/usr/libexec/s30/usb-gadget status", "r");
@@ -505,9 +508,13 @@ static void usb_status(void) {
 	if (f != NULL) {
 		pclose(f);
 	}
+	sUsbUsed = 0;
 	for (i = 0; i < USBF_FUNCS; i++) {
 		sUsbRoom[i] = sUsbOn[i] || cost[i] <= room;
+		sUsbCost[i] = cost[i];
+		sUsbUsed += sUsbOn[i] ? cost[i] : 0;
 	}
+	sUsbMax = sUsbUsed + room;
 }
 
 static int on_brightness_row(void) {
@@ -558,6 +565,32 @@ static void draw_button(int x0, int y0, const char* const* letter) {
 	}
 }
 
+/* The USB page's slot bar: "Used N/M", then a cell per slot, filled for
+   those in use */
+static void draw_usb_slots(int y) {
+	const int cellW = 12, gap = 2, cellX = MENU_X + MENU_W - 8 - sUsbMax * (cellW + gap) + gap;
+	char label[16];
+	int i;
+
+	snprintf(label, sizeof(label), "Used %d/%d", sUsbUsed, sUsbMax);
+	draw_text(label, MENU_X + 12, y + (MENU_ROW_H - 16) / 2, 1, argb(0xffffff, 1.0f));
+	for (i = 0; i < sUsbMax; i++) {
+		fill(cellX + i * (cellW + gap), y + (MENU_ROW_H - 10) / 2, cellW, 10,
+		     argb(i < sUsbUsed ? 0x8060e0 : 0x404048, 1.0f));
+	}
+}
+
+/* A function's cost on its row's right: a pip per slot, filled while on */
+static void draw_usb_pips(int y, int fn, int selected) {
+	const int pipW = 6, gap = 2, x0 = MENU_X + MENU_W - 12 - sUsbCost[fn] * (pipW + gap) + gap;
+	const uint32_t on = selected ? 0xffffff : 0x8060e0, off = selected ? 0x3a2a70 : 0x404048;
+	int i;
+
+	for (i = 0; i < sUsbCost[fn]; i++) {
+		fill(x0 + i * (pipW + gap), y + (MENU_ROW_H - 10) / 2, pipW, 10, argb(sUsbOn[fn] ? on : off, 1.0f));
+	}
+}
+
 /* Top of menu row i */
 static int menu_row_y(int i) {
 	const int h = menu_count() * MENU_ROW_H + 2 * MENU_PAD;
@@ -586,6 +619,8 @@ static void draw_menu(void) {
 		}
 		if (items[i] == NULL) {
 			draw_brightness_row(y, i == sMenuSel);
+		} else if (sMenuPage == 5 && i == USBF_SLOTS) {
+			draw_usb_slots(y);
 		} else {
 			char label[32];
 			int len, x;
@@ -593,8 +628,8 @@ static void draw_menu(void) {
 			if (sMenuPage == 3 && i == SET_PERF) {
 				static const char* const modes[] = { "Off", "Full", "FPS" };
 				snprintf(label, sizeof(label), "%s: %s", items[i], modes[sPerf]);
-			} else if (sMenuPage == 5 && i < USBF_FUNCS) {
-				snprintf(label, sizeof(label), "%s: %s", items[i], sUsbOn[i] ? "On" : "Off");
+			} else if (sMenuPage == 5 && i >= USBF_SERIAL && i < USBF_STORAGE) {
+				snprintf(label, sizeof(label), "%s: %s", items[i], sUsbOn[i - USBF_SERIAL] ? "On" : "Off");
 			} else if (sMenuPage == 1 && i == SYS_BACK && sMenuLauncher) {
 				snprintf(label, sizeof(label), "Close");
 			} else {
@@ -602,9 +637,14 @@ static void draw_menu(void) {
 			}
 			len = (int)strlen(label);
 			x = MENU_X + (MENU_W - len * 8) / 2;
+			if (sMenuPage == 5 && i >= USBF_SERIAL && i < USBF_STORAGE) { // left, the pips on the right
+				x = MENU_X + 12;
+				draw_usb_pips(y, i - USBF_SERIAL, i == sMenuSel);
+			}
 			draw_text(label, x, y + (rowH - 16) / 2, 1,
-			          argb((sMenuPage == 4 && i < USB_TEXT_ROWS) || (sMenuPage == 5 && i < USBF_FUNCS && !sUsbRoom[i])
-			                   ? 0xc0c0c0 // not selectable, or no endpoints left to turn it on
+			          argb(sMenuPage == 4 && i < USB_TEXT_ROWS ? 0xc0c0c0 // not selectable
+			               : sMenuPage == 5 && i >= USBF_SERIAL && i < USBF_STORAGE && !sUsbRoom[i - USBF_SERIAL]
+			                   ? 0x606068 // no slots left to turn it on
 			                   : 0xffffff,
 			               1.0f));
 			if (i == menu_back_row()) {
@@ -1640,8 +1680,8 @@ static void menu_confirm(void) {
 		return;
 	}
 	if (sMenuPage == 5) {
-		if (sMenuSel < USBF_FUNCS) {
-			usb_toggle(sMenuSel);
+		if (sMenuSel >= USBF_SERIAL && sMenuSel < USBF_STORAGE) {
+			usb_toggle(sMenuSel - USBF_SERIAL);
 			menu_redraw();
 		} else if (sMenuSel == USBF_STORAGE) {
 			sMenuPage = 4; // confirm first: it reboots
@@ -1855,6 +1895,9 @@ static void menu_input(void) {
 				sMenuSel = (sMenuSel + (ev[i].code == BTN_DPAD_UP ? menu_count() - 1 : 1)) % menu_count();
 				if (sMenuPage == 4 && sMenuSel < USB_TEXT_ROWS) {
 					sMenuSel = ev[i].code == BTN_DPAD_UP ? USB_CANCEL : USB_OK; // over the text
+				}
+				if (sMenuPage == 5 && sMenuSel == USBF_SLOTS) {
+					sMenuSel = ev[i].code == BTN_DPAD_UP ? USBF_BACK : USBF_SERIAL; // over the slot bar
 				}
 				sRepeatDir = 0;
 				redraw = 1;
