@@ -6,6 +6,11 @@
  * runs at the rate the codec consumes samples (about 60 per second), like the
  * N64's AI-driven audio thread.
  *
+ * Without an update thread (S30Audio_Open alone), S30Audio_PlayInterleaved
+ * writes each frame out as the game passes it: for games whose own audio
+ * thread runs on the N64's retraces (Diddy Kong Racing's libultra audio
+ * manager), with the paced mode's AI length.
+ *
  * S30Audio_Configure changes two things for games that need it:
  * - the sample rate: Mario Kart 64 mixes at 26800 Hz, which the codec can't
  *   run at (7350-192000, standard rates only). ALSA's plug converts it; its
@@ -56,6 +61,10 @@ static pthread_mutex_t sLock = PTHREAD_MUTEX_INITIALIZER;
 // The frame the update rendered, written to ALSA after unlocking
 static int16_t sPending[2 * MAX_FRAMES];
 static int32_t sPendingFrames;
+// Push mode (no update thread): frames queued for push_thread, and the
+// device's queue as push_thread last read it (only it calls ALSA: alsa-lib
+// locks the PCM for the length of a blocking write)
+static int32_t sPushRead, sPushCount, sPushDeviceQueued;
 
 void S30Audio_Lock(void) {
     pthread_mutex_lock(&sLock);
@@ -248,6 +257,10 @@ uint32_t S30Audio_QueuedFrames(void) {
     if (sPcm == NULL) {
         return 0;
     }
+    if (sUpdate == NULL) {
+        queued = (int64_t)sPushDeviceQueued + sPushCount - PACED_LATENCY;
+        return queued > 0 ? (uint32_t)queued : 0;
+    }
     avail = snd_pcm_avail_update(sPcm);
     if (avail < 0 || (snd_pcm_uframes_t)avail > sBufferFrames) {
         return 0;
@@ -262,7 +275,75 @@ uint32_t S30Audio_QueuedFrames(void) {
     return (uint32_t)queued;
 }
 
+/* Push mode: the game's frames queue here and a thread of ours writes them
+   out, so an N64 thread never blocks in ALSA (it would hold the N64's CPU) */
+#define PUSH_FRAMES 8192
+static int16_t sPush[2 * PUSH_FRAMES];
+static pthread_cond_t sPushCond = PTHREAD_COND_INITIALIZER;
+
+static void* push_thread(void* arg) {
+    static int16_t chunk[2 * PACED_PERIOD];
+
+    (void)arg;
+    prefill();
+    for (;;) {
+        int32_t n, i;
+
+        pthread_mutex_lock(&sLock);
+        while (sPushCount == 0) {
+            pthread_cond_wait(&sPushCond, &sLock);
+        }
+        n = sPushCount < PACED_PERIOD ? sPushCount : PACED_PERIOD;
+        for (i = 0; i < n; i++) {
+            chunk[2 * i] = sPush[2 * ((sPushRead + i) % PUSH_FRAMES)];
+            chunk[2 * i + 1] = sPush[2 * ((sPushRead + i) % PUSH_FRAMES) + 1];
+        }
+        sPushRead = (sPushRead + n) % PUSH_FRAMES;
+        sPushCount -= n;
+        pthread_mutex_unlock(&sLock);
+        write_frames(chunk, n);
+        {
+            snd_pcm_sframes_t avail = snd_pcm_avail_update(sPcm);
+
+            sPushDeviceQueued = avail >= 0 && (snd_pcm_uframes_t)avail <= sBufferFrames ? (int32_t)(sBufferFrames - avail) : 0;
+        }
+    }
+    return NULL;
+}
+
+static void push(const int16_t* samples, int32_t frames) {
+    static int started;
+    int32_t i;
+
+    if (sPcm == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&sLock);
+    if (!started) {
+        pthread_t thread;
+
+        started = 1;
+        pthread_create(&thread, NULL, push_thread, NULL);
+        pthread_detach(thread);
+    }
+    for (i = 0; i < frames && sPushCount < PUSH_FRAMES; i++, sPushCount++) {
+        int32_t w = (sPushRead + sPushCount) % PUSH_FRAMES;
+
+        sPush[2 * w] = samples[2 * i];
+        sPush[2 * w + 1] = samples[2 * i + 1];
+    }
+    pthread_cond_signal(&sPushCond);
+    pthread_mutex_unlock(&sLock);
+}
+
 void S30Audio_PlayInterleaved(const int16_t* samples, int32_t frames) {
+    if (sUpdate == NULL) {
+        // No update thread: the game's own audio thread passes each frame
+        // (osAiSetNextBuffer); it is queued for push_thread, the device queue
+        // (prefilled with the paced mode's latency) plus ours its AI length
+        push(samples, frames);
+        return;
+    }
     if (frames > MAX_FRAMES) {
         frames = MAX_FRAMES;
     }

@@ -28,7 +28,9 @@ void S30Audio_Init(void (*update)(void));
 uint32_t S30Audio_QueuedFrames(void);
 // Device underruns so far (debug output)
 int S30Audio_Underruns(void);
-// The update's output: separate L/R, or interleaved stereo
+// The update's output: separate L/R, or interleaved stereo. Without an update
+// thread (S30Audio_Open only), S30Audio_PlayInterleaved writes the frame out
+// at once (the game's own audio thread, through osAiSetNextBuffer).
 void S30Audio_Play(const int16_t* left, const int16_t* right, int32_t frames);
 void S30Audio_PlayInterleaved(const int16_t* samples, int32_t frames);
 

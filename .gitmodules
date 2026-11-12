@@ -46,3 +46,7 @@
 	path = external/gmloader-next
 	url = https://github.com/PortsMaster/gmloader-next.git
 	shallow = true
+[submodule "ports/dkr"]
+	path = ports/dkr
+	url = https://github.com/bkacjios/dkr-s30.git
+	shallow = true

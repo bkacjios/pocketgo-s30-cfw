@@ -54,6 +54,13 @@ static struct {
     u16 filter_count;
     s16 filter[8];
 
+    s16 adpcm_raw[16 * 2 * 8]; /* the book as loaded (ABI1's pole filter reads it) */
+
+    /* ABI1 (libultra 2.0's aspMain): the aux outputs, and the volumes */
+    u16 dry_right, wet_left, wet_right;
+    s16 dry, wet;
+    s16 env_vol[2], env_target[2];
+    s32 env_rate[2];
 } __attribute__((aligned(32))) rspa;
 
 /* ---- Float resample table (raw int16 values cast to float) ---- */
@@ -174,6 +181,7 @@ void aLoadADPCMImpl(int num_entries_times_16, const s16* book_source_addr) {
     for (int i = 0; i < num_entries_times_16 / 2; i++) {
         fp[i] = recip2048 * (float)(s32)book_source_addr[i];
     }
+    memcpy(rspa.adpcm_raw, book_source_addr, num_entries_times_16);
 }
 
 void aSetBufferImpl(u8 flags, u16 in, u16 out, u16 nbytes) {
@@ -182,9 +190,20 @@ void aSetBufferImpl(u8 flags, u16 in, u16 out, u16 nbytes) {
     rspa.nbytes = nbytes;
 }
 
+/* Front to back, as the RSP does: ranges may overlap */
 void aDMEMMoveImpl(u16 in_addr, u16 out_addr, int nbytes) {
+    u8* dst = BUF_U8(out_addr);
+    const u8* src = BUF_U8(in_addr);
+    int i;
+
     nbytes = ROUND_UP_16(nbytes);
-    memcpy(BUF_U8(out_addr), BUF_U8(in_addr), nbytes);
+    if (dst + nbytes <= src || src + nbytes <= dst) {
+        memcpy(dst, src, nbytes);
+        return;
+    }
+    for (i = 0; i < nbytes; i++) {
+        dst[i] = src[i];
+    }
 }
 
 void aSetLoopImpl(ADPCM_STATE* adpcm_loop_state) {
@@ -906,3 +925,203 @@ void aDMEMMove4Impl(u16 in_addr, u16 out_addr, u16 nbytes) {
         out[i] = in[i];
     }
 }
+
+/* ---- libultra 2.0's aspMain (ABI1): Diddy Kong Racing's libultra audio ---- */
+/* After mupen64plus-rsp-hle's alist_audio.c and alist.c (ENVMIXER is
+   alist_envmix_exp). DMEM addresses are the library's, without the
+   microcode's DMEM base (0x5C0): they fit this DMEM as they are. */
+
+void aSetBufferAbi1Impl(u8 flags, u16 in, u16 out, u16 count) {
+    if (flags & 0x08) { // A_AUX
+        rspa.dry_right = in;
+        rspa.wet_left = out;
+        rspa.wet_right = count;
+    } else {
+        aSetBufferImpl(flags, in, out, count);
+    }
+}
+
+/* The count from the last aSetBuffer; the decoders read the copy in DMEM */
+void aLoadBufferAbi1Impl(const void* source_addr) {
+    if (rspa.nbytes != 0) {
+        memcpy(BUF_U8(rspa.in), source_addr, ROUND_UP_8(rspa.nbytes));
+    }
+    bufPtr = rspa.buf;
+}
+
+void aSaveBufferAbi1Impl(void* dest_addr) {
+    if (rspa.nbytes != 0) {
+        memcpy(dest_addr, BUF_U8(rspa.out), ROUND_UP_8(rspa.nbytes));
+    }
+}
+
+void aSetVolumeAbi1Impl(u8 flags, s16 v, s16 t, s16 r) {
+    if (flags & 0x08) { // A_AUX: dry and wet amounts
+        rspa.dry = v;
+        rspa.wet = r;
+    } else {
+        int lr = (flags & 0x02) ? 0 : 1; // A_LEFT
+
+        if (flags & 0x04) { // A_VOL
+            rspa.env_vol[lr] = v;
+        } else {
+            rspa.env_target[lr] = v;
+            rspa.env_rate[lr] = (s32)(((u32)(u16)t << 16) | (u16)r);
+        }
+    }
+}
+
+typedef struct {
+    s64 value, step, target;
+} Ramp;
+
+static s16 ramp_step(Ramp* ramp) {
+    int reached;
+
+    ramp->value += ramp->step;
+    reached = ramp->step <= 0 ? ramp->value <= ramp->target : ramp->value >= ramp->target;
+    if (reached) {
+        ramp->value = ramp->target;
+        ramp->step = 0;
+    }
+    return (s16)(ramp->value >> 16);
+}
+
+static void sample_mix(s16* dst, s16 src, s16 gain) {
+    *dst = clamp16(*dst + ((src * gain) >> 15));
+}
+
+/* Exponential volume ramps towards the targets, 8 samples a step; dry to the
+   output and dry right, wet (with A_AUX) to the wet left and right. The state
+   (40 halves) holds the ramps between calls, in this mixer's own layout. */
+void aEnvMixerAbi1Impl(u8 flags, s16* state) {
+    const s16* in = BUF_S16(rspa.in);
+    s16* out[4] = { BUF_S16(rspa.out), BUF_S16(rspa.dry_right), BUF_S16(rspa.wet_left), BUF_S16(rspa.wet_right) };
+    int n = (flags & 0x08) ? 4 : 2;
+    s16 dry = rspa.dry, wet = rspa.wet;
+    Ramp ramps[2];
+    s32 seq[2], rates[2];
+    s32 saved[10];
+    int x, y, ptr = 0, k;
+
+    if (flags & A_INIT) {
+        for (k = 0; k < 2; k++) {
+            ramps[k].value = (s64)rspa.env_vol[k] << 16;
+            ramps[k].target = (s64)rspa.env_target[k] << 16;
+            rates[k] = rspa.env_rate[k];
+            seq[k] = rspa.env_vol[k] * rspa.env_rate[k];
+        }
+    } else {
+        memcpy(saved, state, sizeof(saved));
+        wet = (s16)saved[0];
+        dry = (s16)saved[1];
+        for (k = 0; k < 2; k++) {
+            ramps[k].target = saved[2 + k];
+            rates[k] = saved[4 + k];
+            seq[k] = saved[6 + k];
+            ramps[k].value = saved[8 + k];
+        }
+    }
+    for (k = 0; k < 2; k++) {
+        ramps[k].step = ramps[k].target - ramps[k].value;
+    }
+    for (y = 0; y < rspa.nbytes; y += 16) {
+        for (k = 0; k < 2; k++) {
+            if (ramps[k].step != 0) {
+                seq[k] = (s32)(((s64)seq[k] * (s64)rates[k]) >> 16);
+                ramps[k].step = (seq[k] - ramps[k].value) >> 3;
+            }
+        }
+        for (x = 0; x < 8; x++, ptr++) {
+            s16 lvol = ramp_step(&ramps[0]);
+            s16 rvol = ramp_step(&ramps[1]);
+            s16 gains[4];
+
+            gains[0] = clamp16((lvol * dry + 0x4000) >> 15);
+            gains[1] = clamp16((rvol * dry + 0x4000) >> 15);
+            gains[2] = clamp16((lvol * wet + 0x4000) >> 15);
+            gains[3] = clamp16((rvol * wet + 0x4000) >> 15);
+            for (k = 0; k < n; k++) {
+                sample_mix(&out[k][ptr], in[ptr], gains[k]);
+            }
+        }
+    }
+    saved[0] = wet;
+    saved[1] = dry;
+    for (k = 0; k < 2; k++) {
+        saved[2 + k] = (s32)ramps[k].target;
+        saved[4 + k] = rates[k];
+        saved[6 + k] = seq[k];
+        saved[8 + k] = (s32)ramps[k].value;
+    }
+    memcpy(state, saved, sizeof(saved));
+    gS30MixDbg[1]++;
+}
+
+/* The count from the last aSetBuffer, rounded up to 32 bytes */
+void aMixAbi1Impl(s16 gain, u16 in_addr, u16 out_addr) {
+    const s16* in = BUF_S16(in_addr);
+    s16* out = BUF_S16(out_addr);
+    int n = ROUND_UP_32(rspa.nbytes) / 2, i;
+
+    for (i = 0; i < n; i++) {
+        sample_mix(&out[i], in[i], gain);
+    }
+}
+
+static s32 rdot(int n, const s16* x, const s16* y) {
+    s32 accu = 0;
+
+    y += n;
+    while (n-- > 0) {
+        accu += *x++ * *--y;
+    }
+    return accu;
+}
+
+/* The two-pole filter: its coefficients are the ADPCM book loaded last (h1,
+   then h2, which the gain scales in place, as the microcode does); the state
+   keeps the last 4 outputs */
+void aPoleFilterAbi1Impl(u8 flags, u16 gain, s16* state) {
+    s16* dst = BUF_S16(rspa.out);
+    const s16* src = BUF_S16(rspa.in);
+    const s16* h1 = rspa.adpcm_raw;
+    s16* h2 = rspa.adpcm_raw + 8;
+    s16 h2_before[8];
+    s16 l1, l2;
+    int count = ROUND_UP_16(rspa.nbytes), i;
+
+    if (count == 0) {
+        return;
+    }
+    if (flags & A_INIT) {
+        l1 = 0;
+        l2 = 0;
+    } else {
+        l1 = state[2];
+        l2 = state[3];
+    }
+    for (i = 0; i < 8; i++) {
+        h2_before[i] = h2[i];
+        h2[i] = (s16)(((s32)h2[i] * gain) >> 14);
+    }
+    do {
+        s16 frame[8];
+
+        for (i = 0; i < 8; i++) {
+            frame[i] = *src++;
+        }
+        for (i = 0; i < 8; i++) {
+            s32 accu = frame[i] * (s32)gain;
+
+            accu += h1[i] * l1 + h2_before[i] * l2 + rdot(i, h2, frame);
+            dst[i] = clamp16(accu >> 14);
+        }
+        l1 = dst[6];
+        l2 = dst[7];
+        dst += 8;
+        count -= 16;
+    } while (count > 0);
+    memcpy(state, dst - 4, 4 * sizeof(s16));
+}
+

@@ -58,6 +58,18 @@ void aDMEMMove4Impl(unsigned short in_addr, unsigned short out_addr, unsigned sh
 void aDMEMMove2Impl(unsigned char times, unsigned short in_addr, unsigned short out_addr, unsigned short count);
 void aDownsampleHalfImpl(unsigned short count, unsigned short in_addr, unsigned short out_addr);
 
+// libultra 2.0's aspMain (ABI1, Diddy Kong Racing's libultra audio library):
+// aSetBuffer with A_AUX sets the aux outputs (dry right, wet left, wet
+// right); loads, saves and mixes take the count from the last aSetBuffer;
+// aSetVolume sets the envelope mixer's volumes, targets and rates
+void aSetBufferAbi1Impl(unsigned char flags, unsigned short in, unsigned short out, unsigned short count);
+void aLoadBufferAbi1Impl(const void* source_addr);
+void aSaveBufferAbi1Impl(void* dest_addr);
+void aSetVolumeAbi1Impl(unsigned char flags, short v, short t, short r);
+void aEnvMixerAbi1Impl(unsigned char flags, short* state);
+void aMixAbi1Impl(short gain, unsigned short in_addr, unsigned short out_addr);
+void aPoleFilterAbi1Impl(unsigned char flags, unsigned short gain, short* state);
+
 // <prefix>_AUDIODBG counters: ADPCM decodes, envelope mixes, their peaks
 extern int gS30MixDbg[4];
 
