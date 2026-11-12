@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
 	if (s30_capture_open(&cap) != 0) {
 		return 1;
 	}
-	s30_capture(&cap, gameOnly, screen);
+	s30_capture(&cap, gameOnly, 0, screen); // the app is stopped under the menu
 	f = fopen(out, "wb");
 	if (f == NULL) {
 		perror(out);

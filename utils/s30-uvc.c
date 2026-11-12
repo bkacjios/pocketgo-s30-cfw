@@ -14,6 +14,12 @@
  * it asks for. Frames are captured only when a buffer comes back, so a
  * frame is never older than the transfer before it.
  *
+ * No tearing: a capture waits for the app's next page flip (the frame ring
+ * libs30lease.so marks, s30-frames.h) and then the vblank after it, and
+ * copies the planes then: the frame just flipped to stays on screen for a
+ * frame of the app's, and the copy takes a few ms. A screen that doesn't
+ * flip (nothing moving) is captured after FLIP_WAIT_MS.
+ *
  * Usage: s30-uvc   (as root, for the display card's buffer handles)
  */
 #include <errno.h>
@@ -33,12 +39,14 @@
 #include <linux/usb/video.h>
 #include <linux/videodev2.h>
 #include "s30-capture.h"
+#include "s30-frames.h"
 
 #define WIDTH PANEL_H // landscape
 #define HEIGHT PANEL_W
 #define FRAME_SIZE (WIDTH * HEIGHT * 2)
 #define MAX_PAYLOAD 1024 // the function's streaming_maxpacket
 #define NBUFS 2
+#define FLIP_WAIT_MS 40
 
 /* The frame intervals the gadget's descriptor lists (100 ns units, 30 and 15
    fps); the first is the default */
@@ -110,12 +118,40 @@ static void fill_control(struct uvc_streaming_control* c, uint32_t interval) {
  * Frames
  * ------------------------------------------------------------------------- */
 
+/* Until the app's next page flip, FLIP_WAIT_MS at most. The ring is opened
+   each time: s30-display makes a new one when it restarts. */
+static void wait_flip(void) {
+	int fd = open(S30_FRAMES_PATH, O_RDONLY | O_CLOEXEC);
+	const S30Frames* ring = NULL;
+	uint64_t end = now_ms() + FLIP_WAIT_MS;
+
+	if (fd >= 0) {
+		void* m = mmap(NULL, sizeof(S30Frames), PROT_READ, MAP_SHARED, fd, 0);
+
+		ring = m == MAP_FAILED ? NULL : m;
+		close(fd);
+	}
+	if (ring == NULL) {
+		return;
+	}
+	{
+		uint32_t start = ring->count;
+		struct timespec ms1 = { 0, 1000000 };
+
+		while (ring->count == start && now_ms() < end) {
+			nanosleep(&ms1, NULL);
+		}
+	}
+	munmap((void*)ring, sizeof(S30Frames));
+}
+
 /* The screen, rotated to landscape, as YUYV into `out` */
 static void capture_yuyv(uint8_t* out) {
 	static uint32_t screen[PANEL_W * PANEL_H];
 	int x, y;
 
-	s30_capture(&sCap, 0, screen);
+	wait_flip();
+	s30_capture(&sCap, 0, 1, screen);
 	for (y = 0; y < HEIGHT; y++) {
 		for (x = 0; x < WIDTH; x += 2) {
 			uint32_t c0 = screen[(PANEL_H - 1 - x) * PANEL_W + y];
