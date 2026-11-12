@@ -487,6 +487,8 @@ step_initramfs() {
 	mkdir -p "$loader"/{bin,lib,dev,proc,sys}
 	cp -a "$root/bin/busybox" "$loader/bin/"
 	cp -a "$root"/lib/ld-musl-armhf.so.1 "$loader/lib/"
+	# Card check (dosfstools, exfatprogs; libc only)
+	cp -a "$root/sbin/fsck.fat" "$root/usr/sbin/fsck.exfat" "$loader/bin/"
 	install -m 0755 "$HERE/s30-loader" "$loader/init"
 	# USB disk mode (see s30-loader; usb.bmp from tools/make_usb_splash.py)
 	[ -f "$WORK/s30-splash.bin" ] &&

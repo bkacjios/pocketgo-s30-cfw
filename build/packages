@@ -32,6 +32,9 @@ libretro-core-info
 # RetroArch menu assets (Ozone/XMB/GLUI themes, fonts, sounds) in
 # /usr/share/libretro/assets; the launcher uses its Ozone fonts
 retroarch-assets
+# fsck.fat / fsck.exfat for the loader's card check (see s30-loader)
+dosfstools
+exfatprogs
 # Launcher (build.sh launcher)
 sdl2
 sdl2_ttf

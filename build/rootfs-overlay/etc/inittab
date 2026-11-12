@@ -12,3 +12,6 @@ ttyGS0::respawn:-/bin/sh
 
 ::ctrlaltdel:/sbin/reboot
 ::shutdown:/bin/sync
+# The card unmounted (busy: read-only), so its FAT is marked clean; else
+# s30-loader checks it at every boot (see there)
+::shutdown:/bin/umount -a -r

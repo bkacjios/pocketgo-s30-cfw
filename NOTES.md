@@ -296,6 +296,20 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   `/root/.ssh/authorized_keys` (override: `S30_SSH_KEYS="file ..."`); host
   key persists at `/mnt/sd/home/.dropbear/ed25519_host_key`. Serial is the
   fallback: don't push big files over it (a 7 MB base64 transfer wedged it).
+- Card check (2026-11-12): s30-loader reads the card's dirty flags before
+  mounting it and runs `fsck.fat -a -w` / `fsck.exfat -y` (dosfstools,
+  exfatprogs in the initramfs) only when one is set. FAT32 has two: Linux's
+  (boot sector byte 65 bit 0, set at mount and cleared at unmount; once
+  found set at mount the kernel leaves it alone and warns "Volume was not
+  properly unmounted" at every boot) and fsck.fat's (FAT[1] bit 27 clear).
+  fsck.fat 4.2 clears only its own, so the loader clears byte 65 (and the
+  backup boot sector's) after fsck.fat exits 0 or 1. exFAT: VolumeFlags
+  bit 1 at boot sector offset 106, cleared by fsck.exfat. inittab's
+  shutdown runs `umount -a -r` (busy mounts go read-only, which also
+  clears Linux's flag); a crash or a pulled battery leaves it set. The loader also test-mounts
+  `rootfs.sqfs.new` before installing it. Stage an update as another name
+  and `mv` it to `rootfs.sqfs.new` on the device: a reboot during the copy
+  once installed a truncated image (recovered through a card reader).
 - Root is squashfs + tmpfs overlay: changes outside the SD card are lost at
   reboot. For quick tests, edit `/etc/...` live and `killall s30-launcher`
   (init respawns the frontend).

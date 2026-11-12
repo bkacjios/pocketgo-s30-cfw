@@ -57,6 +57,46 @@ if [ $usb_mode = 1 ]; then
 	reboot -f
 fi
 
+# A card that was not unmounted cleanly (a crash, the battery pulled, a copy
+# cut short) is repaired before use. FAT32 has two dirty flags: Linux's,
+# bit 0 of boot sector byte 65 (set at mount, cleared at unmount; left alone
+# once found set, for fsck), and fsck.fat's, FAT[1] bit 27 clear. fsck.fat
+# clears only its own, so Linux's is cleared here after it ran (in the
+# backup boot sector too). exFAT: VolumeFlags bit 1 (boot sector offset
+# 106) is VolumeDirty; fsck.exfat clears it.
+card_byte() { # OFFSET: one byte of the partition, decimal
+	dd if=/dev/mmcblk0p1 bs=1 skip=$1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '
+}
+card_fsck() {
+	local rsvd b s dirty
+	if [ "$(dd if=/dev/mmcblk0p1 bs=1 skip=82 count=5 2>/dev/null | tr -d "\0")" = FAT32 ]; then
+		rsvd=$(dd if=/dev/mmcblk0p1 bs=1 skip=14 count=2 2>/dev/null | od -An -tu2 | tr -d ' ')
+		s=$(card_byte 65)
+		b=$(card_byte $((rsvd * 512 + 7)))
+		dirty=0
+		[ -n "$s" ] && [ $((s & 1)) != 0 ] && dirty=1
+		[ -n "$b" ] && [ $((b & 8)) = 0 ] && dirty=1
+		[ $dirty = 1 ] && echo fsck.fat -a -w
+	elif [ "$(dd if=/dev/mmcblk0p1 bs=1 skip=3 count=5 2>/dev/null | tr -d "\0")" = EXFAT ]; then
+		b=$(card_byte 106)
+		[ -n "$b" ] && [ $((b & 2)) != 0 ] && echo fsck.exfat -y
+	fi
+}
+fsck=$(card_fsck)
+if [ -n "$fsck" ]; then
+	echo "s30-loader: SD card was not unmounted cleanly, checking it" > /dev/console
+	$fsck /dev/mmcblk0p1 > /dev/console 2>&1
+	rc=$?
+	if [ "${fsck%% *}" = fsck.fat ] && [ $rc -le 1 ]; then # 1: errors corrected
+		s=$(card_byte 65)
+		bk=$(dd if=/dev/mmcblk0p1 bs=1 skip=50 count=2 2>/dev/null | od -An -tu2 | tr -d ' ')
+		for sec in 0 $bk; do # the boot sector and its backup (BkBootSec)
+			printf "\\$(printf %03o $((s & ~1)))" |
+				dd of=/dev/mmcblk0p1 bs=1 seek=$((sec * 512 + 65)) conv=notrunc 2>/dev/null
+		done
+	fi
+fi
+
 # FAT (stock card) or ext4
 mount /dev/mmcblk0p1 /sd || fail "cannot mount SD card"
 # Staged update (copied over ssh while the old one is in use as /): installed
