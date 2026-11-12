@@ -13,6 +13,7 @@
 !/ports/mk64
 !/ports/ssb
 !/ports/dkr
+!/ports/RogueSquadron64Recomp
 # Old U-Boot checkout kept for reference (not built)
 /u-boot/
 /testing.tar.gz

@@ -50,3 +50,7 @@
 	path = ports/dkr
 	url = https://github.com/bkacjios/dkr-s30.git
 	shallow = true
+[submodule "ports/RogueSquadron64Recomp"]
+	path = ports/RogueSquadron64Recomp
+	url = https://github.com/bkacjios/rs64recomp-s30.git
+	shallow = true
