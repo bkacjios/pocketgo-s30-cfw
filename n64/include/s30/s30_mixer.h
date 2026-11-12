@@ -61,7 +61,8 @@ void aDownsampleHalfImpl(unsigned short count, unsigned short in_addr, unsigned 
 // libultra 2.0's aspMain (ABI1, Diddy Kong Racing's libultra audio library):
 // aSetBuffer with A_AUX sets the aux outputs (dry right, wet left, wet
 // right); loads, saves and mixes take the count from the last aSetBuffer;
-// aSetVolume sets the envelope mixer's volumes, targets and rates
+// aSetVolume sets the envelope mixer's volumes, targets and rates (linear
+// ramps: the Blast Corps / Diddy Kong Racing and GoldenEye microcode)
 void aSetBufferAbi1Impl(unsigned char flags, unsigned short in, unsigned short out, unsigned short count);
 void aLoadBufferAbi1Impl(const void* source_addr);
 void aSaveBufferAbi1Impl(void* dest_addr);

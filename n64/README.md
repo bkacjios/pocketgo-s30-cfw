@@ -52,6 +52,14 @@ Bugs every N64 port here has hit. Check each in a new game before its first run:
   `S30Audio_Configure` (paced updates) or tempo and pitch drift.
 - **Microcode semantics:** each game's audio microcode differs (envelope
   mixer, DMA rounding); check the Acmd mapping against mupen64plus-rsp-hle's
-  alist for that game.
+  alist for that game. ABI1 (libultra 2.0 aspMain) comes in variants told
+  apart by the ucode data word at +0x28 (rsp-hle's `hle.c`): the common one
+  ramps envelope volumes exponentially, Diddy Kong Racing / Blast Corps
+  (0x1e3c1390) and GoldenEye linearly (`alist_envmix_ge`); the wrong ramp
+  plays the first sequence and leaves later ones silent or stuck.
+- **Shared sound-bank structures:** envelopes, ADPCM books and loops are
+  shared between sounds; swap each once (a set of seen pointers that cannot
+  fill up: DKR's two bank files hold more than a thousand), or a second visit
+  swaps them back and release times become 20-minute ramps.
 - **CPU-written textures:** RAM is read in N64 byte order; code that builds
   or recolours pixels/palettes with native u16 stores must swap.

@@ -927,8 +927,8 @@ void aDMEMMove4Impl(u16 in_addr, u16 out_addr, u16 nbytes) {
 }
 
 /* ---- libultra 2.0's aspMain (ABI1): Diddy Kong Racing's libultra audio ---- */
-/* After mupen64plus-rsp-hle's alist_audio.c and alist.c (ENVMIXER is
-   alist_envmix_exp). DMEM addresses are the library's, without the
+/* After mupen64plus-rsp-hle's alist_audio.c and alist.c (alist_process_audio_bc:
+   ENVMIXER is alist_envmix_ge). DMEM addresses are the library's, without the
    microcode's DMEM base (0x5C0): they fit this DMEM as they are. */
 
 void aSetBufferAbi1Impl(u8 flags, u16 in, u16 out, u16 count) {
@@ -991,25 +991,26 @@ static void sample_mix(s16* dst, s16 src, s16 gain) {
     *dst = clamp16(*dst + ((src * gain) >> 15));
 }
 
-/* Exponential volume ramps towards the targets, 8 samples a step; dry to the
-   output and dry right, wet (with A_AUX) to the wet left and right. The state
-   (40 halves) holds the ramps between calls, in this mixer's own layout. */
+/* Linear volume ramps towards the targets, a step a sample (the Blast Corps /
+   Diddy Kong Racing and GoldenEye aspMain, mupen64plus-rsp-hle's
+   alist_envmix_ge; the common aspMain's exponential ramp, alist_envmix_exp, is
+   not implemented): dry to the output and dry right, wet (with A_AUX) to the
+   wet left and right. The state (40 halves) holds the ramps between calls, in
+   this mixer's own layout. */
 void aEnvMixerAbi1Impl(u8 flags, s16* state) {
     const s16* in = BUF_S16(rspa.in);
     s16* out[4] = { BUF_S16(rspa.out), BUF_S16(rspa.dry_right), BUF_S16(rspa.wet_left), BUF_S16(rspa.wet_right) };
     int n = (flags & 0x08) ? 4 : 2;
     s16 dry = rspa.dry, wet = rspa.wet;
     Ramp ramps[2];
-    s32 seq[2], rates[2];
-    s32 saved[10];
-    int x, y, ptr = 0, k;
+    s32 saved[8];
+    int count = rspa.nbytes / 2, i, k;
 
     if (flags & A_INIT) {
         for (k = 0; k < 2; k++) {
             ramps[k].value = (s64)rspa.env_vol[k] << 16;
             ramps[k].target = (s64)rspa.env_target[k] << 16;
-            rates[k] = rspa.env_rate[k];
-            seq[k] = rspa.env_vol[k] * rspa.env_rate[k];
+            ramps[k].step = rspa.env_rate[k] / 8;
         }
     } else {
         memcpy(saved, state, sizeof(saved));
@@ -1017,42 +1018,29 @@ void aEnvMixerAbi1Impl(u8 flags, s16* state) {
         dry = (s16)saved[1];
         for (k = 0; k < 2; k++) {
             ramps[k].target = saved[2 + k];
-            rates[k] = saved[4 + k];
-            seq[k] = saved[6 + k];
-            ramps[k].value = saved[8 + k];
+            ramps[k].step = saved[4 + k];
+            ramps[k].value = saved[6 + k];
         }
     }
-    for (k = 0; k < 2; k++) {
-        ramps[k].step = ramps[k].target - ramps[k].value;
-    }
-    for (y = 0; y < rspa.nbytes; y += 16) {
-        for (k = 0; k < 2; k++) {
-            if (ramps[k].step != 0) {
-                seq[k] = (s32)(((s64)seq[k] * (s64)rates[k]) >> 16);
-                ramps[k].step = (seq[k] - ramps[k].value) >> 3;
-            }
-        }
-        for (x = 0; x < 8; x++, ptr++) {
-            s16 lvol = ramp_step(&ramps[0]);
-            s16 rvol = ramp_step(&ramps[1]);
-            s16 gains[4];
+    for (i = 0; i < count; i++) {
+        s16 lvol = ramp_step(&ramps[0]);
+        s16 rvol = ramp_step(&ramps[1]);
+        s16 gains[4];
 
-            gains[0] = clamp16((lvol * dry + 0x4000) >> 15);
-            gains[1] = clamp16((rvol * dry + 0x4000) >> 15);
-            gains[2] = clamp16((lvol * wet + 0x4000) >> 15);
-            gains[3] = clamp16((rvol * wet + 0x4000) >> 15);
-            for (k = 0; k < n; k++) {
-                sample_mix(&out[k][ptr], in[ptr], gains[k]);
-            }
+        gains[0] = clamp16((lvol * dry + 0x4000) >> 15);
+        gains[1] = clamp16((rvol * dry + 0x4000) >> 15);
+        gains[2] = clamp16((lvol * wet + 0x4000) >> 15);
+        gains[3] = clamp16((rvol * wet + 0x4000) >> 15);
+        for (k = 0; k < n; k++) {
+            sample_mix(&out[k][i], in[i], gains[k]);
         }
     }
     saved[0] = wet;
     saved[1] = dry;
     for (k = 0; k < 2; k++) {
         saved[2 + k] = (s32)ramps[k].target;
-        saved[4 + k] = rates[k];
-        saved[6 + k] = seq[k];
-        saved[8 + k] = (s32)ramps[k].value;
+        saved[4 + k] = (s32)ramps[k].step;
+        saved[6 + k] = (s32)ramps[k].value;
     }
     memcpy(state, saved, sizeof(saved));
     gS30MixDbg[1]++;
