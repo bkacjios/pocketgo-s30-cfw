@@ -236,7 +236,8 @@ ensure_sysroot() {
 # viewer), with ui.c. SDL2 (KMS), text in utils/osd_font.h, images through
 # the vendored stb_image.h. Utilities (utils/): s30-fel, s30-volumed, s30-splash,
 # s30-keyheld, s30-display (with the system menu and stick calibration) and its
-# preload libs30lease.so, s30-screenshot (the screen's KMS planes to a PNG). Output: $WORK/{launcher,s30-*}.bin, $WORK/libs30lease.so
+# preload libs30lease.so, s30-screenshot (the screen's KMS planes to a PNG),
+# s30-uvc (the screen as a USB webcam). Output: $WORK/{launcher,s30-*}.bin, $WORK/libs30lease.so
 step_launcher() {
 	local app
 	ensure_sysroot
@@ -257,9 +258,12 @@ step_launcher() {
 		-I"$WORK/sysroot/usr/include/libdrm" -ldrm -lm
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-screenshot.bin" "$PROJECT/utils/s30-screenshot.c" \
 		-I"$WORK/sysroot/usr/include/libdrm" -ldrm -lz
+	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-uvc.bin" "$PROJECT/utils/s30-uvc.c" \
+		-I"$WORK/sysroot/usr/include/libdrm" -ldrm
 	"$WORK/bin/armv7-clang" -O2 -Wall -fPIC -shared -o "$WORK/libs30lease.so" "$PROJECT/utils/s30-lease.c"
 	llvm-strip "$WORK/s30-fel.bin" "$WORK/s30-volumed.bin" "$WORK/s30-splash.bin" \
-		"$WORK/s30-keyheld.bin" "$WORK/s30-display.bin" "$WORK/s30-screenshot.bin" "$WORK/libs30lease.so"
+		"$WORK/s30-keyheld.bin" "$WORK/s30-display.bin" "$WORK/s30-screenshot.bin" "$WORK/s30-uvc.bin" \
+		"$WORK/libs30lease.so"
 }
 
 # RetroArch, cross-compiled with clang for armv7 musl against an Alpine
@@ -466,6 +470,8 @@ step_initramfs() {
 		install -m 0755 "$WORK/s30-display.bin" "$root/usr/bin/s30-display"
 	[ -f "$WORK/s30-screenshot.bin" ] &&
 		install -m 0755 "$WORK/s30-screenshot.bin" "$root/usr/bin/s30-screenshot"
+	[ -f "$WORK/s30-uvc.bin" ] &&
+		install -m 0755 "$WORK/s30-uvc.bin" "$root/usr/bin/s30-uvc"
 	[ -d "$WORK/emulationstation-root" ] &&
 		cp -r "$WORK/emulationstation-root/." "$root/"
 	# Mesa (build.sh mesa), in place of Alpine's (build/packages excludes it)

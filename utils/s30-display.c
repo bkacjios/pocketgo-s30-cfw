@@ -26,10 +26,12 @@
  *
  * System menu: the power key (grabbed, so apps never see it) opens a menu
  * over whoever holds the lease: Exit game / System / Resume over an app; the
- * System page (straight away over the launcher) has a brightness slider
- * (D-pad left/right; the level is saved to the file given as argument and
- * restored at start), the performance overlay switch, the stick calibration,
- * Sleep, Reboot and Shut down. The battery (level, and a bolt while charging)
+ * System page (straight away over the launcher) has Settings, Sleep, Reboot
+ * and Shut down; Settings has a brightness slider (D-pad left/right; the
+ * level is saved to the file given as argument and restored at start), the
+ * performance overlay switch, USB video (the screen as a USB webcam,
+ * /usr/libexec/s30/usb-video), the stick calibration and USB storage. The
+ * battery (level, and a bolt while charging)
  * shows in a small box in the screen's top right, where the launcher shows it. That process is frozen (SIGSTOP) and
  * the gamepad grabbed while the menu is open; Exit sends SIGTERM, then
  * SIGKILL if it hasn't gone after EXIT_GRACE_MS. The
@@ -430,15 +432,16 @@ static int osd_is_battery(void) {
 
 /* In an app the menu opens on the app page, whose System row opens the
    system page; over the launcher it opens on the system page, where the last
-   row closes the menu instead of going back. The system page: the brightness
-   slider (NULL), the performance overlay switch, the stick calibration (its
-   own screen, page 2), sleep, reboot, power off. */
+   row closes the menu instead of going back. The system page: Settings,
+   sleep, reboot, power off. Settings (page 3): the brightness slider (NULL),
+   the performance overlay switch, USB video, the stick calibration (its own
+   screen, page 2), USB storage (confirmed on page 4). */
 enum { APP_EXIT, APP_SCREENSHOT, APP_SYSTEM, APP_RESUME };
 static const char* const kAppItems[] = { "Exit game", "Screenshot", "System", "Resume" };
 enum { SYS_SETTINGS, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_BACK };
 static const char* const kSysItems[] = { "Settings", "Sleep", "Reboot", "Shut down", "Back" };
-enum { SET_BRIGHTNESS, SET_PERF, SET_CALIBRATE, SET_USB, SET_BACK };
-static const char* const kSetItems[] = { NULL, "Overlay", "Calibrate stick", "USB storage", "Back" };
+enum { SET_BRIGHTNESS, SET_PERF, SET_USB_VIDEO, SET_CALIBRATE, SET_USB, SET_BACK };
+static const char* const kSetItems[] = { NULL, "Overlay", "USB video", "Calibrate stick", "USB storage", "Back" };
 /* USB storage confirmation: two text rows (USB_TEXT_ROWS, not selectable), OK, Cancel */
 enum { USB_TEXT_ROWS = 2, USB_OK = 2, USB_CANCEL };
 static const char* const kUsbItems[] = { "USB storage mode", "reboots the device", "OK", "Cancel" };
@@ -448,12 +451,18 @@ static const char* const* menu_items(void) {
 }
 
 static int menu_count(void) {
-	return sMenuPage == 0 || sMenuPage == 4 ? 4 : 5;
+	return sMenuPage == 0 || sMenuPage == 4 ? 4 : sMenuPage == 3 ? 6 : 5;
 }
 
 /* The row B returns from (its glyph is drawn there) */
 static int menu_back_row(void) {
 	return sMenuPage == 4 ? USB_CANCEL : sMenuPage == 3 ? SET_BACK : sMenuPage == 1 ? SYS_BACK : APP_RESUME;
+}
+
+/* USB video is on while the UVC function is in the gadget's configuration
+   (usb-video owns the switch and saves it) */
+static int usb_video_on(void) {
+	return access("/sys/kernel/config/usb_gadget/s30/configs/c.1/uvc.usb0", F_OK) == 0;
 }
 
 static int on_brightness_row(void) {
@@ -539,6 +548,8 @@ static void draw_menu(void) {
 			if (sMenuPage == 3 && i == SET_PERF) {
 				static const char* const modes[] = { "Off", "Full", "FPS" };
 				snprintf(label, sizeof(label), "%s: %s", items[i], modes[sPerf]);
+			} else if (sMenuPage == 3 && i == SET_USB_VIDEO) {
+				snprintf(label, sizeof(label), "%s: %s", items[i], usb_video_on() ? "On" : "Off");
 			} else if (sMenuPage == 1 && i == SYS_BACK && sMenuLauncher) {
 				snprintf(label, sizeof(label), "Close");
 			} else {
@@ -1482,6 +1493,20 @@ static int usb_mode_flag(void) {
 	return 0;
 }
 
+/* USB video on or off; waits, as the label shows the result. The gadget
+   rebinds, which takes well under a second. */
+static void usb_video_toggle(void) {
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		execl("/usr/libexec/s30/usb-video", "usb-video", usb_video_on() ? "off" : "on", (char*)NULL);
+		_exit(127);
+	}
+	if (pid > 0) {
+		waitpid(pid, NULL, 0);
+	}
+}
+
 /* s2idle until a wakeup source (the power key) fires. The menu is cleared
    first so the panel doesn't come back showing it; the app is still stopped
    and resumes when the menu closes after waking. */
@@ -1583,6 +1608,10 @@ static void menu_confirm(void) {
 		case SET_PERF:
 			sPerf = (sPerf + 1) % PERF_MODES;
 			perf_save();
+			menu_redraw();
+			break;
+		case SET_USB_VIDEO:
+			usb_video_toggle();
 			menu_redraw();
 			break;
 		case SET_CALIBRATE:
@@ -2419,9 +2448,11 @@ int main(int argc, char** argv) {
 	{
 		// Wake promptly after a vblank (short bursts; blocks otherwise).
 		// musl's sched_setscheduler() is a stub: the system call itself.
+		// Children (s30-screenshot, usb-video and the s30-uvc it starts)
+		// get the normal policy back.
 		struct sched_param sp = { .sched_priority = 1 };
 
-		syscall(SYS_sched_setscheduler, 0, SCHED_FIFO, &sp);
+		syscall(SYS_sched_setscheduler, 0, SCHED_FIFO | SCHED_RESET_ON_FORK, &sp);
 	}
 	for (i = 0; i < 4 && sFd < 0; i++) { // the KMS card (the GPU has its own)
 		snprintf(sCard, sizeof(sCard), "/dev/dri/card%d", i);

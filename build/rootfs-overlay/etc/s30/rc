@@ -49,6 +49,8 @@ echo 02:53:33:30:00:02 > $G/functions/ncm.usb0/dev_addr
 echo 02:53:33:30:00:01 > $G/functions/ncm.usb0/host_addr
 ln -s $G/functions/acm.usb0 $G/functions/ncm.usb0 $G/configs/c.1/
 ls /sys/class/udc > $G/UDC
+# USB video (the screen as a webcam), if switched on in System > USB video
+/usr/libexec/s30/usb-video
 ifconfig lo 127.0.0.1 up
 ifconfig usb0 10.42.0.2 netmask 255.255.255.0 up
 touch /tmp/udhcpd.leases

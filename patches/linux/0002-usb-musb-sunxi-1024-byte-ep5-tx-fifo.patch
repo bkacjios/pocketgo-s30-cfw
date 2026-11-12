@@ -1,0 +1,15 @@
+diff --git a/drivers/usb/musb/sunxi.c b/drivers/usb/musb/sunxi.c
+index a6bd3e968..ee8f17aa3 100644
+--- a/drivers/usb/musb/sunxi.c
++++ b/drivers/usb/musb/sunxi.c
+@@ -638,7 +638,9 @@ static const struct musb_fifo_cfg sunxi_musb_mode_cfg_5eps[] = {
+ 	MUSB_EP_FIFO_SINGLE(3, FIFO_RX, 512),
+ 	MUSB_EP_FIFO_SINGLE(4, FIFO_TX, 512),
+ 	MUSB_EP_FIFO_SINGLE(4, FIFO_RX, 512),
+-	MUSB_EP_FIFO_SINGLE(5, FIFO_TX, 512),
++	/* 1024 bytes, double buffered: a high-speed isochronous endpoint
++	   (UVC gadget) that sends a full packet every microframe */
++	MUSB_EP_FIFO_DOUBLE(5, FIFO_TX, 1024),
+ 	MUSB_EP_FIFO_SINGLE(5, FIFO_RX, 512),
+ };
+ 
