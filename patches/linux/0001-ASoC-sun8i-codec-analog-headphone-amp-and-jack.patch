@@ -1,5 +1,5 @@
 diff --git a/sound/soc/sunxi/sun8i-codec-analog.c b/sound/soc/sunxi/sun8i-codec-analog.c
-index 3335855c6..bdb53a324 100644
+index 3335855c6..c7ed96db4 100644
 --- a/sound/soc/sunxi/sun8i-codec-analog.c
 +++ b/sound/soc/sunxi/sun8i-codec-analog.c
 @@ -11,8 +11,11 @@
@@ -182,7 +182,7 @@ index 3335855c6..bdb53a324 100644
  	if (ret) {
  		dev_err(dev, "Failed to add Headphone DAPM widgets: %d\n", ret);
  		return ret;
-@@ -786,9 +903,163 @@ static int sun8i_codec_analog_cmpnt_probe(struct snd_soc_component *cmpnt)
+@@ -786,9 +903,182 @@ static int sun8i_codec_analog_cmpnt_probe(struct snd_soc_component *cmpnt)
  			return ret;
  	}
  
@@ -201,7 +201,7 @@ index 3335855c6..bdb53a324 100644
 +/*
 + * Headphone jack (hp-det-gpios) owned by the codec, so that it can switch the
 + * outputs: on boards with a mono speaker amplifier bridged across HPL/HPR
-+ * ("allwinner,bridged-mono-speaker"), the speaker plays the DAC's mono mix
++ * ("allwinner,bridged-mono-speaker"), the speaker plays a mono mix of both DACs
 + * differentially while no headphone is in, and is switched off otherwise.
 + * "allwinner,headphone-lr-swapped" swaps the channels for the headphone.
 + */
@@ -262,9 +262,28 @@ index 3335855c6..bdb53a324 100644
 +				       "allwinner,bridged-mono-speaker"))
 +		return;
 +
-+	/* Enum: Stereo, Reverse Stereo, Sum Mono, Mix Mono */
++	/*
++	 * The digital path stays stereo for the speaker too (AIF1's capture
++	 * loopback takes it from the DA0 mux): the speaker's mono mix is
++	 * analog, the left output mixer summing both DACs (DAC Reversed adds
++	 * the right one) into the headphone amplifier, with the DACs 6 dB down
++	 * (8 steps of 0.75 dB) so the sum is as loud as a digital mix would be.
++	 * DA0 route enum: Stereo, Reverse Stereo, Sum Mono, Mix Mono.
++	 * Headphone source enum: DAC, Mixer.
++	 */
 +	ret = sun8i_codec_jack_set_ctl(card, "AIF1 DA0 Stereo Playback Route",
-+				       hp ? swap : 3, hp ? swap : 3);
++				       hp ? swap : 0, hp ? swap : 0);
++	if (!ret)
++		ret = sun8i_codec_jack_set_ctl(card, "DAC Playback Volume",
++					       hp ? 160 : 152, hp ? 160 : 152);
++	if (!ret)
++		ret = sun8i_codec_jack_set_ctl(card, "DAC Playback Switch", 1, 1);
++	if (!ret)
++		ret = sun8i_codec_jack_set_ctl(card, "DAC Reversed Playback Switch",
++					       !hp, 0);
++	if (!ret)
++		ret = sun8i_codec_jack_set_ctl(card, "Headphone Source Playback Route",
++					       !hp, !hp);
 +	if (!ret)
 +		ret = sun8i_codec_jack_set_ctl(card,
 +				"Headphone Mono Differential Playback Switch", !hp, 0);
@@ -346,7 +365,7 @@ index 3335855c6..bdb53a324 100644
  static const struct snd_soc_component_driver sun8i_codec_analog_cmpnt_drv = {
  	.controls		= sun8i_codec_common_controls,
  	.num_controls		= ARRAY_SIZE(sun8i_codec_common_controls),
-@@ -797,6 +1068,8 @@ static const struct snd_soc_component_driver sun8i_codec_analog_cmpnt_drv = {
+@@ -797,6 +1087,8 @@ static const struct snd_soc_component_driver sun8i_codec_analog_cmpnt_drv = {
  	.dapm_routes		= sun8i_codec_common_routes,
  	.num_dapm_routes	= ARRAY_SIZE(sun8i_codec_common_routes),
  	.probe			= sun8i_codec_analog_cmpnt_probe,
@@ -355,7 +374,7 @@ index 3335855c6..bdb53a324 100644
  };
  
  static const struct of_device_id sun8i_codec_analog_of_match[] = {
-@@ -835,12 +1108,35 @@ static int sun8i_codec_analog_probe(struct platform_device *pdev)
+@@ -835,12 +1127,35 @@ static int sun8i_codec_analog_probe(struct platform_device *pdev)
  					       NULL, 0);
  }
  

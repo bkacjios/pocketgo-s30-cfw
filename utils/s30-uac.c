@@ -12,6 +12,12 @@
  * gadget's "Playback Rate" control is non-zero), and is closed as soon as
  * either stops.
  *
+ * Which captured slot gets which channel can change from one capture
+ * start to the next. So each capture starts with only the left loopback on
+ * and takes the slot that carries sound as the left; then the right goes
+ * on. Until then (or while the app
+ * is silent) the left plays on both channels.
+ *
  * The capture, at the app's rate, is resampled (linear) to the host's. The
  * codec and the USB bus have their own clocks, so the ratio follows the
  * gadget's buffer: a little faster when it runs low, slower when it fills.
@@ -78,7 +84,7 @@ static long ctl_get(int card, snd_ctl_elem_iface_t iface, const char* name) {
 }
 
 /* Both channels of a codec mixer control */
-static void ctl_set2(const char* name, long value) {
+static void ctl_set2(const char* name, long left, long right) {
 	snd_ctl_t* ctl;
 	snd_ctl_elem_value_t* v;
 
@@ -88,17 +94,20 @@ static void ctl_set2(const char* name, long value) {
 	snd_ctl_elem_value_alloca(&v);
 	snd_ctl_elem_value_set_interface(v, SND_CTL_ELEM_IFACE_MIXER);
 	snd_ctl_elem_value_set_name(v, name);
-	snd_ctl_elem_value_set_integer(v, 0, value);
-	snd_ctl_elem_value_set_integer(v, 1, value);
+	snd_ctl_elem_value_set_integer(v, 0, left);
+	snd_ctl_elem_value_set_integer(v, 1, right);
 	if (snd_ctl_elem_write(ctl, v) < 0) {
 		fprintf(stderr, "s30-uac: %s: cannot set\n", name);
 	}
 	snd_ctl_close(ctl);
 }
 
-static void loopback(int on) {
-	ctl_set2("AIF1 AD0 Capture Volume", on ? 160 : 0); // 160: as the DA0 playback volume (/etc/s30/rc)
-	ctl_set2("AIF1 Slot 0 Digital ADC Capture Switch", on);
+/* The AIF1 playback-to-capture loopback, per playback channel. The
+   switch is crossed (measured): its first channel passes DA0's right, its
+   second DA0's left. */
+static void loopback(int left, int right) {
+	ctl_set2("AIF1 AD0 Capture Volume", left || right ? 160 : 0, left || right ? 160 : 0); // 160: as DA0 playback
+	ctl_set2("AIF1 Slot 0 Digital ADC Capture Switch", right, left);
 }
 
 /* The app's playback rate if it plays S16_LE stereo, 0 if nothing plays,
@@ -170,6 +179,7 @@ static int session(int gadget, int inRate, int outRate) {
 	snd_pcm_t *cap, *play;
 	char name[16];
 	double pos = 0.0; // the next output frame's position in `in` (frame 0: the previous chunk's last)
+	int slot = -1;    // the captured slot that is the left (-1: not known yet, only the left on)
 	uint64_t nextCheck = 0;
 	struct pollfd pfd;
 
@@ -178,10 +188,10 @@ static int session(int gadget, int inRate, int outRate) {
 	if (play == NULL) {
 		return -1;
 	}
-	loopback(1);
+	loopback(1, 0);
 	cap = open_pcm(CODEC_PCM, SND_PCM_STREAM_CAPTURE, (unsigned)inRate, 256, 2048);
 	if (cap == NULL) {
-		loopback(0);
+		loopback(0, 0);
 		snd_pcm_close(play);
 		return -1;
 	}
@@ -211,8 +221,36 @@ static int session(int gadget, int inRate, int outRate) {
 		}
 		if (n < 0) {
 			snd_pcm_recover(cap, (int)n, 1);
+			loopback(1, 0); // a new start: the slot can move
+			slot = -1;
 			snd_pcm_start(cap);
 			continue;
+		}
+		{
+			int i, l = slot, mono = slot < 0;
+
+			if (slot < 0) { // which slot has the left (the right is off)?
+				long e[CHANNELS] = { 0 };
+
+				for (i = 1; i <= n; i++) {
+					e[0] += abs(in[i * CHANNELS]);
+					e[1] += abs(in[i * CHANNELS + 1]);
+				}
+				l = e[0] >= e[1] ? 0 : 1;
+				if ((e[0] == 0) != (e[1] == 0)) {
+					slot = l;
+					loopback(1, 1); // from the next chunk on
+					fprintf(stderr, "s30-uac: left in slot %d\n", slot);
+				}
+			}
+			// The left's slot to the left; until the right is on, the left on both
+			for (i = 1; i <= n; i++) {
+				int16_t* f = &in[i * CHANNELS];
+				int16_t left = f[l], right = mono ? f[l] : f[1 - l];
+
+				f[0] = left;
+				f[1] = right;
+			}
 		}
 		// Steer the ratio by the gadget buffer's fill
 		if (snd_pcm_delay(play, &delay) < 0) {
@@ -245,7 +283,7 @@ static int session(int gadget, int inRate, int outRate) {
 		}
 	}
 	snd_pcm_close(cap); // first: frees the codec for the app
-	loopback(0);
+	loopback(0, 0);
 	snd_pcm_close(play);
 	fprintf(stderr, "s30-uac: stopped\n");
 	return 0;
@@ -257,7 +295,7 @@ int main(void) {
 	sa.sa_handler = on_signal;
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
-	loopback(0);
+	loopback(0, 0);
 	while (!sQuit) {
 		int gadget = gadget_card(), inRate, outRate;
 

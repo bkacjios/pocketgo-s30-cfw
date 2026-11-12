@@ -20,7 +20,8 @@ udevadm settle --timeout=5
 s30-splash 40
 
 # Audio: stock-like levels. The codec driver follows the headphone jack
-# (speaker mono/differential without headphones, off with them); the volume
+# (speaker mono/differential without headphones, off with them) and owns the
+# DAC volume (6 dB down for the speaker's analog mono mix); the volume
 # (Master Playback Volume) is s30-volumed's, from the volume keys.
 (
 	m() { tinymix -D 0 set "$@" >/dev/null 2>&1; }
@@ -28,7 +29,6 @@ s30-splash 40
 		sleep 1
 	done
 	m "AIF1 DA0 Playback Volume" 160 160
-	m "DAC Playback Volume" 160 160
 	m "AIF1 Slot 0 Digital DAC Playback Switch" 1 1
 ) &
 
