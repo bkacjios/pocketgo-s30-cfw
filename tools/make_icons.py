@@ -26,6 +26,7 @@ MM = "ports/mm/extracted/n64-us/assets/objects/object_mag"
 DKR = "ports/dkr/assets/.vanilla/us.v77/textures/2d/menu"
 MK64 = "ports/mk64/textures/standalone/logo_mario_kart_64.rgba32.png"  # the title screen's logo
 RS64_ROM = "ports/rogue_squadron64/rogue_squadron.z64"  # its title logo is backdrop/logo in the ROM's asset blob
+SF64_ROM = "ports/sf64/baserom.us.rev1.uncompressed.z64"  # title logo in ast_title (assets/yaml/us/rev1/ast_title.yaml)
 RETROARCH = "s30-build/rootfs/usr/share/libretro/assets/branding/retroarch-plain-logo.png"
 
 # Screenshot crops: app name -> (screenshot file, (left, top, right, bottom))
@@ -60,6 +61,41 @@ def rs64_ci8(data):
     im = Image.new("RGBA", (w, h))
     im.putdata([pal[p] for p in data[12 + 1024:12 + 1024 + w * h]])
     return im
+
+
+def sf64_title(rom):
+    """Star Fox 64's title: aTitleStarfoxLogoTex (RGBA16 236x60) over the
+    "64", seven CI8 32x64 pieces of aTitle64LogoDL's quads (a 4x2 grid, the
+    top right cell empty)"""
+    seg = lambda addr: 0xBFC510 + addr - 0x6000000  # ast_title, segment 6
+
+    def rgba16(addr, n):
+        out = []
+        for i in range(n):
+            v = struct.unpack(">H", rom[seg(addr) + i * 2:][:2])[0]
+            out.append(((v >> 11 & 31) * 255 // 31, (v >> 6 & 31) * 255 // 31, (v >> 1 & 31) * 255 // 31, 255 * (v & 1)))
+        return out
+
+    logo = Image.new("RGBA", (236, 60))
+    logo.putdata(rgba16(0x6000000, 236 * 60))
+    # (texture, TLUT, colours, height, grid column, grid row)
+    pieces = [(0x6014DE8, 0x60155E8, 152, 64, 0, 0), (0x6015718, 0x6015EF8, 64, 63, 0, 1),
+              (0x6015F78, 0x6016778, 200, 64, 1, 0), (0x6016908, 0x60170E8, 144, 63, 1, 1),
+              (0x6017208, 0x6017A08, 136, 64, 2, 0), (0x6017B18, 0x6018318, 200, 64, 2, 1),
+              (0x60184A8, 0x6018CA8, 76, 64, 3, 1)]
+    six4 = Image.new("RGBA", (128, 128))
+    for tex, tlut, colours, h, col, row in pieces:
+        pal = rgba16(tlut, colours)
+        piece = Image.new("RGBA", (32, h))
+        piece.putdata([pal[i] if i < colours else (0, 0, 0, 0) for i in rom[seg(tex):][:32 * h]])
+        six4.paste(piece, (32 * col, 64 * row))
+    logo, six4 = trim(logo), trim(six4)
+    h = int(logo.height * 1.7)
+    six4 = six4.resize((six4.width * h // six4.height, h), Image.LANCZOS)
+    out = Image.new("RGBA", (max(logo.width, six4.width), logo.height + h - 8))
+    out.alpha_composite(six4, ((out.width - six4.width) // 2, logo.height - 8))
+    out.alpha_composite(logo, ((out.width - logo.width) // 2, 0))
+    return out
 
 
 def fit(im, box=SIZE - 2 * PAD):
@@ -120,6 +156,8 @@ def main():
         logo = rs64_asset(open(RS64_ROM, "rb").read(), "backdrop", "logo")
         if logo is not None:
             icons["Rogue Squadron"] = fit(trim(rs64_ci8(logo)))
+    if os.path.exists(SF64_ROM):
+        icons["Star Fox 64"] = fit(sf64_title(open(SF64_ROM, "rb").read()))
     if os.path.exists(RETROARCH):
         logo = Image.open(RETROARCH).crop((0, 0, 460, 330))  # the invader, not the wordmark or its rule
         icons["RetroArch"] = fit(trim(logo))
