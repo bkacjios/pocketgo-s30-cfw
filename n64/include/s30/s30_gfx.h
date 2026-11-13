@@ -21,6 +21,10 @@ typedef enum {
     // slots, 10-byte vertices, triangles that carry their texture coords,
     // billboards and counted display lists (gfx_dkr.c)
     S30_UCODE_F3DDKR,
+    // Rare's Fast3D (GoldenEye): Fast3D vertex, triangle and cull encodings
+    // (indices * 10, cull * 40) plus G_TRI4 (0xB1: four triangles of 4-bit
+    // indices). Everything else is F3DEX's.
+    S30_UCODE_F3DGE,
 } S30Ucode;
 
 typedef struct {

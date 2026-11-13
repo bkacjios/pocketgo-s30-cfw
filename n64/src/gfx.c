@@ -3207,10 +3207,20 @@ int gfx_f3dex_to_f3dex2(u32* pw0, u32* pw1) {
             return 0;
         case F3DEX_VTX: { // (n << 10) | (n * 16 - 1), v0 * 2 in bits 16-23
             u32 n = (w0 >> 10) & 0x3F, v0 = ((w0 >> 16) & 0xFF) / 2;
+            if (sCfg.ucode == S30_UCODE_F3DGE) { // Fast3D: n - 1 in bits 20-23, v0 in 16-19
+                n = ((w0 >> 20) & 0xF) + 1;
+                v0 = (w0 >> 16) & 0xF;
+            }
             w0 = ((u32)G_VTX << 24) | (n << 12) | ((v0 + n) << 1);
             break;
         }
         case F3DEX_TRI1: // indices * 2 in w1
+            if (sCfg.ucode == S30_UCODE_F3DGE) { // Fast3D: indices * 10
+                w0 = ((u32)G_TRI1 << 24) | ((((w1 >> 16) & 0xFF) / 10) << 17) | ((((w1 >> 8) & 0xFF) / 10) << 9) |
+                     (((w1 & 0xFF) / 10) << 1);
+                w1 = 0;
+                break;
+            }
             w0 = ((u32)G_TRI1 << 24) | (w1 & 0xFFFFFF);
             w1 = 0;
             break;
@@ -3278,7 +3288,7 @@ int gfx_f3dex_to_f3dex2(u32* pw0, u32* pw1) {
             w0 = ((u32)G_MODIFYVTX << 24) | (w0 & 0xFFFFFF);
             break;
         case F3DEX_CULLDL:
-            if (sCfg.ucode == S30_UCODE_F3DEX_OLD) { // vertex index * 40, end + 1
+            if (sCfg.ucode == S30_UCODE_F3DEX_OLD || sCfg.ucode == S30_UCODE_F3DGE) { // vertex index * 40, end + 1
                 u32 v0 = (w0 & 0xFFFF) / 40, v1 = (w1 & 0xFFFF) / 40;
                 w0 = ((u32)G_CULLDL << 24) | (v0 * 2);
                 w1 = (v1 > 0 ? v1 - 1 : 0) * 2;
@@ -3588,6 +3598,21 @@ static void walk(Gfx* dl, int depth) {
         u32 w0 = dl->words.w0, w1 = dl->words.w1;
         u8 cmd;
 
+        if (sCfg.ucode == S30_UCODE_F3DGE && (w0 >> 24) == F3DEX_TRI2) {
+            // Rare's G_TRI4: four triangles, 4-bit indices (one in w0 bits
+            // 0-15 and two per triangle in w1); all zero means none
+            int t;
+
+            sStats.cmds++;
+            for (t = 0; t < 4; t++) {
+                int a = (w1 >> (t * 8)) & 0xF, b = (w1 >> (t * 8 + 4)) & 0xF, c = (w0 >> (t * 4)) & 0xF;
+
+                if (a | b | c) {
+                    gfx_tri(a, b, c);
+                }
+            }
+            continue;
+        }
         if (sCfg.ucode != S30_UCODE_F3DEX2 && !gfx_f3dex_to_f3dex2(&w0, &w1)) {
             continue;
         }
