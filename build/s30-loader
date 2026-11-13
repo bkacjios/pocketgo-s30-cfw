@@ -93,9 +93,16 @@ card_fsck() {
 }
 fsck=$(card_fsck)
 if [ -n "$fsck" ]; then
+	# On the LCD (tty1, cleared of the splash) as well as the serial console;
+	# the result stays up until START (BTN_START 315) is pressed
+	printf '\033c\nThe SD card was not unmounted cleanly: checking it\n\n' > /dev/tty1
 	echo "s30-loader: SD card was not unmounted cleanly, checking it" > /dev/console
-	$fsck /dev/mmcblk0p1 > /dev/console 2>&1
+	set -o pipefail
+	$fsck /dev/mmcblk0p1 2>&1 | tee /dev/console > /dev/tty1
 	rc=$?
+	set +o pipefail
+	printf '\nPress START to continue\n' > /dev/tty1
+	until s30-keyheld 315; do sleep 0.1; done
 	if [ "${fsck%% *}" = fsck.fat ] && [ $rc -le 1 ]; then # 1: errors corrected
 		s=$(card_byte 65)
 		bk=$(dd if=/dev/mmcblk0p1 bs=1 skip=50 count=2 2>/dev/null | od -An -tu2 | tr -d ' ')

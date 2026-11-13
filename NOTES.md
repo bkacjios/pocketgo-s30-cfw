@@ -302,7 +302,9 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   fallback: don't push big files over it (a 7 MB base64 transfer wedged it).
 - Card check (2026-11-12): s30-loader reads the card's dirty flags before
   mounting it and runs `fsck.fat -a -w` / `fsck.exfat -y` (dosfstools,
-  exfatprogs in the initramfs) only when one is set. FAT32 has two: Linux's
+  exfatprogs in the initramfs) only when one is set; the output goes to the
+  LCD (tty1) as well as the serial console and stays until START is pressed
+  (2026-11-13, tested with `reboot -f`). FAT32 has two: Linux's
   (boot sector byte 65 bit 0, set at mount and cleared at unmount; once
   found set at mount the kernel leaves it alone and warns "Volume was not
   properly unmounted" at every boot) and fsck.fat's (FAT[1] bit 27 clear).
