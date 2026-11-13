@@ -1,0 +1,53 @@
+/*
+ * SPI flash FIT (build.sh flash): kernel, DTB, initramfs and the boot
+ * script. build.sh copies it into s30-build: /incbin/ paths are relative to it.
+ */
+/dts-v1/;
+
+/ {
+	description = "PocketGo S30 flash boot";
+	#address-cells = <1>;
+
+	images {
+		kernel {
+			data = /incbin/("boot/zImage");
+			type = "kernel";
+			arch = "arm";
+			os = "linux";
+			compression = "none";
+			load = <0x42000000>;
+			entry = <0x42000000>;
+			hash { algo = "crc32"; };
+		};
+		fdt {
+			data = /incbin/("boot/sun8i-a33-pocketgo-s30.dtb");
+			type = "flat_dt";
+			arch = "arm";
+			compression = "none";
+			hash { algo = "crc32"; };
+		};
+		ramdisk {
+			data = /incbin/("initramfs.cpio.gz");
+			type = "ramdisk";
+			arch = "arm";
+			os = "linux";
+			compression = "none";
+			hash { algo = "crc32"; };
+		};
+		script {
+			data = /incbin/("flash.cmd");
+			type = "script";
+			compression = "none";
+			hash { algo = "crc32"; };
+		};
+	};
+
+	configurations {
+		default = "s30";
+		s30 {
+			kernel = "kernel";
+			fdt = "fdt";
+			ramdisk = "ramdisk";
+		};
+	};
+};

@@ -6,12 +6,21 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 
-fail() { echo "s30-loader: $*" > /dev/console; exec sh; }
+# /dev/console is the serial port (the last console= on the command line),
+# so the message also goes to the LCD (tty1), cleared of the splash first.
+fail() {
+	echo "s30-loader: $*" > /dev/console
+	printf '\033c\ns30-loader: %s\n\nHold power to switch off.\n' "$*" > /dev/tty1
+	exec sh
+}
 
 mkdir -p /sd /ro /rw /root
+# No SD card (booted from SPI flash): show nocard.bmp after 1 s and wait for
+# one; the card detect GPIO makes mmcblk0p1 appear when a card goes in. rc's
+# first s30-splash redraws the plain splash over the text.
 i=0
 until [ -b /dev/mmcblk0p1 ]; do
-	i=$((i + 1)); [ $i -gt 100 ] && fail "no SD card"
+	i=$((i + 1)); [ $i = 10 ] && s30-splash -i /nocard.bmp
 	sleep 0.1
 done
 
@@ -97,8 +106,13 @@ if [ -n "$fsck" ]; then
 	fi
 fi
 
-# FAT (stock card) or ext4
-mount /dev/mmcblk0p1 /sd || fail "cannot mount SD card"
+# FAT (stock card) or ext4. Retried: a card inserted while waiting above
+# can show up before it is ready to be read.
+i=0
+until mount /dev/mmcblk0p1 /sd; do
+	i=$((i + 1)); [ $i = 10 ] && fail "cannot mount SD card"
+	sleep 0.5
+done
 # Staged update (copied over ssh while the old one is in use as /): installed
 # only if it mounts, so a copy cut short by a reboot is dropped, not booted
 if [ -f /sd/boot/rootfs.sqfs.new ]; then

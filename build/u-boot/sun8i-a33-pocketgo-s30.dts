@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: (GPL-2.0+ OR MIT)
 /*
- * Minimal PocketGo S30 device tree for U-Boot: console and SD card only.
- * Pin muxing is done by U-Boot itself, so no pinctrl references are needed.
+ * Minimal PocketGo S30 device tree for U-Boot: console, SD card and boot
+ * flash. Pin muxing for the console and SD card is done by U-Boot itself;
+ * SPI0 needs its pinctrl reference (an SD card boot never muxed PC0-PC3).
  */
 
 /dts-v1/;
@@ -16,6 +17,7 @@
 	aliases {
 		mmc0 = &mmc0;
 		serial0 = &uart1;
+		spi0 = &spi0;
 	};
 
 	chosen {
@@ -31,4 +33,20 @@
 
 &uart1 {
 	status = "okay";
+};
+
+/*
+ * Boot flash: Zbit ZB25VQ64, 8 MiB, on SPI0 (PC0-PC3). U-Boot's A23/A33
+ * dtsi has the controller and pins (unlike Linux's), disabled.
+ */
+&spi0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi0_pc_pins>;
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <40000000>;
+	};
 };

@@ -1,0 +1,55 @@
+From: PocketGo S30 CFW
+Subject: [PATCH] sunxi: SPI flash boot on A23/A33, Zbit ZB25VQ64
+
+The PocketGo S30 boots from an 8 MiB Zbit ZB25VQ64 (JEDEC 5e 40 17) on
+SPI0 (PC0-PC3).
+
+- SPL_SPI_SUNXI: allow A23/A33. Their SPI controller is the sun6i one
+  (SUNXI_GEN_SUN6I), on PC0-PC3 with function 3, which the SPL code
+  already handles.
+- spi-nor-ids: add zb25vq64 next to zb25vq128.
+- misc_init_r: set spi_booted=1 when the SPL came from SPI flash, so the
+  boot command can tell a flash boot from an SD card boot.
+
+--- a/arch/arm/mach-sunxi/Kconfig
++++ b/arch/arm/mach-sunxi/Kconfig
+@@ -1224,7 +1224,7 @@
+ 
+ config SPL_SPI_SUNXI
+ 	bool "Support for SPI Flash on Allwinner SoCs in SPL"
+-	depends on MACH_SUN4I || MACH_SUN5I || MACH_SUN7I || MACH_SUNXI_H3_H5 || MACH_SUN50I || MACH_SUN8I_R40 || MACH_SUN8I_V3S || SUN50I_GEN_H6 || MACH_SUNIV || SUNXI_GEN_NCAT2
++	depends on MACH_SUN4I || MACH_SUN5I || MACH_SUN7I || MACH_SUN8I_A23 || MACH_SUN8I_A33 || MACH_SUNXI_H3_H5 || MACH_SUN50I || MACH_SUN8I_R40 || MACH_SUN8I_V3S || SUN50I_GEN_H6 || MACH_SUNIV || SUNXI_GEN_NCAT2
+ 	help
+ 	  Enable support for SPI Flash. This option allows SPL to read from
+ 	  sunxi SPI Flash. It uses the same method as the boot ROM, so does
+--- a/drivers/mtd/spi/spi-nor-ids.c
++++ b/drivers/mtd/spi/spi-nor-ids.c
+@@ -722,6 +722,8 @@
+ #endif
+ #ifdef CONFIG_SPI_FLASH_ZBIT
+ 	/* Zbit Semiconductor Inc. */
++	{ INFO("zb25vq64", 0x5e4017, 0, 64 * 1024, 128,
++	       SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ) },
+ 	{ INFO("zb25vq128", 0x5e4018, 0, 64 * 1024, 256,
+ 	       SECT_4K | SPI_NOR_DUAL_READ | SPI_NOR_QUAD_READ) },
+ #endif
+--- a/board/sunxi/board.c
++++ b/board/sunxi/board.c
+@@ -835,6 +835,7 @@
+ 	env_set("fel_booted", NULL);
+ 	env_set("fel_scriptaddr", NULL);
+ 	env_set("mmc_bootdev", NULL);
++	env_set("spi_booted", NULL);
+ 
+ 	boot = sunxi_get_boot_device();
+ 	/* determine if we are running in FEL mode */
+@@ -846,6 +847,9 @@
+ 		env_set("mmc_bootdev", "0");
+ 	} else if (boot == BOOT_DEVICE_MMC2) {
+ 		env_set("mmc_bootdev", "1");
++	/* or from SPI flash (the bootcmd then boots the FIT stored there) */
++	} else if (boot == BOOT_DEVICE_SPI) {
++		env_set("spi_booted", "1");
+ 	}
+ 
+ 	/* Set fdtfile to match the FIT configuration chosen in SPL. */

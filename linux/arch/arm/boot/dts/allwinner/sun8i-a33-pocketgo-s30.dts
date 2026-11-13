@@ -337,6 +337,53 @@
 	status = "okay";
 };
 
+/*
+ * Boot flash: Zbit ZB25VQ64 (8 MiB SPI NOR, JEDEC 5e 40 17) on SPI0,
+ * PC0-PC3. Mainline's A23/A33 dtsi has no SPI nodes (A33 manual: 0x01c68000,
+ * IRQ 97 = GIC SPI 65). The FIFOs are 64 bytes like the H3's: with the A31
+ * compatible (128 bytes) transfers over 64 bytes time out. /dev/mtd0 is the
+ * whole chip, writable: s30-flash writes it (stock image backed up in
+ * firmware-backup/spi-nor-stock.bin).
+ */
+&pio {
+	spi0_pc_pins: spi0-pc-pins {
+		pins = "PC0", "PC1", "PC2", "PC3";
+		function = "spi0";
+	};
+};
+
+&{/soc} {
+	spi0: spi@1c68000 {
+		compatible = "allwinner,sun8i-h3-spi";
+		reg = <0x01c68000 0x1000>;
+		interrupts = <GIC_SPI 65 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&ccu CLK_BUS_SPI0>, <&ccu CLK_SPI0>;
+		clock-names = "ahb", "mod";
+		resets = <&ccu RST_BUS_SPI0>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&spi0_pc_pins>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		flash@0 {
+			compatible = "jedec,spi-nor";
+			reg = <0>;
+			spi-max-frequency = <40000000>;
+
+			partitions {
+				compatible = "fixed-partitions";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				partition@0 {
+					label = "spi-nor";
+					reg = <0x0 0x800000>;
+				};
+			};
+		};
+	};
+};
+
 &uart1 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&uart1_pg_pins>;

@@ -1,0 +1,43 @@
+From: PocketGo S30 CFW
+Subject: [PATCH] splash: initialize the display without a splash image
+
+With stdout/stderr on serial only (patch 0002) and
+SYS_CONSOLE_IS_IN_ENV, U-Boot probes the video device only in
+bmp_display(), from splash_display(). When the splash image can't be
+loaded (no SD card: SPI flash boot, or FEL with the card out),
+splash_display() returns before that, and the display is never set up.
+Linux boots with panel_ilitek_ili9488_dsi.handoff=1, which skips the
+panel init, so the screen stays black (vblank waits time out). Probe the
+video device on that path too.
+
+--- a/common/splash.c
++++ b/common/splash.c
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include <display_options.h>
++#include <dm.h>
+ #include <env.h>
+ #include <splash.h>
+ #include <video.h>
+@@ -171,8 +172,19 @@
+ 
+ 	addr = hextoul(s, NULL);
+ 	ret = splash_screen_prepare();
+-	if (ret)
++	if (ret) {
++		struct udevice *dev;
++
++		/*
++		 * No image (e.g. no SD card for splashsource=mmc_fs). With the
++		 * console off the display, drawing the splash is the only thing
++		 * that probes it: bring it up anyway, blank, so the OS finds an
++		 * initialized panel.
++		 */
++		if (IS_ENABLED(CONFIG_VIDEO))
++			uclass_first_device(UCLASS_VIDEO, &dev);
+ 		return ret;
++	}
+ 
+ 	splash_get_pos(&x, &y);
+ 

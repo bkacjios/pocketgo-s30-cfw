@@ -104,7 +104,7 @@ the hardware and stock firmware findings).
 | SoC | Allwinner A33 (sun8iw5p1), stock board name `zkswe_a33` |
 | DRAM | DDR3, 552 MHz, zq 0x3bfb, odt_en 1, tpr0 0x47214f, tpr1 0x1c2294b, tpr2 0x61043, tpr12 0xa8, tpr13 0x901 |
 | PMIC | AXP223 on RSB (addr 0x3a3). dcdc1 3.0 V, dcdc2 1.1 V, dcdc3 1.2 V, dcdc5 1.5 V, aldo2 2.5 V, aldo3 3.0 V |
-| Boot flash | 16 MB SPI NOR w25q128 on SPI0 (PC0-PC3) |
+| Boot flash | 8 MiB SPI NOR Zbit ZB25VQ64 (JEDEC 5e 40 17) on SPI0 (PC0-PC3); stock fex said w25q128. Linux: /dev/mtd0 (writable, s30-flash), backup in firmware-backup/spi-nor-stock.bin |
 | SD card | mmc0 on PF0-PF5, card detect PB1 (active low) |
 | Debug UART | UART1 on PG6 (TX) / PG7 (RX), 115200 |
 | Backlight | PWM0 on PH0, 50 kHz, polarity 0 (active high, unverified) |
@@ -279,7 +279,7 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   need the loader to copy rootfs.sqfs to RAM (83 MB) first. `s30-loader` (initramfs) exports
   the whole card (`/dev/mmcblk0`) as a USB mass storage device before
   mounting anything, and shows `build/splash/usb.bmp` (regenerate with
-  `tools/make_usb_splash.py`, kernel VGA 8x16 font). Ejecting on the PC or
+  `tools/make_loader_screens.py`, kernel VGA 8x16 font). Ejecting on the PC or
   pressing START reboots (START without ejecting can lose unflushed host
   writes). Kernel + uInitrd copied to the card 2026-10-30, untested on
   hardware: unknown whether the gamepad (I2C) and the UDC are up in time
@@ -656,6 +656,41 @@ Debugging without serial:
 - `tools/fel_axp_dump.sh`: AXP223 registers over RSB from FEL (after SPL).
 - A U-Boot USB ACM console (`USB_FUNCTION_ACM`, stdout usbacm in preboot)
   never enumerated here; unverified whether it works on this board.
+
+## SPI flash boot (verified 2026-11-12)
+
+U-Boot, kernel and loader in the 8 MiB boot flash, so the device boots with
+no card (no-card screen, then waits for one); the card only holds
+rootfs.sqfs and user data. Written with `s30-flash write` and booted from
+flash with the card out, then the card inserted: boots normally. The kernel
+erases 64 KiB blocks (`MTD_SPI_NOR_USE_4K_SECTORS` off): a FIT update (85
+of 128 blocks) takes 48 s; with 4 KiB sectors the first full write took
+about twice as long per MB. A card with U-Boot at 8 KiB still takes priority.
+
+- Linux: SPI0 + flash in the board DTS (`allwinner,sun8i-h3-spi`: the A33
+  FIFOs are 64 bytes; the A31 compatible times out on transfers > 64 bytes).
+  `/dev/mtd0`, the whole chip, writable (s30-flash).
+- Stock backup: `firmware-backup/spi-nor-stock.bin` (gitignored, sha256
+  371bab3f...392904). Decodes with `tools/decode_firmware.py` after
+  splitting into p0..p4 (384/128/7296/128/256 KiB).
+- `build.sh flash` -> `out/spi-nor.bin`: U-Boot+SPL @0, FIT @0xc0000
+  (`build/flash.its`: XZ zImage, DTB, initramfs, `flash.cmd`), logo BMP
+  @0x780000. U-Boot patches 0004 (A33 SPL SPI boot, zb25vq64,
+  `spi_booted`), 0005 (display up even without a splash image: the panel
+  handoff needs it), 0006 (logo from flash, else the card; header checked:
+  erased flash reads size 0xffffffff, which wrapped U-Boot's size check and
+  hung it reading 4 GB). U-Boot's own A23/A33 dtsi has spi0 (disabled),
+  Linux's does not.
+- Verified over FEL with the card out (2026-11-12): FIT boot from RAM,
+  `sf probe`/`sf read`, no-card screen, card hot insert.
+- `s30-flash write|verify|read` (utils/s30-flash.c, in the rootfs): writes
+  only changed erase blocks, block 0 (eGON header) erased first and written
+  last, read back. Images must be flash-sized with a valid eGON checksum.
+- FEL without adb: set the boot0 flag from Linux (`printf
+  "\x5a\xa5\xa5\x5a" | dd of=/sys/bus/nvmem/devices/nvmem0/nvmem bs=4
+  seek=2 count=1 conv=notrunc`; byte writes are ignored), power off, card
+  out, power on. `build.sh fel` (no adb) boots from RAM. udev rule for
+  non-root FEL: `/etc/udev/rules.d/70-sunxi-fel.rules`.
 
 ## Build
 

@@ -50,3 +50,20 @@ CONFIG_AXP_DISABLE_BOOT_ON_POWERON=y
 # became a ~730 ns system call). Nothing here uses KVM.
 CONFIG_EXPERT=y
 # CONFIG_ARMV7_VIRT is not set
+# Boot flash (Zbit ZB25VQ64, 8 MiB, SPI0; patch 0004). The same binary boots
+# from the SD card (8 KiB) or from flash offset 0 (U-Boot proper at 0x8000).
+# Flash boot (BROM finds no U-Boot on the card): spi_booted is set, and the
+# FIT at 0xc0000 (build.sh flash) is read and its script runs. If that fails,
+# distro boot from the SD card as before.
+CONFIG_SPL_SPI_SUNXI=y
+CONFIG_MTD=y
+CONFIG_SPI=y
+CONFIG_DM_SPI=y
+CONFIG_SPI_SUNXI=y
+CONFIG_SPI_FLASH=y
+CONFIG_DM_SPI_FLASH=y
+CONFIG_SPI_FLASH_ZBIT=y
+CONFIG_CMD_SF=y
+# Same as the DTS spi-max-frequency (default 1 MHz: ~4 s for the logo)
+CONFIG_SF_DEFAULT_SPEED=40000000
+CONFIG_BOOTCOMMAND="if test -n ${spi_booted}; then setenv fit_addr 0x48000000; sf probe 0 && sf read ${fit_addr} 0xc0000 0x100 && fdt addr ${fit_addr} && fdt header get fit_size totalsize && sf read ${fit_addr} 0xc0000 ${fit_size} && source ${fit_addr}:script; fi; run distro_bootcmd"

@@ -1,0 +1,95 @@
+From: PocketGo S30 CFW
+Subject: [PATCH] sunxi: boot splash from SPI flash, then the SD card
+
+The PocketGo S30 SPI flash image (build.sh flash) carries the boot logo
+as an uncompressed BMP at 0x780000, so a flash boot without an SD card
+shows it. splash_source_load() only tries the one location splashsource
+names, and the generic "sf" location is at offset 0, so the board
+provides splash_screen_prepare(): SPI flash first, then /boot/logo.bmp on
+the card (for a card boot with the stock firmware still in flash). The raw
+loader trusts the size in the BMP header, which on stock flash data can be
+hundreds of MB, so the flash is only used when its header is a BMP of at
+most 512 KiB.
+
+--- a/board/sunxi/board.c
++++ b/board/sunxi/board.c
+@@ -48,6 +48,9 @@
+ #include <nand.h>
+ #include <net.h>
+ #include <spl.h>
++#include <spi_flash.h>
++#include <splash.h>
++#include <asm/unaligned.h>
+ #include <sy8106a.h>
+ #include <asm/setup.h>
+ 
+@@ -827,6 +830,69 @@
+ 	}
+ }
+ 
++#if CONFIG_IS_ENABLED(SPLASH_SOURCE)
++/*
++ * PocketGo S30 boot splash: an uncompressed BMP in SPI flash at 0x780000
++ * (build.sh flash), else /boot/logo.bmp on the SD card (a card boot with
++ * the stock firmware still in flash, whose data there is not a BMP).
++ */
++#define S30_SPLASH_SF_OFFSET	0x780000
++#define S30_SPLASH_SF_MAX	0x80000
++
++static struct splash_location s30_splash_locations[] = {
++	{
++		.name = "sf",
++		.storage = SPLASH_STORAGE_SF,
++		.flags = SPLASH_STORAGE_RAW,
++		.offset = S30_SPLASH_SF_OFFSET,
++	},
++	{
++		.name = "mmc_fs",
++		.storage = SPLASH_STORAGE_MMC,
++		.flags = SPLASH_STORAGE_FS,
++		.devpart = "0:1",
++	},
++};
++
++/*
++ * The raw loader takes the read size from the BMP header without checking
++ * it: on stock flash data that can be hundreds of MB (U-Boot hangs before
++ * the display is up). Only load from flash what looks like a BMP that fits.
++ */
++static bool s30_splash_in_flash(void)
++{
++	struct spi_flash *sf;
++	u8 hdr[6];
++
++	sf = spi_flash_probe(CONFIG_SF_DEFAULT_BUS, CONFIG_SF_DEFAULT_CS,
++			     CONFIG_SF_DEFAULT_SPEED, CONFIG_SF_DEFAULT_MODE);
++	if (!sf || spi_flash_read(sf, S30_SPLASH_SF_OFFSET, sizeof(hdr), hdr))
++		return false;
++
++	return hdr[0] == 'B' && hdr[1] == 'M' &&
++	       get_unaligned_le32(hdr + 2) <= S30_SPLASH_SF_MAX;
++}
++
++int splash_screen_prepare(void)
++{
++	const char *bmp = (const char *)env_get_hex("splashimage", 0);
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(s30_splash_locations); i++) {
++		if (s30_splash_locations[i].storage == SPLASH_STORAGE_SF &&
++		    !s30_splash_in_flash())
++			continue;
++		env_set("splashsource", s30_splash_locations[i].name);
++		if (!splash_source_load(s30_splash_locations,
++					ARRAY_SIZE(s30_splash_locations)) &&
++		    bmp[0] == 'B' && bmp[1] == 'M')
++			return 0;
++	}
++
++	return -ENOENT;
++}
++#endif
++
+ int misc_init_r(void)
+ {
+ 	const char *spl_dt_name;

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Make build/splash/usb.bmp: the boot splash (build/splash/logo.bmp) with
-"USB Storage Device" under the logo, shown by s30-loader in USB disk mode.
+"""Make the s30-loader screens: the boot splash (build/splash/logo.bmp) with
+text under the logo.
+
+  build/splash/usb.bmp     USB disk mode
+  build/splash/nocard.bmp  no SD card: s30-loader waits for one
 
 Text uses the kernel's VGA 8x16 console font (lib/fonts/font_8x16.c from the
 kernel tree build.sh clones), scaled up without smoothing to match the
@@ -8,7 +11,7 @@ pixel-art logo. The BMP is panel-native portrait (320x480); the device is
 held landscape with the panel's +x pointing down, so the text is drawn on a
 landscape canvas and rotated back.
 
-Usage: python3 tools/make_usb_splash.py [font_8x16.c]
+Usage: python3 tools/make_loader_screens.py [font_8x16.c]
 """
 import re
 import sys
@@ -23,10 +26,17 @@ FONT = Path(sys.argv[1]) if len(sys.argv) > 1 else \
 GLYPH_H = 16
 
 # Landscape coordinates (480x320); the logo ends at y ~200
-LINES = [  # (text, scale, centre y, rgb)
-    ("USB Storage Device", 2, 240, (255, 255, 255)),
-    ("Eject on the PC or press START", 1, 284, (160, 140, 230)),  # "Go" purple, lighter
-]
+WHITE, PURPLE = (255, 255, 255), (160, 140, 230)  # "Go" purple, lighter
+SCREENS = {  # file: [(text, scale, centre y, rgb)]
+    "usb.bmp": [
+        ("USB Storage Device", 2, 240, WHITE),
+        ("Eject on the PC or press START", 1, 284, PURPLE),
+    ],
+    "nocard.bmp": [
+        ("No SD Card", 2, 240, WHITE),
+        ("Insert a card to continue", 1, 284, PURPLE),
+    ],
+}
 
 # One byte per glyph row, a line each ("\t0x18, /* 00011000 */")
 rows = [int(b, 16) for b in re.findall(r"^\s*(0x[0-9a-fA-F]{2}),", FONT.read_text(), re.M)]
@@ -45,7 +55,9 @@ def draw_text(img, text, scale, cy, rgb):
                     img.paste(rgb, (x, y, x + scale, y + scale))
 
 
-land = Image.open(SPLASH / "logo.bmp").convert("RGB").transpose(Image.Transpose.ROTATE_270)
-for line in LINES:
-    draw_text(land, *line)
-land.transpose(Image.Transpose.ROTATE_90).save(SPLASH / "usb.bmp")
+logo = Image.open(SPLASH / "logo.bmp").convert("RGB").transpose(Image.Transpose.ROTATE_270)
+for name, lines in SCREENS.items():
+    land = logo.copy()
+    for line in lines:
+        draw_text(land, *line)
+    land.transpose(Image.Transpose.ROTATE_90).save(SPLASH / name)

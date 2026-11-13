@@ -19,3 +19,4 @@
 /testing.tar.gz
 __pycache__/
 *.pyc
+firmware-backup/

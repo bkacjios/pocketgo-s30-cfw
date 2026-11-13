@@ -251,6 +251,7 @@ step_launcher() {
 	done
 	# Small system utilities (utils/)
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-fel.bin" "$PROJECT/utils/s30-fel.c"
+	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-flash.bin" "$PROJECT/utils/s30-flash.c"
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-volumed.bin" \
 		"$PROJECT/utils/s30-volumed.c" -lasound
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-splash.bin" "$PROJECT/utils/s30-splash.c"
@@ -263,7 +264,7 @@ step_launcher() {
 		-I"$WORK/sysroot/usr/include/libdrm" -ldrm
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-uac.bin" "$PROJECT/utils/s30-uac.c" -lasound
 	"$WORK/bin/armv7-clang" -O2 -Wall -fPIC -shared -o "$WORK/libs30lease.so" "$PROJECT/utils/s30-lease.c"
-	llvm-strip "$WORK/s30-fel.bin" "$WORK/s30-volumed.bin" "$WORK/s30-splash.bin" \
+	llvm-strip "$WORK/s30-fel.bin" "$WORK/s30-flash.bin" "$WORK/s30-volumed.bin" "$WORK/s30-splash.bin" \
 		"$WORK/s30-keyheld.bin" "$WORK/s30-display.bin" "$WORK/s30-screenshot.bin" "$WORK/s30-uvc.bin" "$WORK/s30-uac.bin" \
 		"$WORK/libs30lease.so"
 }
@@ -464,6 +465,8 @@ step_initramfs() {
 		install -m 0755 "$WORK/launcher.bin" "$root/usr/bin/s30-launcher"
 	[ -f "$WORK/s30-fel.bin" ] &&
 		install -m 0755 "$WORK/s30-fel.bin" "$root/usr/bin/s30-fel"
+	[ -f "$WORK/s30-flash.bin" ] &&
+		install -m 0755 "$WORK/s30-flash.bin" "$root/usr/bin/s30-flash"
 	[ -f "$WORK/s30-volumed.bin" ] &&
 		install -m 0755 "$WORK/s30-volumed.bin" "$root/usr/bin/s30-volumed"
 	[ -f "$WORK/s30-splash.bin" ] &&
@@ -500,12 +503,14 @@ step_initramfs() {
 	# Card check (dosfstools, exfatprogs; libc only)
 	cp -a "$root/sbin/fsck.fat" "$root/usr/sbin/fsck.exfat" "$loader/bin/"
 	install -m 0755 "$HERE/s30-loader" "$loader/init"
-	# USB disk mode (see s30-loader; usb.bmp from tools/make_usb_splash.py)
+	# USB disk mode and the no-card screen (see s30-loader; usb.bmp and
+	# nocard.bmp from tools/make_loader_screens.py)
 	[ -f "$WORK/s30-splash.bin" ] &&
 		install -m 0755 "$WORK/s30-splash.bin" "$loader/bin/s30-splash"
 	[ -f "$WORK/s30-keyheld.bin" ] &&
 		install -m 0755 "$WORK/s30-keyheld.bin" "$loader/bin/s30-keyheld"
 	install -m 0644 "$HERE/splash/usb.bmp" "$loader/usb.bmp"
+	install -m 0644 "$HERE/splash/nocard.bmp" "$loader/nocard.bmp"
 	fakeroot sh -c 'mknod -m 600 "$1/dev/console" c 5 1 &&
 		cd "$1" && find . | cpio -o -H newc --quiet | gzip -9 > "$2"' \
 		_ "$loader" "$WORK/initramfs.cpio.gz"
@@ -573,6 +578,42 @@ step_image() {
 	dd if="$WORK/u-boot-sunxi-with-spl.bin" of="$img" bs=1k seek=8 conv=notrunc status=none
 	dd if="$part" of="$img" bs=1M seek="$offset_mb" conv=notrunc status=none
 	echo "Wrote $img"
+}
+
+# SPI flash image (8 MiB Zbit ZB25VQ64), written over /dev/mtd0 from Linux.
+# Layout:
+#   0x000000  U-Boot with SPL (BROM loads the SPL; U-Boot proper at 0x8000)
+#   0x0c0000  FIT: zImage, DTB, initramfs (s30-loader), boot script
+#             (flash.its, flash.cmd); U-Boot reads it when spi_booted is set
+#   0x780000  Boot logo, uncompressed BMP (U-Boot patch 0006)
+# The root filesystem (rootfs.sqfs) and user data stay on the SD card. The
+# BROM tries the card first: a card with U-Boot at 8 KiB still boots from the
+# card. Install on the device with s30-flash write. Run after linux, uboot
+# and initramfs.
+FLASH_SIZE=$((0x800000))
+FLASH_FIT_OFFS=$((0xc0000))
+FLASH_LOGO_OFFS=$((0x780000))
+step_flash() {
+	local img="$OUT/spi-nor.bin" uboot="$WORK/u-boot-sunxi-with-spl.bin"
+	local fit="$WORK/flash.itb" n
+	n=$(stat -c %s "$uboot")
+	[ "$n" -le "$FLASH_FIT_OFFS" ] ||
+		{ echo "U-Boot is $n bytes, over the $FLASH_FIT_OFFS before the FIT" >&2; exit 1; }
+	# dtc resolves /incbin/ paths from the .its file's directory
+	cp "$HERE/flash.cmd" "$HERE/flash.its" "$WORK/"
+	"$WORK/u-boot/tools/mkimage" -f "$WORK/flash.its" "$fit" > /dev/null
+	n=$(stat -c %s "$fit")
+	[ "$n" -le $((FLASH_LOGO_OFFS - FLASH_FIT_OFFS)) ] ||
+		{ echo "FIT is $n bytes, over the $((FLASH_LOGO_OFFS - FLASH_FIT_OFFS)) before the logo" >&2; exit 1; }
+	[ "$(stat -c %s "$HERE/splash/logo.bmp")" -le $((FLASH_SIZE - FLASH_LOGO_OFFS)) ] ||
+		{ echo "logo.bmp does not fit after $FLASH_LOGO_OFFS" >&2; exit 1; }
+	mkdir -p "$OUT"
+	# Erased flash reads 0xff
+	head -c "$FLASH_SIZE" /dev/zero | tr '\0' '\377' > "$img"
+	dd if="$uboot" of="$img" conv=notrunc status=none
+	dd if="$fit" of="$img" bs=1 seek="$FLASH_FIT_OFFS" conv=notrunc status=none
+	dd if="$HERE/splash/logo.bmp" of="$img" bs=1 seek="$FLASH_LOGO_OFFS" conv=notrunc status=none
+	echo "Wrote $img (U-Boot $(stat -c %s "$uboot"), FIT $n of $((FLASH_LOGO_OFFS - FLASH_FIT_OFFS)) bytes)"
 }
 
 # Make an SD card boot on its own (no stock firmware, no FEL): the A33 boot
@@ -650,6 +691,7 @@ case "${1:-all}" in
 	gmloader) step_gmloader ;;
 	fel) step_fel ;;
 	sdcard) step_sdcard "${2:-}" "${3:-}" ;;
+	flash) step_flash ;;
 	all) step_deps; step_linux; step_uboot; step_rootfs; step_image ;;
-	*) echo "usage: $0 [deps|linux|uboot|rootfs|image|initramfs|retroarch|emulationstation|launcher|mesa|gmloader|fel|sdcard /dev/sdX [format]|all]" >&2; exit 2 ;;
+	*) echo "usage: $0 [deps|linux|uboot|rootfs|image|initramfs|retroarch|emulationstation|launcher|mesa|gmloader|fel|sdcard /dev/sdX [format]|flash|all]" >&2; exit 2 ;;
 esac
