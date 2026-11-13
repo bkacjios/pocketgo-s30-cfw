@@ -27,6 +27,7 @@ DKR = "ports/dkr/assets/.vanilla/us.v77/textures/2d/menu"
 MK64 = "ports/mk64/textures/standalone/logo_mario_kart_64.rgba32.png"  # the title screen's logo
 RS64_ROM = "ports/rogue_squadron64/rogue_squadron.z64"  # its title logo is backdrop/logo in the ROM's asset blob
 SF64_ROM = "ports/sf64/baserom.us.rev1.uncompressed.z64"  # title logo in ast_title (assets/yaml/us/rev1/ast_title.yaml)
+TMC_ROM = "ports/tmc/baserom.gba"  # USA; its title logo is the title-screen object's sprite frames
 RETROARCH = "s30-build/rootfs/usr/share/libretro/assets/branding/retroarch-plain-logo.png"
 
 # Screenshot crops: app name -> (screenshot file, (left, top, right, bottom))
@@ -98,6 +99,38 @@ def sf64_title(rom):
     return out
 
 
+def tmc_title(rom):
+    """The Minish Cap's title logo: TITLE_SCREEN_OBJECT (gObjectDefinition_BD,
+    src/object/titleScreenObject.c) types 0 and 1, sprite 511 frames 16 and
+    22 drawn at their screen positions. Offsets are the USA ROM's
+    (assets/gfx.json; gFrameObjLists 0x2F3D74, the OAM size table 0xB2BE8)."""
+    frame_lists, obj_sizes = 0x2F3D74, 0xB2BE8
+    u16 = lambda o: struct.unpack("<H", rom[o:o + 2])[0]
+    u32 = lambda o: struct.unpack("<I", rom[o:o + 4])[0]
+    colour = lambda v: ((v & 31) * 255 // 31, (v >> 5 & 31) * 255 // 31, (v >> 10 & 31) * 255 // 31, 255)
+    out = Image.new("RGBA", (240, 160))
+    px = out.load()
+    # (frame, tiles, palette, entity x, y)
+    for fi, gfx, pal, ex, ey in ((16, 9267040, 5921632, 120, 48), (22, 9282912, 5921664, 136, 81)):
+        colours = [colour(u16(pal + i * 2)) for i in range(16)]
+        frame = frame_lists + u32(frame_lists + u32(frame_lists + 511 * 4) + fi * 4)
+        for k in range(rom[frame]):
+            x, y, flags, tile = struct.unpack("<bbBH", rom[frame + 1 + k * 5:][:5])
+            offx, offy, w, h = rom[obj_sizes + ((flags & 0xF0) >> 2):][:4]
+            for t in range(w * h // 64):
+                for i in range(64):
+                    b = rom[gfx + (tile + t) * 32 + i // 2]
+                    c = b >> 4 if i & 1 else b & 15
+                    tx, ty = (t % (w // 8)) * 8 + i % 8, (t // (w // 8)) * 8 + i // 8
+                    if flags & 4:
+                        tx = w - 1 - tx
+                    if flags & 8:
+                        ty = h - 1 - ty
+                    if c and 0 <= ex + x - offx + tx < 240 and 0 <= ey + y - offy + ty < 160:
+                        px[ex + x - offx + tx, ey + y - offy + ty] = colours[c]
+    return out
+
+
 def fit(im, box=SIZE - 2 * PAD):
     """`im` scaled to fit a box, centred on a transparent SIZE x SIZE canvas"""
     im = im.convert("RGBA")
@@ -158,6 +191,8 @@ def main():
             icons["Rogue Squadron"] = fit(trim(rs64_ci8(logo)))
     if os.path.exists(SF64_ROM):
         icons["Star Fox 64"] = fit(sf64_title(open(SF64_ROM, "rb").read()))
+    if os.path.exists(TMC_ROM):
+        icons["The Minish Cap"] = fit(trim(tmc_title(open(TMC_ROM, "rb").read())))
     if os.path.exists(RETROARCH):
         logo = Image.open(RETROARCH).crop((0, 0, 460, 330))  # the invader, not the wordmark or its rule
         icons["RetroArch"] = fit(trim(logo))
