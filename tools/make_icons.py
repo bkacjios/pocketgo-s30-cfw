@@ -33,8 +33,10 @@ AM2R_APK = os.environ.get("AM2R_APK", "")  # AM2RLauncher's APK (on the card: /m
 ES = "external/emulationstation/resources/window_icon_256.png"  # its window and desktop icon
 RETROARCH = "s30-build/rootfs/usr/share/libretro/assets/branding/retroarch-plain-logo.png"
 
-# Screenshot crops: app name -> (screenshot file, (left, top, right, bottom))
+# Screenshot crops: app name -> (screenshot file, (left, top, right, bottom),
+# background): "black" keys out a black background, else rounded corners
 SHOTS = {
+    "Super Mario 64": ("sm64-0001.png", (70, 50, 415, 210), "black"),  # the title logo, without the copyright line
 }
 
 
@@ -164,6 +166,22 @@ def strip(files):
     return out
 
 
+def key_black(im, lo=16, hi=64):
+    """A logo shot on black, with the black made transparent: alpha ramps up
+    with brightness from `lo` to `hi`, and the colours are divided by it (the
+    edges were blended over black)"""
+    out = Image.new("RGBA", im.size)
+    data = []
+    for r, g, b, _ in im.convert("RGBA").getdata():
+        a = min(255, max(0, (max(r, g, b) - lo) * 255 // (hi - lo)))
+        if a == 0:
+            data.append((0, 0, 0, 0))
+        else:
+            data.append(tuple(min(255, c * 255 // a) if a < 255 else c for c in (r, g, b)) + (a,))
+    out.putdata(data)
+    return out
+
+
 def rounded(im, radius=18):
     """Screenshot crops get rounded corners (the logo keeps its background)"""
     from PIL import ImageDraw
@@ -205,11 +223,11 @@ def main():
     if os.path.exists(RETROARCH):
         logo = Image.open(RETROARCH).crop((0, 0, 460, 330))  # the invader, not the wordmark or its rule
         icons["RetroArch"] = fit(trim(logo))
-    for name, (shot, box) in SHOTS.items():
+    for name, (shot, box, background) in SHOTS.items():
         path = os.path.join(shots or "", shot)
         if shots is not None and os.path.exists(path):
             im = Image.open(path).convert("RGBA").crop(box)
-            icons[name] = fit(rounded(im))
+            icons[name] = fit(trim(key_black(im)) if background == "black" else rounded(im))
     for name, im in icons.items():
         im.save(os.path.join(out, f"{name}.png"))
         print(name)
