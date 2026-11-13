@@ -30,6 +30,7 @@ RS64_ROM = "ports/rogue_squadron64/rogue_squadron.z64"  # its title logo is back
 SF64_ROM = "ports/sf64/baserom.us.rev1.uncompressed.z64"  # title logo in ast_title (assets/yaml/us/rev1/ast_title.yaml)
 TMC_ROM = "ports/tmc/baserom.gba"  # USA; its title logo is the title-screen object's sprite frames
 AM2R_APK = os.environ.get("AM2R_APK", "")  # AM2RLauncher's APK (on the card: /mnt/sd/home/ports/am2r/am2r.apk)
+SSB = "ports/ssb/relocAssets/MNTitle"  # the title screen's sprites, extracted from relocData
 ES = "external/emulationstation/resources/window_icon_256.png"  # its window and desktop icon
 RETROARCH = "s30-build/rootfs/usr/share/libretro/assets/branding/retroarch-plain-logo.png"
 
@@ -137,6 +138,21 @@ def tmc_title(rom):
     return out
 
 
+def ssb_title():
+    """Smash Bros.' title logo: SUPER, SMASH and BROS. over the dark jagged
+    cutout, at the title screen's sprite centres (dMNTitleCommonSpriteDescs,
+    src/mn/mncommon/mntitle.c, US)"""
+    load = lambda name: Image.open(f"{SSB}/{name}.png").convert("RGBA")
+    cutout = load("Cutout")
+    backing = Image.new("RGBA", cutout.size, (0, 0, 0, 255))
+    backing.putalpha(cutout.getchannel("R"))  # a white mask the game draws dark
+    out = Image.new("RGBA", (320, 240))
+    for im, (cx, cy) in ((backing, (157, 94)), (load("Smash"), (161, 88)), (load("Super"), (55, 96)),
+                         (load("Bros"), (268, 96))):
+        out.alpha_composite(im, (cx - im.width // 2, cy - im.height // 2))
+    return out
+
+
 def fit(im, box=SIZE - 2 * PAD):
     """`im` scaled to fit a box, centred on a transparent SIZE x SIZE canvas"""
     im = im.convert("RGBA")
@@ -218,6 +234,8 @@ def main():
     if AM2R_APK and os.path.exists(AM2R_APK):
         with zipfile.ZipFile(AM2R_APK) as apk, apk.open("res/drawable-xxxhdpi-v4/icon.png") as f:
             icons["AM2R"] = fit(trim(Image.open(f)))  # the Android app icon
+    if os.path.exists(SSB):
+        icons["Super Smash Bros."] = fit(trim(ssb_title()))
     if os.path.exists(ES):
         icons["EmulationStation"] = fit(trim(Image.open(ES)))
     if os.path.exists(RETROARCH):
