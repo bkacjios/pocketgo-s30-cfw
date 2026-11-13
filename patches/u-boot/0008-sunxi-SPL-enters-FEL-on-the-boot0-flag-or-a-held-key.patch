@@ -1,0 +1,199 @@
+From: PocketGo S30 CFW
+Subject: [PATCH] sunxi: SPL enters FEL on the boot0 flag or a held key (A33)
+
+Allwinner's boot0 jumps to the boot ROM's FEL entry (0xffff0020) when RTC
+general-purpose register 2 holds 0x5aa5a55a, clearing it first; the boot
+ROM itself does not check the flag. With the SPL in the SPI flash in
+boot0's place, Linux's "reboot fel" (s30-fel) needs the SPL to do the
+same. SPL_FEL_KEY names a key (active low, pulled up here) that enters
+FEL when held at power on, with no card and no running system needed:
+the PocketGo S30 uses volume down (PG0).
+
+diff --git a/board/sunxi/Kconfig b/board/sunxi/Kconfig
+index 084a8b0c..3d77b696 100644
+--- a/board/sunxi/Kconfig
++++ b/board/sunxi/Kconfig
+@@ -1,3 +1,14 @@
++config SPL_FEL_KEY
++	string "GPIO of a key that enters FEL (USB boot) when held at power on"
++	depends on MACH_SUN8I_A33
++	default ""
++	help
++	  The SPL jumps to the boot ROM's FEL entry when this key (active low,
++	  pulled up by the SPL) is held at power on, so sunxi-fel can load the
++	  device over USB without a card. Empty: no key. The SPL also enters
++	  FEL once when RTC general-purpose register 2 holds the magic
++	  0x5aa5a55a, as Allwinner's boot0 does (Linux's "reboot fel").
++
+ choice
+ 	prompt "SPL Image Type"
+ 	default SPL_IMAGE_TYPE_SUNXI_EGON
+diff --git a/board/sunxi/board.c b/board/sunxi/board.c
+index 3d1afec7..31a592e0 100644
+--- a/board/sunxi/board.c
++++ b/board/sunxi/board.c
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <clock_legacy.h>
++#include <cpu_func.h>
+ #include <dm.h>
+ #include <env.h>
+ #include <hang.h>
+@@ -48,6 +49,9 @@
+ #include <nand.h>
+ #include <net.h>
+ #include <spl.h>
++#include <spi_flash.h>
++#include <splash.h>
++#include <asm/unaligned.h>
+ #include <sy8106a.h>
+ #include <asm/setup.h>
+ 
+@@ -571,10 +575,49 @@ static void status_led_init(void)
+ #endif
+ }
+ 
++#ifdef CONFIG_MACH_SUN8I_A33
++/*
++ * FEL (USB boot) from the SPL, as Allwinner's boot0 does: when RTC
++ * general-purpose register 2 holds the magic (Linux's "reboot fel"), or
++ * the FEL key is held at power on, jump to the boot ROM's FEL entry. The
++ * flag is one-shot; the boot ROM only checks for it on its own when
++ * nothing boots. DRAM is not up yet, as the ROM expects.
++ */
++#define FEL_FLAG_REG	(SUNXI_RTC_BASE + 0x108)
++#define FEL_FLAG_MAGIC	0x5aa5a55a
++#define BROM_FEL_ENTRY	0xffff0020
++
++static void sunxi_fel_check(void)
++{
++	int enter = readl(FEL_FLAG_REG) == FEL_FLAG_MAGIC;
++
++	if (enter)
++		writel(0, FEL_FLAG_REG);
++	if (!enter && CONFIG_SPL_FEL_KEY[0]) {
++		int pin = sunxi_name_to_gpio(CONFIG_SPL_FEL_KEY);
++
++		if (pin >= 0) {
++			sunxi_gpio_set_cfgpin(pin, SUNXI_GPIO_INPUT);
++			sunxi_gpio_set_pull(pin, SUNXI_GPIO_PULL_UP);
++			udelay(100);
++			enter = gpio_get_value(pin) == 0;
++		}
++	}
++	if (enter) {
++		dcache_disable();
++		icache_disable();
++		((void (*)(void))BROM_FEL_ENTRY)();
++	}
++}
++#endif
++
+ void sunxi_board_init(void)
+ {
+ 	int power_failed = 0;
+ 
++#ifdef CONFIG_MACH_SUN8I_A33
++	sunxi_fel_check();
++#endif
+ 	if (CONFIG_IS_ENABLED(SUNXI_LED_STATUS))
+ 		status_led_init();
+ 
+@@ -595,7 +638,7 @@ void sunxi_board_init(void)
+ 		pmic_bus_read(AXP_POWER_STATUS, &boot_reason);
+ 		if (boot_reason & AXP_POWER_STATUS_ALDO_IN) {
+ 			printf("Power on by plug-in, shutting down.\n");
+-			pmic_bus_write(0x32, BIT(7));
++			pmic_bus_setbits(0x32, BIT(7));
+ 		}
+ 	}
+ 
+@@ -827,6 +870,69 @@ static void setup_environment(const void *fdt)
+ 	}
+ }
+ 
++#if CONFIG_IS_ENABLED(SPLASH_SOURCE)
++/*
++ * PocketGo S30 boot splash: an uncompressed BMP in SPI flash at 0x780000
++ * (build.sh flash), else /boot/logo.bmp on the SD card (a card boot with
++ * the stock firmware still in flash, whose data there is not a BMP).
++ */
++#define S30_SPLASH_SF_OFFSET	0x780000
++#define S30_SPLASH_SF_MAX	0x80000
++
++static struct splash_location s30_splash_locations[] = {
++	{
++		.name = "sf",
++		.storage = SPLASH_STORAGE_SF,
++		.flags = SPLASH_STORAGE_RAW,
++		.offset = S30_SPLASH_SF_OFFSET,
++	},
++	{
++		.name = "mmc_fs",
++		.storage = SPLASH_STORAGE_MMC,
++		.flags = SPLASH_STORAGE_FS,
++		.devpart = "0:1",
++	},
++};
++
++/*
++ * The raw loader takes the read size from the BMP header without checking
++ * it: on stock flash data that can be hundreds of MB (U-Boot hangs before
++ * the display is up). Only load from flash what looks like a BMP that fits.
++ */
++static bool s30_splash_in_flash(void)
++{
++	struct spi_flash *sf;
++	u8 hdr[6];
++
++	sf = spi_flash_probe(CONFIG_SF_DEFAULT_BUS, CONFIG_SF_DEFAULT_CS,
++			     CONFIG_SF_DEFAULT_SPEED, CONFIG_SF_DEFAULT_MODE);
++	if (!sf || spi_flash_read(sf, S30_SPLASH_SF_OFFSET, sizeof(hdr), hdr))
++		return false;
++
++	return hdr[0] == 'B' && hdr[1] == 'M' &&
++	       get_unaligned_le32(hdr + 2) <= S30_SPLASH_SF_MAX;
++}
++
++int splash_screen_prepare(void)
++{
++	const char *bmp = (const char *)env_get_hex("splashimage", 0);
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(s30_splash_locations); i++) {
++		if (s30_splash_locations[i].storage == SPLASH_STORAGE_SF &&
++		    !s30_splash_in_flash())
++			continue;
++		env_set("splashsource", s30_splash_locations[i].name);
++		if (!splash_source_load(s30_splash_locations,
++					ARRAY_SIZE(s30_splash_locations)) &&
++		    bmp[0] == 'B' && bmp[1] == 'M')
++			return 0;
++	}
++
++	return -ENOENT;
++}
++#endif
++
+ int misc_init_r(void)
+ {
+ 	const char *spl_dt_name;
+@@ -835,6 +941,7 @@ int misc_init_r(void)
+ 	env_set("fel_booted", NULL);
+ 	env_set("fel_scriptaddr", NULL);
+ 	env_set("mmc_bootdev", NULL);
++	env_set("spi_booted", NULL);
+ 
+ 	boot = sunxi_get_boot_device();
+ 	/* determine if we are running in FEL mode */
+@@ -846,6 +953,9 @@ int misc_init_r(void)
+ 		env_set("mmc_bootdev", "0");
+ 	} else if (boot == BOOT_DEVICE_MMC2) {
+ 		env_set("mmc_bootdev", "1");
++	/* or from SPI flash (the bootcmd then boots the FIT stored there) */
++	} else if (boot == BOOT_DEVICE_SPI) {
++		env_set("spi_booted", "1");
+ 	}
+ 
+ 	/* Set fdtfile to match the FIT configuration chosen in SPL. */

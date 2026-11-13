@@ -702,6 +702,13 @@ about twice as long per MB. A card with U-Boot at 8 KiB still takes priority.
 - Launcher: app output goes to the log; a launch script with a
   `# s30-console` line (first 10 lines) also gets it on tty1, which
   s30-display shows whenever no app holds the display.
+- FEL key (2026-11-13, U-Boot patch 0008, `CONFIG_SPL_FEL_KEY="PG0"`): hold
+  VOLUME DOWN at power on and the SPL jumps to the boot ROM's FEL entry
+  (0xffff0020), as stock boot0 did on the RTC flag; no card or system
+  needed. The SPL also honours the flag itself (`s30-fel` / `reboot fel`),
+  which stopped working when our SPL replaced boot0 in the chip: the boot
+  ROM never checked it. Both the chip and the card's gap carry this SPL
+  (the ROM boots the card first). Verified: `s30-fel` -> `sunxi-fel ver`.
 - FEL without adb: set the boot0 flag from Linux (`printf
   "\x5a\xa5\xa5\x5a" | dd of=/sys/bus/nvmem/devices/nvmem0/nvmem bs=4
   seek=2 count=1 conv=notrunc`; byte writes are ignored), power off, card
