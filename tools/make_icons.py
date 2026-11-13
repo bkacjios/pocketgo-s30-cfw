@@ -153,6 +153,26 @@ def ssb_title():
     return out
 
 
+def oot_title():
+    """Ocarina of Time's title logo as En_Mag draws it: the shield logo, then
+    THE LEGEND OF and OCARINA OF TIME, each a shadow pass and a gold pass a
+    pixel up and left (src/overlays/actors/ovl_En_Mag/z_en_mag.c; the I8
+    text through (PRIM - ENV) * TEXEL0 + ENV, its intensity as alpha)"""
+    def lerped(name, prim, env):
+        t = Image.open(f"{OOT}/{name}.i8.png").convert("L")
+        out = Image.new("RGBA", t.size)
+        out.putdata([tuple(e + (p - e) * v // 255 for p, e in zip(prim, env)) + (v,) for v in t.getdata()])
+        return out
+
+    out = Image.new("RGBA", (320, 240))
+    shield = Image.open(f"{OOT}/gTitleZeldaShieldLogoTex.rgba32.png").convert("RGBA")
+    out.alpha_composite(shield, (160 - shield.width // 2, 100 - shield.height // 2))
+    for prim, env, dx in (((0, 0, 0), (100, 0, 100), 1), ((200, 200, 150), (100, 100, 50), 0)):
+        out.alpha_composite(lerped("gTitleTheLegendOfTextTex", prim, env), (153 + dx, 72 + dx))
+        out.alpha_composite(lerped("gTitleOcarinaOfTimeTMTextTex", prim, env), (151 + dx, 126 + dx))
+    return out
+
+
 def mm_title():
     """Majora's Mask's title logo as En_Mag draws it once faded in: the mask,
     the subtitle's shadow and text, the ZELDA logo and THE LEGEND OF
@@ -238,7 +258,7 @@ def main():
     os.makedirs(out, exist_ok=True)
     icons = {}
     if os.path.exists(OOT):
-        icons["Ocarina of Time"] = fit(trim(Image.open(f"{OOT}/gTitleZeldaShieldLogoTex.rgba32.png")))
+        icons["Ocarina of Time"] = fit(trim(oot_title()))
     if os.path.exists(MM):
         icons["Majora's Mask"] = fit(trim(mm_title()))
     if os.path.exists(DKR):
