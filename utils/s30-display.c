@@ -24,6 +24,14 @@
  * needs a master lessor), so an app that opens the card directly still
  * works when the daemon is not involved.
  *
+ * The text console (tty1) shows whenever no app holds the display, so an
+ * app that only prints (its output goes there through the launcher) is
+ * seen: while a lease is out the console is in graphics mode (KD_GRAPHICS:
+ * fbcon draws nothing, so a chatty app costs nothing); when it ends, text
+ * mode again and a forced fbdev mode set, which makes the kernel's DRM
+ * fbdev helper put the console back on screen (it would only do that by
+ * itself when the card's last user closes it, and the daemon keeps it open).
+ *
  * System menu: the power key (grabbed, so apps never see it) opens a menu
  * over whoever holds the lease: Exit game / System / Resume over an app; the
  * System page (straight away over the launcher) has Settings, Sleep, Reboot
@@ -60,6 +68,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
+#include <linux/fb.h>
+#include <linux/kd.h>
 #include <math.h>
 #include <poll.h>
 #include <sched.h>
@@ -2106,6 +2116,28 @@ static void power_key(int fd) {
 	}
 }
 
+/* The console (tty1) hidden while an app holds the display, else shown */
+static void console_shown(int shown) {
+	struct fb_var_screeninfo v;
+	int fd = open("/dev/tty1", O_RDWR | O_NOCTTY | O_CLOEXEC);
+
+	if (fd >= 0) {
+		ioctl(fd, KDSETMODE, shown ? KD_TEXT : KD_GRAPHICS);
+		close(fd);
+	}
+	if (!shown) {
+		return;
+	}
+	fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+	if (fd >= 0 && ioctl(fd, FBIOGET_VSCREENINFO, &v) == 0) {
+		v.activate = FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
+		ioctl(fd, FBIOPUT_VSCREENINFO, &v);
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
+}
+
 /* Forget the lease once its lessee has closed it; drop master when idle */
 static void check_lease(void) {
 	drmModeLesseeListRes* list;
@@ -2127,6 +2159,7 @@ static void check_lease(void) {
 		sAppPid = 0;
 		sAppLauncher = 0;
 		set_master(0);
+		console_shown(1); // after dropping master: the fbdev helper needs it free
 	}
 }
 
@@ -2146,6 +2179,8 @@ static int make_lease(void) {
 	if (fd < 0) {
 		sLessee = 0;
 		set_master(0);
+	} else {
+		console_shown(0);
 	}
 	return fd;
 }

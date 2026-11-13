@@ -16,7 +16,10 @@
  * left/right). Folders open; *.sh files run with /bin/sh;
  * ELF binaries run directly (on exFAT every file looks executable, so the
  * file type decides). While an app runs the launcher releases the display
- * and waits for it.
+ * and waits for it. The app's output (stdout, stderr) goes to the launcher's
+ * own (the frontend's log) and to the text console (tty1, cleared first),
+ * which s30-display shows while no app holds the display: an app that only
+ * prints is seen on screen. When it exits, the launcher comes straight back.
  *
  * Icons: an image next to an entry with the same name (Ocarina of Time.png
  * for Ocarina of Time.sh, Folder.png for Folder/) is its tile and is not
@@ -32,6 +35,7 @@
 #include <libgen.h>
 #include <limits.h>
 #include <linux/input.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -853,10 +857,45 @@ static bool is_elf(const char* path) {
     return elf;
 }
 
+/* Copy the app's output from `out` to stdout (the log) and `tty` until it
+   exits. Polled, not read to EOF: something the app left running in the
+   background may keep the pipe open. */
+static void relay_output(const char* path, pid_t pid, int out, int tty) {
+    struct pollfd pfd = { .fd = out, .events = POLLIN };
+    char buf[4096];
+    bool exited = false;
+    ssize_t n;
+
+    while (!exited) {
+        int status;
+
+        exited = waitpid(pid, &status, WNOHANG) == pid;
+        if (exited) {
+            printf("launcher: %s exited (status 0x%x)\n", path, status);
+        } else if (poll(&pfd, 1, 200) <= 0) {
+            continue;
+        }
+        // Drain what is there (all of it once the app has gone)
+        while ((n = read(out, buf, sizeof(buf))) > 0) {
+            fflush(stdout);
+            if (write(STDOUT_FILENO, buf, n) < 0) {
+                // the log is gone: the screen still gets it
+            }
+            if (tty >= 0 && write(tty, buf, n) < 0) {
+                // nothing to do
+            }
+        }
+        if (n == 0) {
+            pfd.fd = -1; // EOF: just wait for the exit
+        }
+    }
+}
+
 static void run(const char* path) {
     const char* dot = strrchr(path, '.');
     bool script = dot != NULL && strcmp(dot, ".sh") == 0;
     char dir[PATH_MAX];
+    int pipefd[2], tty;
     pid_t pid;
 
     if (!script && !is_elf(path)) {
@@ -865,8 +904,20 @@ static void run(const char* path) {
     printf("launcher: running %s\n", path);
     ui_video_close();
     snprintf(dir, sizeof(dir), "%s", path);
+    // The console starts empty: no earlier app's text when it shows
+    tty = open("/dev/tty1", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+    if (tty >= 0 && write(tty, "\033[H\033[2J", 7) < 0) {
+        // not fatal
+    }
+    if (pipe2(pipefd, O_CLOEXEC) != 0) {
+        pipefd[0] = pipefd[1] = -1;
+    }
     pid = fork();
     if (pid == 0) {
+        if (pipefd[1] >= 0) {
+            dup2(pipefd[1], STDOUT_FILENO); // dup2 clears close-on-exec
+            dup2(pipefd[1], STDERR_FILENO);
+        }
         if (chdir(dirname(dir)) != 0) {
             _exit(127);
         }
@@ -878,10 +929,26 @@ static void run(const char* path) {
         fprintf(stderr, "launcher: exec %s: %s\n", path, strerror(errno));
         _exit(127);
     } else if (pid > 0) {
-        int status;
-        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        if (pipefd[1] >= 0) {
+            close(pipefd[1]); // the app's copy is the only writer: EOF at its exit
+            pipefd[1] = -1;
+            fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+            relay_output(path, pid, pipefd[0], tty);
+        } else {
+            int status;
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+            }
+            printf("launcher: %s exited (status 0x%x)\n", path, status);
         }
-        printf("launcher: %s exited (status 0x%x)\n", path, status);
+    }
+    if (pipefd[0] >= 0) {
+        close(pipefd[0]);
+    }
+    if (pipefd[1] >= 0) {
+        close(pipefd[1]); // fork failed
+    }
+    if (tty >= 0) {
+        close(tty);
     }
     if (!ui_video_open()) {
         exit(1); // init respawns the frontend
