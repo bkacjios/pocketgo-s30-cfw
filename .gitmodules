@@ -1,6 +1,6 @@
 [submodule "linux"]
 	path = external/linux
-	url = https://github.com/torvalds/linux.git
+	url = https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
 	shallow = true
 [submodule "u-boot"]
 	path = external/u-boot
