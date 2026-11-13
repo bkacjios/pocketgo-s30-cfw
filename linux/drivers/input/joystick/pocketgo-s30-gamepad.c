@@ -21,6 +21,12 @@
  * passes raw values through apart from the deadzone; the calibration sets
  * deadzone 0 and no edges to read raw values.
  *
+ * The stick is read by its own thread, which keeps the latest sample; the
+ * poll reports that with the buttons and never waits on I2C. The stick MCU
+ * sometimes holds the bus (seconds, with the controller's default timeout),
+ * which used to stop the buttons with it. The bus carries only the stick, so
+ * its timeout is cut to S30_I2C_TIMEOUT_MS.
+ *
  * Before calibration the raw samples are smoothed (each output the average of
  * the new sample and the previous output, about 20 ms of lag at the 10 ms
  * poll); after it, a radial deadzone (out of 127, default S30_DEADZONE) around the
@@ -30,8 +36,10 @@
 
 #include <linux/bits.h>
 #include <linux/gpio/consumer.h>
+#include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/input.h>
+#include <linux/kthread.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/math.h>
@@ -39,6 +47,7 @@
 #include <linux/property.h>
 
 #define S30_GAMEPAD_POLL_MS	10
+#define S30_I2C_TIMEOUT_MS	50
 #define S30_DEADZONE		8
 #define S30_GAMEPAD_MAX_KEYS	32
 #define S30_EDGES		32	/* directions in the edge table */
@@ -55,6 +64,9 @@ struct s30_gamepad {
 	int cal[7];		/* cx cy m00 m01 m10 m11 deadzone */
 	int edge[S30_EDGES];	/* reach per direction, 1/16 counts (0: no table) */
 	int fx, fy;		/* smoothed raw stick, 1/16 units (-1: none yet) */
+	int stick;		/* latest reported stick, x | y << 8 (-1: none yet) */
+	unsigned int interval;	/* ms between stick reads */
+	struct task_struct *thread;
 	unsigned int nkeys;
 	struct s30_gamepad_key keys[] __counted_by(nkeys);
 };
@@ -91,10 +103,9 @@ static int s30_edge(const int *edge, int x, int y)
 	return (edge[i] * (65536 - f) + edge[(i + 1) % S30_EDGES] * f) >> 16;
 }
 
-static void s30_gamepad_poll(struct input_dev *input)
+/* One stick sample, calibrated, into gp->stick */
+static void s30_stick_read(struct s30_gamepad *gp)
 {
-	struct s30_gamepad *gp = input_get_drvdata(input);
-	unsigned int i;
 	u8 buf[4];
 	int ret;
 
@@ -140,8 +151,46 @@ static void s30_gamepad_poll(struct input_dev *input)
 			x = x * scaled / r;
 			y = y * scaled / r;
 		}
-		input_report_abs(input, ABS_X, clamp(128 + x, 0, 255));
-		input_report_abs(input, ABS_Y, clamp(128 + y, 0, 255));
+		WRITE_ONCE(gp->stick, clamp(128 + x, 0, 255) | clamp(128 + y, 0, 255) << 8);
+	}
+}
+
+static int s30_stick_thread(void *data)
+{
+	struct s30_gamepad *gp = data;
+
+	while (!kthread_should_stop()) {
+		s30_stick_read(gp);
+		usleep_range(gp->interval * 1000, gp->interval * 1000 + 1000);
+	}
+	return 0;
+}
+
+static int s30_gamepad_open(struct input_dev *input)
+{
+	struct s30_gamepad *gp = input_get_drvdata(input);
+
+	gp->thread = kthread_run(s30_stick_thread, gp, "s30-stick");
+	return PTR_ERR_OR_ZERO(gp->thread);
+}
+
+static void s30_gamepad_close(struct input_dev *input)
+{
+	struct s30_gamepad *gp = input_get_drvdata(input);
+
+	kthread_stop(gp->thread);
+}
+
+/* The latest stick sample and the buttons: nothing here waits on I2C */
+static void s30_gamepad_poll(struct input_dev *input)
+{
+	struct s30_gamepad *gp = input_get_drvdata(input);
+	int stick = READ_ONCE(gp->stick), ret;
+	unsigned int i;
+
+	if (stick >= 0) {
+		input_report_abs(input, ABS_X, stick & 0xff);
+		input_report_abs(input, ABS_Y, stick >> 8);
 	}
 
 	for (i = 0; i < gp->nkeys; i++) {
@@ -230,6 +279,7 @@ static int s30_gamepad_probe(struct i2c_client *client)
 	gp->client = client;
 	mutex_init(&gp->cal_lock);
 	gp->fx = -1;
+	gp->stick = -1;
 	gp->cal[0] = 128;
 	gp->cal[1] = 128;
 	gp->cal[2] = 4096;
@@ -245,8 +295,10 @@ static int s30_gamepad_probe(struct i2c_client *client)
 	input->phys = "pocketgo-s30-gamepad/input0";
 	input->id.bustype = BUS_I2C;
 	input_set_drvdata(input, gp);
+	input->open = s30_gamepad_open;
+	input->close = s30_gamepad_close;
 
-	/* No fuzz/flat: the poll handler smooths and applies the deadzone, and
+	/* No fuzz/flat: the stick thread smooths and applies the deadzone, and
 	 * the input core's fuzz filter turned slow movement into jumps */
 	input_set_abs_params(input, ABS_X, 0, 255, 0, 0);
 	input_set_abs_params(input, ABS_Y, 0, 255, 0, 0);
@@ -277,6 +329,10 @@ static int s30_gamepad_probe(struct i2c_client *client)
 	if (device_property_read_u32(dev, "poll-interval", &interval))
 		interval = S30_GAMEPAD_POLL_MS;
 	input_set_poll_interval(input, interval);
+	gp->interval = interval;
+
+	/* The bus is the stick MCU's alone */
+	client->adapter->timeout = msecs_to_jiffies(S30_I2C_TIMEOUT_MS);
 
 	return input_register_device(input);
 }
