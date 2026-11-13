@@ -110,8 +110,9 @@ def tmc_title(rom):
     colour = lambda v: ((v & 31) * 255 // 31, (v >> 5 & 31) * 255 // 31, (v >> 10 & 31) * 255 // 31, 255)
     out = Image.new("RGBA", (240, 160))
     px = out.load()
-    # (frame, tiles, palette, entity x, y)
-    for fi, gfx, pal, ex, ey in ((16, 9267040, 5921632, 120, 48), (22, 9282912, 5921664, 136, 81)):
+    # (frame, tiles, palette, entity x, y); object palettes 359 and 360 are
+    # gPalette_3434 and 3435 (gUnk_08133368, src/data/objPalettes.c)
+    for fi, gfx, pal, ex, ey in ((16, 9267040, 6020032, 120, 48), (22, 9282912, 6020064, 136, 81)):
         colours = [colour(u16(pal + i * 2)) for i in range(16)]
         frame = frame_lists + u32(frame_lists + u32(frame_lists + 511 * 4) + fi * 4)
         for k in range(rom[frame]):
