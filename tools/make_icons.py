@@ -28,6 +28,7 @@ MK64 = "ports/mk64/textures/standalone/logo_mario_kart_64.rgba32.png"  # the tit
 RS64_ROM = "ports/rogue_squadron64/rogue_squadron.z64"  # its title logo is backdrop/logo in the ROM's asset blob
 SF64_ROM = "ports/sf64/baserom.us.rev1.uncompressed.z64"  # title logo in ast_title (assets/yaml/us/rev1/ast_title.yaml)
 TMC_ROM = "ports/tmc/baserom.gba"  # USA; its title logo is the title-screen object's sprite frames
+ES = "external/emulationstation/resources/window_icon_256.png"  # its window and desktop icon
 RETROARCH = "s30-build/rootfs/usr/share/libretro/assets/branding/retroarch-plain-logo.png"
 
 # Screenshot crops: app name -> (screenshot file, (left, top, right, bottom))
@@ -194,6 +195,8 @@ def main():
         icons["Star Fox 64"] = fit(sf64_title(open(SF64_ROM, "rb").read()))
     if os.path.exists(TMC_ROM):
         icons["The Minish Cap"] = fit(trim(tmc_title(open(TMC_ROM, "rb").read())))
+    if os.path.exists(ES):
+        icons["EmulationStation"] = fit(trim(Image.open(ES)))
     if os.path.exists(RETROARCH):
         logo = Image.open(RETROARCH).crop((0, 0, 460, 330))  # the invader, not the wordmark or its rule
         icons["RetroArch"] = fit(trim(logo))
