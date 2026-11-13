@@ -37,7 +37,8 @@ s30-splash 40
 
 ifconfig lo 127.0.0.1 up
 # USB gadget: the functions switched on in Settings > USB (default the
-# serial shell, host /dev/ttyACM*, and NCM networking, device 10.42.0.2;
+# serial shell, host /dev/ttyACM*, and NCM networking, device s30.local /
+# 10.42.0.2;
 # see /etc/udhcpd.conf)
 /usr/libexec/s30/usb-gadget
 s30-splash 60

@@ -238,7 +238,8 @@ ensure_sysroot() {
 # s30-keyheld, s30-display (with the system menu and stick calibration) and its
 # preload libs30lease.so, s30-screenshot (the screen's KMS planes to a PNG),
 # s30-uvc and s30-uac (the screen and the speaker's sound as a USB webcam and
-# sound card). Output: $WORK/{launcher,s30-*}.bin, $WORK/libs30lease.so
+# sound card), s30-mdns (s30.local over the USB network). Output:
+# $WORK/{launcher,s30-*}.bin, $WORK/libs30lease.so
 step_launcher() {
 	local app
 	ensure_sysroot
@@ -262,10 +263,11 @@ step_launcher() {
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-uvc.bin" "$PROJECT/utils/s30-uvc.c" \
 		-I"$WORK/sysroot/usr/include/libdrm" -ldrm
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-uac.bin" "$PROJECT/utils/s30-uac.c" -lasound
+	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-mdns.bin" "$PROJECT/utils/s30-mdns.c"
 	"$WORK/bin/armv7-clang" -O2 -Wall -fPIC -shared -o "$WORK/libs30lease.so" "$PROJECT/utils/s30-lease.c"
 	llvm-strip "$WORK/s30-fel.bin" "$WORK/s30-volumed.bin" "$WORK/s30-splash.bin" \
 		"$WORK/s30-keyheld.bin" "$WORK/s30-display.bin" "$WORK/s30-screenshot.bin" "$WORK/s30-uvc.bin" "$WORK/s30-uac.bin" \
-		"$WORK/libs30lease.so"
+		"$WORK/s30-mdns.bin" "$WORK/libs30lease.so"
 }
 
 # RetroArch, cross-compiled with clang for armv7 musl against an Alpine
@@ -478,6 +480,8 @@ step_initramfs() {
 		install -m 0755 "$WORK/s30-uvc.bin" "$root/usr/bin/s30-uvc"
 	[ -f "$WORK/s30-uac.bin" ] &&
 		install -m 0755 "$WORK/s30-uac.bin" "$root/usr/bin/s30-uac"
+	[ -f "$WORK/s30-mdns.bin" ] &&
+		install -m 0755 "$WORK/s30-mdns.bin" "$root/usr/bin/s30-mdns"
 	[ -d "$WORK/emulationstation-root" ] &&
 		cp -r "$WORK/emulationstation-root/." "$root/"
 	# Mesa (build.sh mesa), in place of Alpine's (build/packages excludes it)

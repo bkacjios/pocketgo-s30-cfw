@@ -5,7 +5,7 @@
 #   usb-gadget status           "FUNC on|off COST" per function, then "free N"
 # Functions and the IN endpoints they take (the musb controller has 5):
 #   serial   ACM shell, host /dev/ttyACM* (notify + data)      2
-#   network  NCM, ssh to 10.42.0.2 (notify + data)             2
+#   network  NCM, ssh to s30.local / 10.42.0.2 (notify + data) 2
 #   audio    UAC2 sound card: what the speaker plays (s30-uac) 1
 #   video    UVC webcam: the screen (s30-uvc)                  1
 # Turning one on past the 5 fails (exit 3). Every change rebinds the gadget,
@@ -96,7 +96,7 @@ create() {
 # Rebind with the saved functions
 apply() {
 	create
-	killall s30-uvc s30-uac 2>/dev/null
+	killall s30-uvc s30-uac s30-mdns 2>/dev/null
 	echo > $G/UDC 2>/dev/null
 	for f in $ORDER; do rm -f $G/configs/c.1/$(inst $f); done
 	any=
@@ -111,6 +111,8 @@ apply() {
 		ifconfig usb0 10.42.0.2 netmask 255.255.255.0 up
 		touch /tmp/udhcpd.leases
 		pidof udhcpd >/dev/null || busybox-extras udhcpd /etc/udhcpd.conf
+		# The host resolves s30.local to 10.42.0.2 (mDNS, A record only)
+		s30-mdns usb0 s30 </dev/null >>/tmp/s30-mdns.log 2>&1 &
 	fi
 	enabled audio && s30-uac </dev/null >>/tmp/s30-uac.log 2>&1 &
 	# The video function keeps the whole gadget off the bus until s30-uvc

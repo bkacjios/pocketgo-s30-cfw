@@ -268,7 +268,11 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
 - USB under Linux is a configfs composite gadget set up by `/etc/s30/rc`:
   ACM serial shell (`/dev/ttyACM*`) plus NCM networking (verified
   2026-10-29). Device 10.42.0.2, udhcpd hands the host 10.42.0.1 (no
-  router/DNS). `ssh root@10.42.0.2`, `scp`/`rsync` work (dropbear,
+  router/DNS). `s30-mdns` (utils/, started by `usb-gadget` with the network
+  function) answers mDNS A queries for `s30.local` on usb0, so
+  `ssh root@s30.local` works on Linux (systemd-resolved with MulticastDNS,
+  or avahi), macOS and Windows 10+ without host setup; `10.42.0.2` still
+  works. `ssh root@10.42.0.2`, `scp`/`rsync` work (dropbear,
   sftp-server, rsync); scp ~6 MB/s (83 MB rootfs in 14 s). First boot
   generates the host key (takes a while).
 - USB disk mode: hold SELECT at power on, or System menu > Settings > USB storage
