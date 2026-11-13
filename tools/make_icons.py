@@ -153,6 +153,28 @@ def ssb_title():
     return out
 
 
+def mm_title():
+    """Majora's Mask's title logo as En_Mag draws it once faded in: the mask,
+    the subtitle's shadow and text, the ZELDA logo and THE LEGEND OF
+    (src/overlays/actors/ovl_En_Mag/z_en_mag.c: positions, and the prim
+    colours the I8 textures are tinted with, their intensity as alpha)"""
+    def tinted(name, rgb):
+        i = Image.open(f"{MM}/{name}.i8.png").convert("L")
+        out = Image.new("RGBA", i.size, rgb + (255,))
+        out.putalpha(i)
+        return out
+
+    out = Image.new("RGBA", (320, 240))
+    mask = Image.open(f"{MM}/title_screen_majoras_mask.rgba32.png").convert("RGBA")
+    zelda = Image.open(f"{MM}/title_screen_zelda_logo.rgba32.png").convert("RGBA")
+    out.alpha_composite(mask, (124 - mask.width // 2, 103 - mask.height // 2))
+    out.alpha_composite(tinted("title_screen_majoras_mask_subtitle_mask", (0, 0, 0)), (151, 124))
+    out.alpha_composite(tinted("title_screen_majoras_mask_subtitle", (208, 102, 222)), (151, 124))
+    out.alpha_composite(zelda, (177 - zelda.width // 2, 105 - zelda.height // 2))
+    out.alpha_composite(tinted("title_screen_the_legend_of_text", (208, 102, 222)), (158, 71))
+    return out
+
+
 def fit(im, box=SIZE - 2 * PAD):
     """`im` scaled to fit a box, centred on a transparent SIZE x SIZE canvas"""
     im = im.convert("RGBA")
@@ -218,7 +240,7 @@ def main():
     if os.path.exists(OOT):
         icons["Ocarina of Time"] = fit(trim(Image.open(f"{OOT}/gTitleZeldaShieldLogoTex.rgba32.png")))
     if os.path.exists(MM):
-        icons["Majora's Mask"] = fit(trim(Image.open(f"{MM}/title_screen_majoras_mask.rgba32.png")))
+        icons["Majora's Mask"] = fit(trim(mm_title()))
     if os.path.exists(DKR):
         icons["Diddy Kong Racing"] = fit(trim(strip([f"{DKR}/title_{i}.png" for i in range(10)])))
     if os.path.exists(MK64):
