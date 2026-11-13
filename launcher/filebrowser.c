@@ -17,9 +17,11 @@
  * ELF binaries run directly (on exFAT every file looks executable, so the
  * file type decides). While an app runs the launcher releases the display
  * and waits for it. The app's output (stdout, stderr) goes to the launcher's
- * own (the frontend's log) and to the text console (tty1, cleared first),
- * which s30-display shows while no app holds the display: an app that only
- * prints is seen on screen. When it exits, the launcher comes straight back.
+ * own (the frontend's log). A launch script with a "# s30-console" line in
+ * its first lines also gets it on the text console (tty1), which
+ * s30-display shows while no app holds the display: an app that only prints
+ * is seen on screen. The console is cleared before every app, so no earlier
+ * text shows. When the app exits, the launcher comes straight back.
  *
  * Icons: an image next to an entry with the same name (Ocarina of Time.png
  * for Ocarina of Time.sh, Folder.png for Folder/) is its tile and is not
@@ -891,11 +893,32 @@ static void relay_output(const char* path, pid_t pid, int out, int tty) {
     }
 }
 
+#define CONSOLE_MARK "# s30-console"
+#define CONSOLE_MARK_LINES 10
+
+/* Whether the launch script asks for its output on the console: a line
+   CONSOLE_MARK among its first CONSOLE_MARK_LINES */
+static bool wants_console(const char* path) {
+    FILE* f = fopen(path, "r");
+    char line[256];
+    bool found = false;
+    int i;
+
+    for (i = 0; f != NULL && !found && i < CONSOLE_MARK_LINES && fgets(line, sizeof(line), f) != NULL; i++) {
+        line[strcspn(line, "\r\n")] = '\0';
+        found = strcmp(line, CONSOLE_MARK) == 0;
+    }
+    if (f != NULL) {
+        fclose(f);
+    }
+    return found;
+}
+
 static void run(const char* path) {
     const char* dot = strrchr(path, '.');
     bool script = dot != NULL && strcmp(dot, ".sh") == 0;
     char dir[PATH_MAX];
-    int pipefd[2], tty;
+    int pipefd[2] = { -1, -1 }, tty;
     pid_t pid;
 
     if (!script && !is_elf(path)) {
@@ -909,7 +932,8 @@ static void run(const char* path) {
     if (tty >= 0 && write(tty, "\033[H\033[2J", 7) < 0) {
         // not fatal
     }
-    if (pipe2(pipefd, O_CLOEXEC) != 0) {
+    // Output to the console too only when the script asks for it
+    if (script && tty >= 0 && wants_console(path) && pipe2(pipefd, O_CLOEXEC) != 0) {
         pipefd[0] = pipefd[1] = -1;
     }
     pid = fork();
