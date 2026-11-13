@@ -12,7 +12,9 @@ Usage: make_icons.py OUTDIR [SHOT_DIR]
 Needs Pillow. Run from the repository root.
 """
 import os
+import struct
 import sys
+import zlib
 
 from PIL import Image
 
@@ -23,12 +25,41 @@ OOT = "ports/oot/extracted/gc-us/assets/objects/object_mag"
 MM = "ports/mm/extracted/n64-us/assets/objects/object_mag"
 DKR = "ports/dkr/assets/.vanilla/us.v77/textures/2d/menu"
 MK64 = "ports/mk64/textures/standalone/logo_mario_kart_64.rgba32.png"  # the title screen's logo
+RS64_ROM = "ports/rogue_squadron64/rogue_squadron.z64"  # its title logo is backdrop/logo in the ROM's asset blob
 RETROARCH = "s30-build/rootfs/usr/share/libretro/assets/branding/retroarch-plain-logo.png"
 
 # Screenshot crops: app name -> (screenshot file, (left, top, right, bottom))
 SHOTS = {
-    "Rogue Squadron": ("Rogue Squadron title.png", (72, 20, 412, 236)),  # the logo, Luke and the X-wing, above START
 }
+
+
+def rs64_asset(rom, folder, name):
+    """A Rogue Squadron asset by folder and name: the blob at ROM 0x144340
+    (ports/rogue_squadron64/docs/data_blob), zlib unless stored raw"""
+    for seg in range(2):
+        base = 0x144380 + struct.unpack(">I", rom[0x144340 + seg * 0x20 + 0x1C:][:4])[0]
+        manifest_off, _, manifest_size = struct.unpack(">IHH", rom[base:base + 8])
+        entries = [rom[base + manifest_off + i * 0x20:][:0x20] for i in range(manifest_size // 0x20)]
+        current = None
+        for e in entries:
+            off, size, csize, flags = struct.unpack(">IIIB", e[:13])
+            ename = e[16:].split(b"\0")[0].decode("latin1")
+            if flags & 0x80:
+                current = ename
+            elif current == folder and ename == name:
+                data = rom[base + off:][:size if csize == 0xFFFFFFFF else csize]
+                return data if csize == 0xFFFFFFFF else zlib.decompress(data)
+    return None
+
+
+def rs64_ci8(data):
+    """A partial-header CI8 image (type 1): 12-byte header, 256 RGBA
+    colours, then the pixels"""
+    w, h = struct.unpack(">HH", data[4:8])
+    pal = [tuple(data[12 + i * 4:16 + i * 4]) for i in range(256)]
+    im = Image.new("RGBA", (w, h))
+    im.putdata([pal[p] for p in data[12 + 1024:12 + 1024 + w * h]])
+    return im
 
 
 def fit(im, box=SIZE - 2 * PAD):
@@ -85,6 +116,10 @@ def main():
         icons["Diddy Kong Racing"] = fit(trim(strip([f"{DKR}/title_{i}.png" for i in range(10)])))
     if os.path.exists(MK64):
         icons["Mario Kart 64"] = fit(trim(Image.open(MK64)))
+    if os.path.exists(RS64_ROM):
+        logo = rs64_asset(open(RS64_ROM, "rb").read(), "backdrop", "logo")
+        if logo is not None:
+            icons["Rogue Squadron"] = fit(trim(rs64_ci8(logo)))
     if os.path.exists(RETROARCH):
         logo = Image.open(RETROARCH).crop((0, 0, 460, 330))  # the invader, not the wordmark or its rule
         icons["RetroArch"] = fit(trim(logo))
