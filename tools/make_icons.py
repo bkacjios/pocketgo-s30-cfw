@@ -4,7 +4,7 @@ the ports' extracted game assets and from title-screen screenshots. The art
 is the games' own, so the icons live on the card (/mnt/sd/apps/NAME.png,
 beside NAME.sh), not in this repository.
 
-Usage: make_icons.py OUTDIR [SHOT_DIR]
+Usage: [AM2R_APK=am2r.apk] make_icons.py OUTDIR [SHOT_DIR]
   OUTDIR    where the PNGs go (copy them to /mnt/sd/apps)
   SHOT_DIR  screenshots (s30-screenshot, 480x320) for the games whose logo
             is not a texture: NAME.png per entry in SHOTS, cropped by box
@@ -14,6 +14,7 @@ Needs Pillow. Run from the repository root.
 import os
 import struct
 import sys
+import zipfile
 import zlib
 
 from PIL import Image
@@ -28,6 +29,7 @@ MK64 = "ports/mk64/textures/standalone/logo_mario_kart_64.rgba32.png"  # the tit
 RS64_ROM = "ports/rogue_squadron64/rogue_squadron.z64"  # its title logo is backdrop/logo in the ROM's asset blob
 SF64_ROM = "ports/sf64/baserom.us.rev1.uncompressed.z64"  # title logo in ast_title (assets/yaml/us/rev1/ast_title.yaml)
 TMC_ROM = "ports/tmc/baserom.gba"  # USA; its title logo is the title-screen object's sprite frames
+AM2R_APK = os.environ.get("AM2R_APK", "")  # AM2RLauncher's APK (on the card: /mnt/sd/home/ports/am2r/am2r.apk)
 ES = "external/emulationstation/resources/window_icon_256.png"  # its window and desktop icon
 RETROARCH = "s30-build/rootfs/usr/share/libretro/assets/branding/retroarch-plain-logo.png"
 
@@ -195,6 +197,9 @@ def main():
         icons["Star Fox 64"] = fit(sf64_title(open(SF64_ROM, "rb").read()))
     if os.path.exists(TMC_ROM):
         icons["The Minish Cap"] = fit(trim(tmc_title(open(TMC_ROM, "rb").read())))
+    if AM2R_APK and os.path.exists(AM2R_APK):
+        with zipfile.ZipFile(AM2R_APK) as apk, apk.open("res/drawable-xxxhdpi-v4/icon.png") as f:
+            icons["AM2R"] = fit(trim(Image.open(f)))  # the Android app icon
     if os.path.exists(ES):
         icons["EmulationStation"] = fit(trim(Image.open(ES)))
     if os.path.exists(RETROARCH):
