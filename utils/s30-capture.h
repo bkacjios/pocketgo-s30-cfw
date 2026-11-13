@@ -35,7 +35,7 @@ typedef struct {
 	uint32_t crtc; // the panel's CRTC
 } S30Capture;
 
-static uint64_t s30_capture_prop(int fd, uint32_t plane, const char* name, uint64_t def) {
+static inline uint64_t s30_capture_prop(int fd, uint32_t plane, const char* name, uint64_t def) {
 	drmModeObjectProperties* props = drmModeObjectGetProperties(fd, plane, DRM_MODE_OBJECT_PLANE);
 	uint64_t v = def;
 	uint32_t i;
@@ -53,7 +53,7 @@ static uint64_t s30_capture_prop(int fd, uint32_t plane, const char* name, uint6
 }
 
 /* The display card (the GPU has its own) and its active CRTC; -1 if none */
-static int s30_capture_open(S30Capture* c) {
+static inline int s30_capture_open(S30Capture* c) {
 	drmModeRes* res = NULL;
 	int i;
 
@@ -109,7 +109,7 @@ typedef struct {
 } S30CapturePlane;
 
 /* A plane's buffer and geometry, mapped; -1 if it can't be read */
-static int s30_capture_prepare(int fd, uint32_t plane, S30CapturePlane* p) {
+static inline int s30_capture_prepare(int fd, uint32_t plane, S30CapturePlane* p) {
 	drmModePlane* pl = drmModeGetPlane(fd, plane);
 	drmModeFB2* fb;
 	struct drm_mode_map_dumb map = { 0 };
@@ -178,7 +178,7 @@ static int s30_capture_prepare(int fd, uint32_t plane, S30CapturePlane* p) {
 /* The visible rows out of the buffer, as fast as it reads: plain memcpy is
    the fastest from write-combined memory here, all rows at once when they
    are contiguous */
-static int s30_capture_copy(S30CapturePlane* p) {
+static inline int s30_capture_copy(S30CapturePlane* p) {
 	size_t row = (size_t)p->rowPx * p->bpp, need = row * (size_t)(p->ch > 0 ? p->ch : 0);
 	const uint8_t* src = p->mem + p->offset + (size_t)p->sy * p->pitch + (size_t)p->sx * p->bpp;
 	int y;
@@ -206,7 +206,7 @@ static int s30_capture_copy(S30CapturePlane* p) {
 }
 
 /* The copied rows blended into `screen` (panel layout, 0xRRGGBB) */
-static void s30_capture_blend(const S30CapturePlane* p, uint32_t* screen) {
+static inline void s30_capture_blend(const S30CapturePlane* p, uint32_t* screen) {
 	int x, y;
 
 	for (y = 0; y < p->ch; y++) {
@@ -249,7 +249,7 @@ static void s30_capture_blend(const S30CapturePlane* p, uint32_t* screen) {
    lookups done before it: a buffer an app has just flipped to is then on
    screen (rendered), and stays there for at least the panel's frame, while
    the copy, a few ms, runs. */
-static int s30_capture(const S30Capture* c, int gameOnly, int vsync, uint32_t* screen) {
+static inline int s30_capture(const S30Capture* c, int gameOnly, int vsync, uint32_t* screen) {
 	static S30CapturePlane planes[16];
 	drmModePlaneRes* res = drmModeGetPlaneResources(c->fd);
 	uint32_t order[16];

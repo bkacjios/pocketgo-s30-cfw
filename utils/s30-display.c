@@ -87,6 +87,7 @@
 
 #include "osd_button.h"
 #include "osd_font.h"
+#include "s30-capture.h"
 #include "s30-frames.h"
 
 #define SOCKET_PATH "/run/s30-display.sock"
@@ -1510,6 +1511,157 @@ static void menu_close(int exitApp) {
 	}
 }
 
+/* ---------------------------------------------------------------------------
+ * Screenshot animation, over the app (still stopped under the menu): a white
+ * flash over the captured frame, which then lifts off as a sheet of paper
+ * (a white border, a soft shadow, the screen dimmed behind it), tilts, and
+ * flies off to the bottom right as if filed away
+ * ------------------------------------------------------------------------- */
+
+#define SHOT_FLASH_MS 150
+#define SHOT_LIFT_MS 280
+#define SHOT_HOLD_MS 200
+#define SHOT_FLY_MS 340
+#define SHOT_SCALE 0.46f // the paper's size held, of the screen
+#define SHOT_BORDER 6.0f // the paper's white margin, screen pixels
+#define SHOT_PAPER 0xf6f4ee
+
+/* Straight-alpha "over" into the overlay buffer */
+static void over(int x, int y, uint32_t rgb, float a) {
+	uint32_t* p;
+	float da, oa;
+
+	if (a <= 0.0f || x < 0 || x >= BUF_W || y < 0 || y >= BUF_H) {
+		return;
+	}
+	a = a > 1.0f ? 1.0f : a;
+	p = &sBack[(BUF_W - 1 - x) * BUF_H + y];
+	da = (float)(*p >> 24) / 255.0f;
+	oa = a + da * (1.0f - a);
+	*p = (uint32_t)(oa * 255.0f + 0.5f) << 24 |
+	     mix(rgb, *p & 0xffffff, oa > 0.0f ? a / oa : 1.0f);
+}
+
+/* The frame (panel layout, 0xRRGGBB) at landscape (u, v), bilinear */
+static uint32_t shot_sample(const uint32_t* panel, float u, float v) {
+	int x0, y0, x1, y1, c, i;
+	float fx, fy;
+	uint32_t out = 0, p[4];
+
+	u = u < 0.0f ? 0.0f : u > BUF_W - 1 ? BUF_W - 1 : u;
+	v = v < 0.0f ? 0.0f : v > BUF_H - 1 ? BUF_H - 1 : v;
+	x0 = (int)u;
+	y0 = (int)v;
+	x1 = x0 + 1 < BUF_W ? x0 + 1 : x0;
+	y1 = y0 + 1 < BUF_H ? y0 + 1 : y0;
+	fx = u - x0;
+	fy = v - y0;
+	// landscape (x, y) is panel (y, 479 - x)
+	p[0] = panel[(PANEL_H - 1 - x0) * PANEL_W + y0];
+	p[1] = panel[(PANEL_H - 1 - x1) * PANEL_W + y0];
+	p[2] = panel[(PANEL_H - 1 - x0) * PANEL_W + y1];
+	p[3] = panel[(PANEL_H - 1 - x1) * PANEL_W + y1];
+	for (c = 0; c < 24; c += 8) {
+		float ch[4];
+
+		for (i = 0; i < 4; i++) {
+			ch[i] = (float)((p[i] >> c) & 0xff);
+		}
+		out |= (uint32_t)((ch[0] * (1 - fx) + ch[1] * fx) * (1 - fy) + (ch[2] * (1 - fx) + ch[3] * fx) * fy + 0.5f) << c;
+	}
+	return out;
+}
+
+/* The paper: the frame at `scale` (of the screen), turned by `angle`
+   (radians) around (cx, cy), with its margin and shadow, at opacity `alpha` */
+static void shot_paper(const uint32_t* panel, float cx, float cy, float scale, float angle, float alpha) {
+	const float lift = fminf(1.0f, (1.0f - scale) / (1.0f - SHOT_SCALE)); // the margin grows in as it lifts
+	const float hw = BUF_W * 0.5f * scale, hh = BUF_H * 0.5f * scale, b = SHOT_BORDER * lift;
+	const float pw = hw + b, ph = hh + b, ca = cosf(angle), sa = sinf(angle);
+	const float shx = 7.0f, shy = 9.0f, soft = 10.0f; // shadow offset and blur, screen pixels
+	const float reach = sqrtf(pw * pw + ph * ph) + soft + 10.0f;
+	int x, y, x0 = (int)(cx - reach), x1 = (int)(cx + reach), y0 = (int)(cy - reach), y1 = (int)(cy + reach);
+
+	for (y = y0 < 0 ? 0 : y0; y <= y1 && y < BUF_H; y++) {
+		for (x = x0 < 0 ? 0 : x0; x <= x1 && x < BUF_W; x++) {
+			// Into the paper's frame (unrotated, centred), for the shadow and the paper
+			float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
+			float u = dx * ca + dy * sa, v = -dx * sa + dy * ca;
+			float sdx = dx - shx, sdy = dy - shy;
+			float su = sdx * ca + sdy * sa, sv = -sdx * sa + sdy * ca;
+			float sd = fmaxf(fabsf(su) - pw, fabsf(sv) - ph); // outside the shadow's rect (>0)
+			float pd = fmaxf(fabsf(u) - pw, fabsf(v) - ph);   // outside the paper (>0)
+			float cover;
+
+			if (sd < soft) {
+				float a = 0.45f * (sd <= 0.0f ? 1.0f : 1.0f - sd / soft);
+				over(x, y, 0x000000, a * a / 0.45f * alpha);
+			}
+			cover = 0.5f - pd; // one pixel of anti-aliasing at the edge
+			if (cover <= 0.0f) {
+				continue;
+			}
+			cover = cover > 1.0f ? 1.0f : cover;
+			if (fabsf(u) < hw && fabsf(v) < hh) {
+				over(x, y, shot_sample(panel, BUF_W * 0.5f + u / scale, BUF_H * 0.5f + v / scale), cover * alpha);
+			} else {
+				over(x, y, SHOT_PAPER, cover * alpha);
+			}
+		}
+	}
+}
+
+static float ease_out(float t) {
+	return 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
+}
+
+static float ease_in(float t) {
+	return t * t * t;
+}
+
+/* The whole overlay one colour (ARGB) */
+static void shot_clear(uint32_t argbColour) {
+	int i;
+
+	for (i = 0; i < BUF_W * BUF_H; i++) {
+		sBack[i] = argbColour;
+	}
+}
+
+/* The animation, frame by frame at the panel's rate (timed by the clock, so
+   a slow frame skips ahead); the overlay ends clear */
+static void shot_animate(const uint32_t* panel) {
+	const uint64_t start = now_ms();
+	const int total = SHOT_FLASH_MS + SHOT_LIFT_MS + SHOT_HOLD_MS + SHOT_FLY_MS;
+	int t;
+
+	while ((t = (int)(now_ms() - start)) < total) {
+		if (t < SHOT_FLASH_MS) { // the frame full screen (the buffer's layout is the frame's), a white flash fading
+			float f = 1.0f - (float)t / SHOT_FLASH_MS;
+			int i;
+
+			for (i = 0; i < BUF_W * BUF_H; i++) {
+				sBack[i] = 0xff000000 | mix(0xffffff, panel[i], f * f);
+			}
+		} else if (t < SHOT_FLASH_MS + SHOT_LIFT_MS + SHOT_HOLD_MS) { // lifts off and tilts
+			float k = ease_out(fminf(1.0f, (float)(t - SHOT_FLASH_MS) / SHOT_LIFT_MS));
+
+			shot_clear(argb(0x000000, 0.45f * k));
+			shot_paper(panel, BUF_W * 0.5f, BUF_H * 0.5f - 6.0f * k, 1.0f - (1.0f - SHOT_SCALE) * k,
+			           -0.10f * k, 1.0f);
+		} else { // flies off to the bottom right, turning, the dimming going
+			float k = ease_in((float)(t - SHOT_FLASH_MS - SHOT_LIFT_MS - SHOT_HOLD_MS) / SHOT_FLY_MS);
+
+			shot_clear(argb(0x000000, 0.45f * (1.0f - k)));
+			shot_paper(panel, BUF_W * 0.5f + 360.0f * k, BUF_H * 0.5f - 6.0f + 260.0f * k,
+			           SHOT_SCALE * (1.0f - 0.35f * k), -0.10f + 0.55f * k, 1.0f - 0.3f * k);
+		}
+		present_synced();
+	}
+	shot_clear(0);
+	present_synced();
+}
+
 /* The game's picture (its primary plane, without the OSD or the menu) as
    /mnt/sd/screenshots/<app>-NNNN.png, numbered after the highest one there
    (no RTC: the clock restarts at 1970 every boot). The app is stopped under
@@ -1548,13 +1700,23 @@ static void take_screenshot(void) {
 		closedir(d);
 	}
 	snprintf(path, sizeof(path), "%s/%s-%04d.png", kDir, app, next);
-	pid = fork();
-	if (pid == 0) {
-		execlp("s30-screenshot", "s30-screenshot", "-g", path, (char*)NULL);
-		_exit(127);
-	}
-	if (pid > 0) {
-		waitpid(pid, NULL, 0);
+	{
+		// The frame for the animation, read here; s30-screenshot reads its
+		// own and writes the file meanwhile (the app is stopped, the frame
+		// can't change), done before the menu lets the app go on
+		static uint32_t frame[PANEL_W * PANEL_H];
+		const S30Capture cap = { sFd, sCrtc };
+
+		s30_capture(&cap, 1, 0, frame);
+		pid = fork();
+		if (pid == 0) {
+			execlp("s30-screenshot", "s30-screenshot", "-g", path, (char*)NULL);
+			_exit(127);
+		}
+		shot_animate(frame);
+		if (pid > 0) {
+			waitpid(pid, NULL, 0);
+		}
 	}
 	fprintf(stderr, "s30-display: screenshot %s\n", path);
 }
