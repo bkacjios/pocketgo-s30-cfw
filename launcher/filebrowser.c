@@ -22,7 +22,8 @@
  * for Ocarina of Time.sh, Folder.png for Folder/) is its tile and is not
  * listed itself. Other images (png, jpg, bmp) are listed as thumbnails and
  * open in the viewer: left/right step through the folder's images, B goes
- * back.
+ * back. In Screenshots (and its viewer) X deletes the picture, after a
+ * confirmation (A delete, B cancel).
  */
 #include <dirent.h>
 #include <errno.h>
@@ -577,9 +578,40 @@ static void draw_header(const char* title) {
     ui_fill((SDL_Rect){ 8, HEADER_H - 1, SCRW - 16, 1 }, kLine);
 }
 
+/* Screenshots (not Files) with a picture selected: X deletes it */
+static bool can_delete(void) {
+    return !sBrowsing && strcmp(sDir.path, SHOTS_DIR) == 0 && sDir.count > 0 &&
+           sDir.entries[sDir.selected].kind == K_IMAGE;
+}
+
+static bool sConfirm; // "Delete ...?" is up (A deletes, B cancels)
+
+/* The confirmation, a box over whatever is drawn */
+static void draw_confirm(void) {
+    const Entry* e = &sDir.entries[sDir.selected];
+    const SDL_Rect box = { SCRW / 2 - 150, SCRH / 2 - 44, 300, 88 };
+    char text[NAME_MAX + 16];
+    int x = box.x + 20, w;
+
+    ui_fill((SDL_Rect){ 0, 0, SCRW, SCRH }, (SDL_Color){ 0, 0, 0, 120 });
+    ui_fill(box, kTile);
+    ui_box(box, kSelectedEdge, 2);
+    snprintf(text, sizeof(text), "Delete %s?", e->name);
+    w = ui_text_width(text);
+    w = w > box.w - 24 ? box.w - 24 : w;
+    ui_text(text, UI_TEXT, box.x + (box.w - w) / 2, box.y + 18, box.w - 24);
+    ui_button(kLetterA, x, box.y + 54);
+    x += BUTTON_SIZE + 5;
+    ui_text("Delete", UI_TEXT, x, box.y + 53, SCRW);
+    x += ui_text_width("Delete") + 20;
+    ui_button(kLetterB, x, box.y + 54);
+    x += BUTTON_SIZE + 5;
+    ui_text("Cancel", UI_DIM, x, box.y + 53, SCRW);
+}
+
 /* "(A) action   (B) Back" (where B goes somewhere: not home, not / in
-   Files), in Files "(X) Exit", then "(Y) List" or "(Y) Tiles" at the left;
-   `name` right-aligned */
+   Files), in Files "(X) Exit" (in Screenshots "(X) Delete"), then "(Y)
+   List" or "(Y) Tiles" at the left; `name` right-aligned */
 static void draw_footer(const char* action, const char* name) {
     const int ty = FOOTER_Y + 3, by = FOOTER_Y + 4;
     int x = 12;
@@ -602,6 +634,11 @@ static void draw_footer(const char* action, const char* name) {
         x += BUTTON_SIZE + 5;
         ui_text("Exit", UI_DIM, x, ty, SCRW);
         x += ui_text_width("Exit") + 14;
+    } else if (can_delete()) {
+        ui_button(kLetterX, x, by);
+        x += BUTTON_SIZE + 5;
+        ui_text("Delete", UI_DIM, x, ty, SCRW);
+        x += ui_text_width("Delete") + 14;
     }
     ui_button(kLetterY, x, by);
     x += BUTTON_SIZE + 5;
@@ -687,6 +724,9 @@ static void render_dir(void) {
                 : sDir.entries[sDir.selected].kind == K_IMAGE ? "View"
                                                               : "Run",
                 name);
+    if (sConfirm) {
+        draw_confirm();
+    }
     ui_present();
     if (more) {
         render_dir();
@@ -755,7 +795,42 @@ static void render_view(void) {
     ui_text(e->name, UI_TEXT, 10, SCRH - 19, SCRW - 90);
     snprintf(pos, sizeof(pos), "%d/%d", at, n);
     ui_text(pos, UI_DIM, SCRW - 10 - ui_text_width(pos), SCRH - 19, 80);
+    if (can_delete()) {
+        int x = SCRW - 10 - ui_text_width(pos) - 16 - ui_text_width("Delete");
+        ui_text("Delete", UI_DIM, x, SCRH - 19, SCRW);
+        ui_button(kLetterX, x - 5 - BUTTON_SIZE, SCRH - 18);
+    }
+    if (sConfirm) {
+        draw_confirm();
+    }
     ui_present();
+}
+
+/* Deletes the selected screenshot; the one after it (or before, at the end)
+   is selected, and shown if the viewer is open (closed when none is left) */
+static void delete_selected(void) {
+    const Entry* e = &sDir.entries[sDir.selected];
+    char next[NAME_MAX + 1] = "";
+
+    if (sDir.selected + 1 < sDir.count) {
+        snprintf(next, sizeof(next), "%s", sDir.entries[sDir.selected + 1].name);
+    } else if (sDir.selected > 0) {
+        snprintf(next, sizeof(next), "%s", sDir.entries[sDir.selected - 1].name);
+    }
+    if (unlink(e->path) != 0) {
+        fprintf(stderr, "launcher: delete %s: %s\n", e->path, strerror(errno));
+        return;
+    }
+    sync();
+    printf("launcher: deleted %s\n", e->path);
+    dir_open(SHOTS_DIR, next[0] ? next : NULL);
+    if (sView.open) {
+        if (sDir.count > 0 && sDir.entries[sDir.selected].kind == K_IMAGE) {
+            view_open();
+        } else {
+            view_close();
+        }
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -910,7 +985,19 @@ int main(int argc, char** argv) {
             repeat = true;
         }
 
-        if (sView.open) {
+        if (sConfirm) { // only A or B
+            if (a && !prevA) {
+                sConfirm = false;
+                delete_selected();
+                dirty = true;
+            } else if (b && !prevB) {
+                sConfirm = false;
+                dirty = true;
+            }
+        } else if (xb && !prevX && can_delete()) {
+            sConfirm = true;
+            dirty = true;
+        } else if (sView.open) {
             if (repeat && dx != 0) {
                 int i = view_step(dx);
                 if (i >= 0) {
