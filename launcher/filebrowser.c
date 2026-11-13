@@ -591,7 +591,9 @@ static void draw_confirm(void) {
     const Entry* e = &sDir.entries[sDir.selected];
     const SDL_Rect box = { SCRW / 2 - 150, SCRH / 2 - 44, 300, 88 };
     char text[NAME_MAX + 16];
-    int x = box.x + 20, w;
+    // "(A) Delete   (B) Cancel", centred under the question
+    const int hintsW = 2 * (BUTTON_SIZE + 5) + ui_text_width("Delete") + 20 + ui_text_width("Cancel");
+    int x = box.x + (box.w - hintsW) / 2, w;
 
     ui_fill((SDL_Rect){ 0, 0, SCRW, SCRH }, (SDL_Color){ 0, 0, 0, 120 });
     ui_fill(box, kTile);
