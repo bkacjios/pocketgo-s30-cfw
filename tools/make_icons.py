@@ -22,6 +22,7 @@ PAD = 4
 OOT = "ports/oot/extracted/gc-us/assets/objects/object_mag"
 MM = "ports/mm/extracted/n64-us/assets/objects/object_mag"
 DKR = "ports/dkr/assets/.vanilla/us.v77/textures/2d/menu"
+MK64 = "ports/mk64/textures/standalone/logo_mario_kart_64.rgba32.png"  # the title screen's logo
 RETROARCH = "s30-build/rootfs/usr/share/libretro/assets/branding/retroarch-plain-logo.png"
 
 # Screenshot crops: app name -> (screenshot file, (left, top, right, bottom))
@@ -81,6 +82,8 @@ def main():
         icons["Majora's Mask"] = fit(trim(Image.open(f"{MM}/title_screen_majoras_mask.rgba32.png")))
     if os.path.exists(DKR):
         icons["Diddy Kong Racing"] = fit(trim(strip([f"{DKR}/title_{i}.png" for i in range(10)])))
+    if os.path.exists(MK64):
+        icons["Mario Kart 64"] = fit(trim(Image.open(MK64)))
     if os.path.exists(RETROARCH):
         logo = Image.open(RETROARCH).crop((0, 0, 460, 330))  # the invader, not the wordmark or its rule
         icons["RetroArch"] = fit(trim(logo))
