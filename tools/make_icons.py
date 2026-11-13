@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launcher icons (128x128 PNG, transparent) for the apps on the card, from
+"""Launcher icons (PNG, transparent, the logo's own shape, 160 px on its long side) for the apps on the card, from
 the ports' extracted game assets and from title-screen screenshots. The art
 is the games' own, so the icons live on the card (/mnt/sd/apps/NAME.png,
 beside NAME.sh), not in this repository.
@@ -19,8 +19,7 @@ import zlib
 
 from PIL import Image
 
-SIZE = 128
-PAD = 4
+SIZE = 160  # the launcher decodes icons to at most this (THUMB_DIM)
 
 OOT = "ports/oot/extracted/gc-us/assets/objects/object_mag"
 MM = "ports/mm/extracted/n64-us/assets/objects/object_mag"
@@ -195,15 +194,14 @@ def mm_title():
     return out
 
 
-def fit(im, box=SIZE - 2 * PAD):
-    """`im` scaled to fit a box, centred on a transparent SIZE x SIZE canvas"""
+def fit(im):
+    """`im` scaled to SIZE on its long side, no padding (the launcher fits it
+    into the tile)"""
     im = im.convert("RGBA")
-    scale = min(box / im.width, box / im.height)
+    scale = SIZE / max(im.width, im.height)
     if scale != 1:
         im = im.resize((max(1, round(im.width * scale)), max(1, round(im.height * scale))), Image.LANCZOS)
-    out = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
-    out.alpha_composite(im, ((SIZE - im.width) // 2, (SIZE - im.height) // 2))
-    return out
+    return im
 
 
 def trim(im):

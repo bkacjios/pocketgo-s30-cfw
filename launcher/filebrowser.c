@@ -63,7 +63,7 @@
 #define PITCH_Y 124
 #define GRID_X ((SCRW - (COLS * PITCH_X - (PITCH_X - TILE_W))) / 2)
 #define GRID_Y 40
-#define ICON_BOX 72  // the icon's square inside a tile (thumbnails: the tile's width)
+#define ICON_BOX 72  // the built-in icons' square inside a tile (pictures: the tile's width)
 #define LABEL_COLS ((TILE_W - 8) / UI_CHAR_W) // label lines of 12 characters
 #define THUMB_DIM 160 // thumbnails are decoded to at most this (2x the box)
 #define LOADS_PER_FRAME 2
@@ -547,8 +547,10 @@ static void draw_label(const char* text, SDL_Color color, int x, int y) {
 
 static void draw_tile(const Entry* e, int x, int y, bool selected) {
     const SDL_Rect tile = { x, y, TILE_W, TILE_H };
-    const SDL_Rect iconBox = e->kind == K_IMAGE ? (SDL_Rect){ x + 4, y + 6, TILE_W - 8, ICON_BOX }
-                                                : (SDL_Rect){ x + (TILE_W - ICON_BOX) / 2, y + 6, ICON_BOX, ICON_BOX };
+    // Pictures (thumbnails and icon images) get the tile's width; the
+    // built-in icons a square
+    const SDL_Rect iconBox = e->icon != NULL ? (SDL_Rect){ x + 4, y + 6, TILE_W - 8, ICON_BOX }
+                                             : (SDL_Rect){ x + (TILE_W - ICON_BOX) / 2, y + 6, ICON_BOX, ICON_BOX };
     char label[NAME_MAX + 1];
 
     ui_fill(tile, kTile);
