@@ -1584,8 +1584,31 @@ static uint32_t shot_sample(const uint32_t* panel, float u, float v) {
 	return out;
 }
 
+/* The frame around landscape (u, v) for a screen pixel `step` frame pixels
+   wide: shrunk below ~3/4, four bilinear samples (a quarter pixel each way)
+   averaged, so the picture doesn't shimmer as it scales down */
+static uint32_t shot_area(const uint32_t* panel, float u, float v, float step) {
+	uint32_t s[4], out = 0;
+	float d = step * 0.25f;
+	int c;
+
+	if (step < 1.33f) {
+		return shot_sample(panel, u, v);
+	}
+	s[0] = shot_sample(panel, u - d, v - d);
+	s[1] = shot_sample(panel, u + d, v - d);
+	s[2] = shot_sample(panel, u - d, v + d);
+	s[3] = shot_sample(panel, u + d, v + d);
+	for (c = 0; c < 24; c += 8) {
+		out |= ((((s[0] >> c) & 0xff) + ((s[1] >> c) & 0xff) + ((s[2] >> c) & 0xff) + ((s[3] >> c) & 0xff) + 2) / 4) << c;
+	}
+	return out;
+}
+
 /* The paper: the frame at `scale` (of the screen), turned by `angle`
-   (radians) around (cx, cy), with its margin and shadow, at opacity `alpha` */
+   (radians) around (cx, cy), with its margin and shadow, at opacity `alpha`.
+   Both edges anti-aliased by a pixel's coverage: the paper's against what is
+   behind it, the picture's against the margin. */
 static void shot_paper(const uint32_t* panel, float cx, float cy, float scale, float angle, float alpha) {
 	const float lift = fminf(1.0f, (1.0f - scale) / (1.0f - SHOT_SCALE)); // the margin grows in as it lifts
 	const float hw = BUF_W * 0.5f * scale, hh = BUF_H * 0.5f * scale, b = SHOT_BORDER * lift;
@@ -1603,7 +1626,9 @@ static void shot_paper(const uint32_t* panel, float cx, float cy, float scale, f
 			float su = sdx * ca + sdy * sa, sv = -sdx * sa + sdy * ca;
 			float sd = fmaxf(fabsf(su) - pw, fabsf(sv) - ph); // outside the shadow's rect (>0)
 			float pd = fmaxf(fabsf(u) - pw, fabsf(v) - ph);   // outside the paper (>0)
-			float cover;
+			float id = fmaxf(fabsf(u) - hw, fabsf(v) - hh);   // outside the picture (>0)
+			float cover, pic;
+			uint32_t colour = SHOT_PAPER;
 
 			if (sd < soft) {
 				float a = 0.45f * (sd <= 0.0f ? 1.0f : 1.0f - sd / soft);
@@ -1614,11 +1639,16 @@ static void shot_paper(const uint32_t* panel, float cx, float cy, float scale, f
 				continue;
 			}
 			cover = cover > 1.0f ? 1.0f : cover;
-			if (fabsf(u) < hw && fabsf(v) < hh) {
-				over(x, y, shot_sample(panel, BUF_W * 0.5f + u / scale, BUF_H * 0.5f + v / scale), cover * alpha);
-			} else {
-				over(x, y, SHOT_PAPER, cover * alpha);
+			pic = 0.5f - id;
+			pic = pic < 0.0f ? 0.0f : pic > 1.0f ? 1.0f : pic;
+			if (b < 1.0f) {
+				pic += (1.0f - pic) * (1.0f - b); // no margin yet: no white seam at the edge
 			}
+			if (pic > 0.0f) {
+				colour = mix(shot_area(panel, BUF_W * 0.5f + u / scale, BUF_H * 0.5f + v / scale, 1.0f / scale),
+				             SHOT_PAPER, pic);
+			}
+			over(x, y, colour, cover * alpha);
 		}
 	}
 }
