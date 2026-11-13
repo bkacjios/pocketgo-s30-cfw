@@ -27,6 +27,7 @@ RETROARCH = "s30-build/rootfs/usr/share/libretro/assets/branding/retroarch-plain
 
 # Screenshot crops: app name -> (screenshot file, (left, top, right, bottom))
 SHOTS = {
+    "Rogue Squadron": ("Rogue Squadron title.png", (72, 20, 412, 236)),  # the logo, Luke and the X-wing, above START
 }
 
 
