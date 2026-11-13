@@ -50,7 +50,7 @@ CONFIG_AXP_DISABLE_BOOT_ON_POWERON=y
 # became a ~730 ns system call). Nothing here uses KVM.
 CONFIG_EXPERT=y
 # CONFIG_ARMV7_VIRT is not set
-# Boot flash (Zbit ZB25VQ64, 8 MiB, SPI0; patch 0004). The same binary boots
+# Boot flash (Zbit ZB25VQ64, 8 MiB, SPI0; patch 0005). The same binary boots
 # from the SD card (8 KiB) or from flash offset 0 (U-Boot proper at 0x8000).
 # Flash boot (BROM finds no U-Boot on the card): spi_booted is set, and the
 # FIT at 0xc0000 (build.sh flash) is read and its script runs. If that fails,

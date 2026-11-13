@@ -675,17 +675,29 @@ about twice as long per MB. A card with U-Boot at 8 KiB still takes priority.
   splitting into p0..p4 (384/128/7296/128/256 KiB).
 - `build.sh flash` -> `out/spi-nor.bin`: U-Boot+SPL @0, FIT @0xc0000
   (`build/flash.its`: XZ zImage, DTB, initramfs, `flash.cmd`), logo BMP
-  @0x780000. U-Boot patches 0004 (A33 SPL SPI boot, zb25vq64,
-  `spi_booted`), 0005 (display up even without a splash image: the panel
-  handoff needs it), 0006 (logo from flash, else the card; header checked:
+  @0x780000. U-Boot patches 0005 (A33 SPL SPI boot, zb25vq64,
+  `spi_booted`), 0006 (display up even without a splash image: the panel
+  handoff needs it), 0007 (logo from flash, else the card; header checked:
   erased flash reads size 0xffffffff, which wrapped U-Boot's size check and
   hung it reading 4 GB). U-Boot's own A23/A33 dtsi has spi0 (disabled),
   Linux's does not.
 - Verified over FEL with the card out (2026-11-12): FIT boot from RAM,
   `sf probe`/`sf read`, no-card screen, card hot insert.
-- `s30-flash write|verify|read` (utils/s30-flash.c, in the rootfs): writes
-  only changed erase blocks, block 0 (eGON header) erased first and written
-  last, read back. Images must be flash-sized with a valid eGON checksum.
+- `s30-flash restore` writes `/mnt/sd/boot/spi-nor-stock.bin` back. `write`
+  saves the flash there first when it holds a boot image that is not ours
+  (no FIT at 0xc0000) and the file does not exist yet. This unit's copy
+  came from firmware-backup/ (sha256 371bab3f...).
+- `s30-flash write|verify|read` (launcher/flash.c, with ui.c; in the
+  rootfs): writes only changed erase blocks, block 0 (eGON header) erased
+  first and written last, read back. Images must be flash-sized with a
+  valid eGON checksum. `write` shows a window (progress bar, result, any
+  button exits); from ssh it stops the frontend for that and continues it
+  after. Reads go in 64 KiB pieces: one 4 MiB SPI transfer (PIO, no DMA)
+  timed out while the window started. s30-display treats it like the
+  launcher (no FPS overlay, no Exit in the menu).
+- Launcher: app output goes to the log; a launch script with a
+  `# s30-console` line (first 10 lines) also gets it on tty1, which
+  s30-display shows whenever no app holds the display.
 - FEL without adb: set the boot0 flag from Linux (`printf
   "\x5a\xa5\xa5\x5a" | dd of=/sys/bus/nvmem/devices/nvmem0/nvmem bs=4
   seek=2 count=1 conv=notrunc`; byte writes are ignored), power off, card

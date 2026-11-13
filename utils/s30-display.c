@@ -1447,6 +1447,8 @@ static int open_input(const char* name) {
 	return -1;
 }
 
+/* The launcher, or s30-flash (system UI too: no performance overlay, and the
+   menu opens on the system page, without Exit) */
 static int is_launcher(pid_t pid) {
 	char path[32], comm[32] = "";
 	FILE* f;
@@ -1459,7 +1461,7 @@ static int is_launcher(pid_t pid) {
 		}
 		fclose(f);
 	}
-	return strncmp(comm, "s30-launcher", 12) == 0;
+	return strncmp(comm, "s30-launcher", 12) == 0 || strncmp(comm, "s30-flash", 9) == 0;
 }
 
 static void menu_open(void) {

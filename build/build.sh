@@ -233,7 +233,7 @@ ensure_sysroot() {
 
 # Device programs. The launcher (launcher/): filebrowser.c, the boot UI that
 # starts RetroArch, OoT and other apps (a tile grid with icons, an image
-# viewer), with ui.c. SDL2 (KMS), text in utils/osd_font.h, images through
+# viewer), and flash.c (s30-flash, the boot flash writer), with ui.c. SDL2 (KMS), text in utils/osd_font.h, images through
 # the vendored stb_image.h. Utilities (utils/): s30-fel, s30-volumed, s30-splash,
 # s30-keyheld, s30-display (with the system menu and stick calibration) and its
 # preload libs30lease.so, s30-screenshot (the screen's KMS planes to a PNG),
@@ -242,7 +242,7 @@ ensure_sysroot() {
 step_launcher() {
 	local app
 	ensure_sysroot
-	for app in filebrowser:launcher; do
+	for app in filebrowser:launcher flash:s30-flash; do
 		"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/${app#*:}.bin" \
 			"$PROJECT/launcher/${app%%:*}.c" "$PROJECT/launcher/ui.c" \
 			-I"$WORK/sysroot/usr/include/SDL2" -lSDL2 -lm
@@ -251,7 +251,6 @@ step_launcher() {
 	done
 	# Small system utilities (utils/)
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-fel.bin" "$PROJECT/utils/s30-fel.c"
-	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-flash.bin" "$PROJECT/utils/s30-flash.c"
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-volumed.bin" \
 		"$PROJECT/utils/s30-volumed.c" -lasound
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-splash.bin" "$PROJECT/utils/s30-splash.c"
@@ -264,7 +263,7 @@ step_launcher() {
 		-I"$WORK/sysroot/usr/include/libdrm" -ldrm
 	"$WORK/bin/armv7-clang" -O2 -Wall -o "$WORK/s30-uac.bin" "$PROJECT/utils/s30-uac.c" -lasound
 	"$WORK/bin/armv7-clang" -O2 -Wall -fPIC -shared -o "$WORK/libs30lease.so" "$PROJECT/utils/s30-lease.c"
-	llvm-strip "$WORK/s30-fel.bin" "$WORK/s30-flash.bin" "$WORK/s30-volumed.bin" "$WORK/s30-splash.bin" \
+	llvm-strip "$WORK/s30-fel.bin" "$WORK/s30-volumed.bin" "$WORK/s30-splash.bin" \
 		"$WORK/s30-keyheld.bin" "$WORK/s30-display.bin" "$WORK/s30-screenshot.bin" "$WORK/s30-uvc.bin" "$WORK/s30-uac.bin" \
 		"$WORK/libs30lease.so"
 }
@@ -585,7 +584,7 @@ step_image() {
 #   0x000000  U-Boot with SPL (BROM loads the SPL; U-Boot proper at 0x8000)
 #   0x0c0000  FIT: zImage, DTB, initramfs (s30-loader), boot script
 #             (flash.its, flash.cmd); U-Boot reads it when spi_booted is set
-#   0x780000  Boot logo, uncompressed BMP (U-Boot patch 0006)
+#   0x780000  Boot logo, uncompressed BMP (U-Boot patch 0007)
 # The root filesystem (rootfs.sqfs) and user data stay on the SD card. The
 # BROM tries the card first: a card with U-Boot at 8 KiB still boots from the
 # card. Install on the device with s30-flash write. Run after linux, uboot
