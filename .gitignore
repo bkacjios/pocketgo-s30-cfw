@@ -1,6 +1,8 @@
 # Build trees and outputs (build.sh: $WORK and $OUT)
 /s30-build/
 /out/
+# Package signing key (private; its public key is in rootfs-overlay/etc/apk/keys)
+/build/s30.rsa
 # Stock firmware dumps and their decoded parts (not redistributable)
 /S30-info/
 /firmware-decoded/

@@ -1,0 +1,55 @@
+# Build every package (build.sh) on each push to main and publish the
+# repository to the gh-pages branch, where the devices' System update app
+# looks (build.sh publish, S30_APK_REPO). The signing key is the secret
+# S30_SIGN_KEY (the contents of build/s30.rsa): without it build.sh stops,
+# since the public key in the tree only matches that key. About an hour.
+name: packages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: packages
+  cancel-in-progress: true
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the package versions are the commit count
+      - name: Signing key
+        run: |
+          [ -n "$S30_SIGN_KEY" ] || { echo "secret S30_SIGN_KEY is not set" >&2; exit 1; }
+          umask 077; printf '%s\n' "$S30_SIGN_KEY" > build/s30.rsa
+        env:
+          S30_SIGN_KEY: ${{ secrets.S30_SIGN_KEY }}
+      - name: Submodules build.sh does not fetch itself
+        run: git submodule update --init --depth 1 external/es-theme-carbon
+      - run: bash build/build.sh deps
+      - run: bash build/build.sh linux
+      - run: bash build/build.sh uboot
+      - run: bash build/build.sh rootfs
+      - run: bash build/build.sh mesa
+      - run: bash build/build.sh launcher
+      - run: bash build/build.sh retroarch
+      - run: bash build/build.sh emulationstation
+      - run: bash build/build.sh initramfs
+      - run: bash build/build.sh publish
+      - name: Flash image and loader (for a card or s30-flash by hand)
+        run: bash build/build.sh flash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boot
+          path: |
+            out/spi-nor.bin
+            s30-build/u-boot-sunxi-with-spl.bin
+            s30-build/boot/
+            s30-build/uInitrd
+            s30-build/fel.scr
+            s30-build/rootfs.sqfs
+          if-no-files-found: error

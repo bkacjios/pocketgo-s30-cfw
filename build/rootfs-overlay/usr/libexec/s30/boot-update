@@ -1,0 +1,36 @@
+#!/bin/sh
+# Install the boot files of the s30-linux and s30-uboot packages
+# (/usr/share/s30/boot) on the SD card, which both U-Boots boot from (the
+# card's own at 8 KiB, or the SPI flash's: flash.cmd loads /boot from the
+# card first). The apk trigger of s30-base on that directory, so apk upgrade
+# (the System update app) runs it after a new kernel, loader or U-Boot is
+# unpacked; also runs by hand.
+#
+# The kernel, DTB, loader and boot script go to /boot (as .new, then
+# renamed, so a copy cut short leaves the old file). U-Boot is rewritten at
+# 8 KiB when the card holds one there (build.sh sdcard) and it differs. The
+# SPI flash is never touched here: it is the bootloader and a fallback kernel,
+# refreshed by hand (build.sh flash, s30-flash write).
+set -e
+B=/usr/share/s30/boot
+
+for f in zImage sun8i-a33-pocketgo-s30.dtb uInitrd boot.scr; do
+	cmp -s $B/$f /mnt/sd/boot/$f && continue
+	echo "boot-update: /boot/$f on the card"
+	cp $B/$f /mnt/sd/boot/$f.new
+	mv /mnt/sd/boot/$f.new /mnt/sd/boot/$f
+done
+sync
+
+# eGON.BT0, the boot header's magic, 4 bytes into U-Boot's SPL at 8 KiB
+if [ -b /dev/mmcblk0 ] &&
+	[ "$(dd if=/dev/mmcblk0 bs=4 skip=2049 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 65474f4e2e425430 ]; then
+	uboot=$B/u-boot-sunxi-with-spl.bin
+	n=$(stat -c %s $uboot)
+	if dd if=/dev/mmcblk0 bs=1k skip=8 count=$(((n + 1023) / 1024)) 2>/dev/null | head -c "$n" | cmp -s - $uboot; then
+		echo "boot-update: U-Boot on the card is current"
+	else
+		echo "boot-update: writing U-Boot to the card"
+		dd if=$uboot of=/dev/mmcblk0 bs=1k seek=8 conv=notrunc,fsync status=none
+	fi
+fi

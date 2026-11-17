@@ -6,10 +6,14 @@
 # Linux, U-Boot and RetroArch are git submodules (external/, pinned
 # versions); each is built in a git worktree under $WORK (Linux filesystem;
 # the kernel tree cannot be checked out on NTFS), so board patches never touch
-# the submodule checkout. The result is written to <project>/out/sdcard.img.
+# the submodule checkout. The results go to $WORK (s30-build/); build.sh
+# sdcard writes them to a card.
 #
-# Steps can be run individually: build.sh deps|linux|uboot|rootfs|image
+# Steps can be run individually: build.sh deps|linux|uboot|rootfs|initramfs
 # USB boot from stock firmware (no flashing): build.sh initramfs, then fel
+# Our programs, the kernel, U-Boot and the board files are apk packages
+# (signed with build/s30.rsa); build.sh publish puts them online for the
+# device's System update app.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,9 +22,22 @@ WORK="${WORK:-$PROJECT/s30-build}"
 OUT="${OUT:-$PROJECT/out}"
 JOBS="$(nproc)"
 export ARCH=arm
+# Timestamps in what mkimage (uInitrd, the FIT, the scripts) and the kernel
+# and U-Boot builds embed: the commit's, so a rebuild of one commit gives the
+# same files (boot-update compares them with what is installed)
+export SOURCE_DATE_EPOCH
+SOURCE_DATE_EPOCH="$(git -C "$PROJECT" log -1 --format=%ct)"
 
 ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/armv7
 ALPINE_REPO=https://dl-cdn.alpinelinux.org/alpine/latest-stable
+# Our package repository: $WORK/repo, published as the gh-pages branch of
+# origin (build.sh publish), which GitHub Pages serves here. Listed in the
+# device's /etc/apk/repositories; the packages are signed with SIGN_KEY
+# (private, gitignored; made on first use) and PUB_KEY (committed, in the
+# rootfs as /etc/apk/keys)
+S30_APK_REPO=https://bkacjios.github.io/pocketgo-s30-cfw/apk
+SIGN_KEY="$HERE/s30.rsa"
+PUB_KEY="$HERE/rootfs-overlay/etc/apk/keys/s30.rsa.pub"
 
 mkdir -p "$WORK" "$OUT"
 
@@ -63,7 +80,7 @@ step_deps() {
 			arm-none-eabi-gcc arm-none-eabi-binutils dtc swig python \
 			python-setuptools python-pyelftools gnutls util-linux-libs \
 			e2fsprogs util-linux fakeroot curl ca-certificates cpio kmod \
-			clang lld llvm squashfs-tools pkgconf
+			clang lld llvm squashfs-tools pkgconf cmake ninja
 		return
 	fi
 	sudo apt-get update
@@ -72,7 +89,7 @@ step_deps() {
 		gcc-arm-linux-gnueabihf device-tree-compiler swig python3-dev \
 		python3-setuptools python3-pyelftools libgnutls28-dev uuid-dev \
 		e2fsprogs fdisk fakeroot curl ca-certificates cpio kmod \
-		clang lld llvm squashfs-tools pkg-config
+		clang lld llvm squashfs-tools pkg-config cmake ninja-build python3-venv
 }
 
 step_linux() {
@@ -177,28 +194,25 @@ step_rootfs() {
 	tarball="$WORK/$ver"
 	[ -f "$tarball" ] || curl -fSL -o "$tarball" "$ALPINE_MIRROR/$ver"
 	echo "Rootfs: $ver"
-	# Extraction and image creation share one fakeroot session so files
-	# keep root ownership inside the ext4 image.
 	echo "$tarball" > "$WORK/rootfs.src"
 
-	# Extra packages from build/packages plus their dependencies (resolved
-	# from the repo indexes; packages already in minirootfs are skipped)
-	local repo idx name ver
-	mkdir -p "$WORK/apk"
-	for repo in main community; do
-		curl -fsSL "$ALPINE_REPO/$repo/armv7/APKINDEX.tar.gz" |
-			tar -xzO APKINDEX > "$WORK/apk/APKINDEX.$repo"
-	done
-	tar -xzOf "$tarball" ./lib/apk/db/installed > "$WORK/apk/installed"
-	python3 -I "$PROJECT/tools/apk_resolve.py" "$WORK/apk/installed" \
-		"$WORK/apk/APKINDEX.main" "$WORK/apk/APKINDEX.community" \
-		-- $(grep -v '^#' "$HERE/packages") > "$WORK/apk/list"
-	rm -f "$WORK/apk/"*.apk
-	while read -r idx name ver; do
-		repo="${idx##*APKINDEX.}"
-		curl -fsSL -o "$WORK/apk/$name-$ver.apk" "$ALPINE_REPO/$repo/armv7/$name-$ver.apk"
-	done < "$WORK/apk/list"
-	echo "Packages: $(wc -l < "$WORK/apk/list") ($(cut -d' ' -f2 "$WORK/apk/list" | tr '\n' ' '))"
+	# apk for the build host (static, from Alpine's own repo): it installs
+	# build/packages into the rootfs tree (step_initramfs), so the device's
+	# package database is complete and apk upgrade there covers everything
+	local host_arch apk_ver
+	host_arch="$(uname -m)"
+	apk_ver="$(curl -fsSL "$ALPINE_REPO/main/$host_arch/APKINDEX.tar.gz" | tar -xzO APKINDEX |
+		awk '/^P:apk-tools-static$/ { f = 1 } f && /^V:/ { v = substr($0, 3); f = 0 } END { print v }')"
+	[ -n "$apk_ver" ] || { echo "no apk-tools-static for $host_arch" >&2; exit 1; }
+	mkdir -p "$WORK/bin" "$WORK/apk"
+	# Downloaded whole: tar stops at the one file and the pipe would break
+	curl -fsSL -o "$WORK/apk-tools-static.apk" "$ALPINE_REPO/main/$host_arch/apk-tools-static-$apk_ver.apk"
+	tar -xzOf "$WORK/apk-tools-static.apk" sbin/apk.static > "$WORK/bin/apk.static"
+	chmod 0755 "$WORK/bin/apk.static"
+	# Left by the old resolver (tools/apk_resolve.py)
+	rm -f "$WORK"/apk/APKINDEX.main "$WORK"/apk/APKINDEX.community "$WORK"/apk/installed \
+		"$WORK"/apk/list "$WORK"/apk/*-r[0-9]*.apk
+	echo "apk-tools-static $apk_ver"
 }
 
 # Cross sysroot for clang builds (RetroArch, launcher): Alpine minirootfs +
@@ -207,20 +221,15 @@ step_rootfs() {
 SYSROOT_PKGS="gcc g++ musl-dev linux-headers libdrm-dev mesa-dev alsa-lib-dev eudev-dev zlib-dev sdl2-dev sdl2_ttf-dev
 	freeimage-dev freetype-dev curl-dev vlc-dev rapidjson-dev pugixml-dev"
 ensure_sysroot() {
-	local sr="$WORK/sysroot" idx name ver repo t
+	local sr="$WORK/sysroot" t
 	if [ "$(cat "$sr/.done" 2>/dev/null)" != "$SYSROOT_PKGS" ]; then
 		rm -rf "$sr" "$WORK/sysroot-apk"; mkdir -p "$sr" "$WORK/sysroot-apk"
 		tar -xzf "$(cat "$WORK/rootfs.src")" -C "$sr"
 		# shellcheck disable=SC2086
-		python3 -I "$PROJECT/tools/apk_resolve.py" "$WORK/apk/installed" \
-			"$WORK/apk/APKINDEX.main" "$WORK/apk/APKINDEX.community" -- \
-			$SYSROOT_PKGS > "$WORK/sysroot-apk/list"
-		while read -r idx name ver; do
-			repo="${idx##*APKINDEX.}"
-			curl -fsSL -o "$WORK/sysroot-apk/$name-$ver.apk" \
-				"$ALPINE_REPO/$repo/armv7/$name-$ver.apk"
-			tar -xzf "$WORK/sysroot-apk/$name-$ver.apk" -C "$sr" --exclude=".*" 2>/dev/null
-		done < "$WORK/sysroot-apk/list"
+		fakeroot "$WORK/bin/apk.static" --root "$sr" --arch armv7 --no-scripts --no-interactive \
+			--cache-dir "$WORK/sysroot-apk" --keys-dir "$sr/etc/apk/keys" \
+			--repository "$ALPINE_REPO/main" --repository "$ALPINE_REPO/community" \
+			add $SYSROOT_PKGS
 		echo "$SYSROOT_PKGS" > "$sr/.done"
 	fi
 	mkdir -p "$WORK/bin"
@@ -442,69 +451,140 @@ step_gmloader() {
 	ls -l "$out/gmloadernext.armhf"
 }
 
-# Root filesystem for build.sh fel: rootfs.sqfs (minirootfs + packages +
-# rootfs-overlay) goes to /s30 on the SD card; uInitrd is a small loader (busybox,
-# musl, s30-loader as /init) that mounts it with a tmpfs overlay.
-step_initramfs() {
-	local root="$WORK/rootfs" loader="$WORK/loader" apk
-	rm -rf "$root" "$loader"; mkdir -p "$root" "$loader"
-	tar -xzf "$(cat "$WORK/rootfs.src")" -C "$root"
-	for apk in "$WORK"/apk/*.apk; do
-		[ -e "$apk" ] && tar -xzf "$apk" -C "$root" --exclude=".*" 2>/dev/null
-	done
-	# Board files: init setup (/etc/inittab, /etc/s30/rc), configs, scripts
-	# (build/rootfs-overlay mirrors the rootfs layout)
-	cp -r "$HERE/rootfs-overlay/." "$root/"
-	# ssh login as root with the build user's public keys (override with
-	# S30_SSH_KEYS="file ..."; none found = no key login)
-	mkdir -p -m 700 "$root/root/.ssh"
-	cat ${S30_SSH_KEYS:-"$HOME"/.ssh/id_*.pub} > "$root/root/.ssh/authorized_keys" 2>/dev/null || true
-	chmod 600 "$root/root/.ssh/authorized_keys"
-	[ -f "$WORK/retroarch.bin" ] &&
-		install -m 0755 "$WORK/retroarch.bin" "$root/usr/bin/retroarch"
-	[ -f "$WORK/launcher.bin" ] &&
-		install -m 0755 "$WORK/launcher.bin" "$root/usr/bin/s30-launcher"
-	[ -f "$WORK/s30-fel.bin" ] &&
-		install -m 0755 "$WORK/s30-fel.bin" "$root/usr/bin/s30-fel"
-	[ -f "$WORK/s30-flash.bin" ] &&
-		install -m 0755 "$WORK/s30-flash.bin" "$root/usr/bin/s30-flash"
-	[ -f "$WORK/s30-volumed.bin" ] &&
-		install -m 0755 "$WORK/s30-volumed.bin" "$root/usr/bin/s30-volumed"
-	[ -f "$WORK/s30-splash.bin" ] &&
-		install -m 0755 "$WORK/s30-splash.bin" "$root/usr/bin/s30-splash"
-	[ -f "$WORK/s30-display.bin" ] &&
-		install -m 0755 "$WORK/s30-display.bin" "$root/usr/bin/s30-display"
-	[ -f "$WORK/s30-screenshot.bin" ] &&
-		install -m 0755 "$WORK/s30-screenshot.bin" "$root/usr/bin/s30-screenshot"
-	[ -f "$WORK/s30-uvc.bin" ] &&
-		install -m 0755 "$WORK/s30-uvc.bin" "$root/usr/bin/s30-uvc"
-	[ -f "$WORK/s30-uac.bin" ] &&
-		install -m 0755 "$WORK/s30-uac.bin" "$root/usr/bin/s30-uac"
-	[ -f "$WORK/s30-mdns.bin" ] &&
-		install -m 0755 "$WORK/s30-mdns.bin" "$root/usr/bin/s30-mdns"
-	[ -d "$WORK/emulationstation-root" ] &&
-		cp -r "$WORK/emulationstation-root/." "$root/"
-	# Mesa (build.sh mesa), in place of Alpine's (build/packages excludes it)
-	[ -d "$WORK/mesa-root" ] &&
-		cp -r "$WORK/mesa-root/." "$root/"
-	# EmulationStation theme (submodule external/es-theme-carbon)
-	if [ -f "$PROJECT/external/es-theme-carbon/carbon.xml" ]; then
-		mkdir -p "$root/etc/emulationstation/themes/carbon"
-		tar -C "$PROJECT/external/es-theme-carbon" -cf - --exclude=.git . |
-			tar -C "$root/etc/emulationstation/themes/carbon" -xf -
+# Root filesystem (minirootfs + packages) as rootfs.ext4 (an ext4 image,
+# mounted read-write as / on the device: changes persist, apk add works) and
+# rootfs.sqfs (squashfs, the read-only fallback under a tmpfs overlay; what
+# build.sh fel pushes). uInitrd is a small loader (busybox, musl, s30-loader
+# as /init) that mounts one of them from /boot on the SD card.
+#
+# Everything of ours is a package too (apk mkpkg, signed with SIGN_KEY), so
+# apk knows every file, checks dependencies and apk upgrade on the device
+# (the System update app) takes newer ones from S30_APK_REPO:
+#   s30-mesa              build.sh mesa (lima, no LLVM); provides Alpine's
+#                         mesa-* names so nothing pulls Alpine's Mesa
+#   s30-tools             the launcher, utils/, libs30lease, splash.bmp
+#   s30-retroarch, s30-emulationstation (with the theme)
+#   s30-linux             zImage, DTB, the loader (uInitrd) and boot.scr, in
+#                         /usr/share/s30/boot
+#   s30-uboot             u-boot-sunxi-with-spl.bin, same place
+#   s30-base              rootfs-overlay (init, configs, scripts); its apk
+#                         trigger on /usr/share/s30/boot runs boot-update,
+#                         which copies the new boot files to /boot on the
+#                         card (and U-Boot to 8 KiB when the card has one).
+#                         The SPI flash (U-Boot, fallback kernel) is only
+#                         written by hand: build.sh flash, s30-flash write
+# Versions: 0.<commit count>-r0 (s30-linux and s30-uboot: the upstream
+# version, -r<commit count>), so a later commit always upgrades; the
+# description names the commit.
+ROOTFS_EXT4_MB=1024 # the image's size; the tree is ~300 MB, the rest is free for apk add
+PKG_REL= PKG_DESC= # commit count, git describe (step_initramfs)
+MKPKG_DEPS=        # extra depends for the next mkpkg
+sign_key() {
+	[ -f "$SIGN_KEY" ] && return
+	if [ -f "$PUB_KEY" ]; then
+		echo "$SIGN_KEY is missing but $PUB_KEY exists: the devices only take packages signed with that key." >&2
+		echo "Restore it, or delete the public key for a new pair (and reflash the devices)." >&2
+		exit 1
 	fi
-	[ -f "$WORK/libs30lease.so" ] &&
-		install -D -m 0755 "$WORK/libs30lease.so" "$root/usr/lib/s30/libs30lease.so"
+	mkdir -p "${PUB_KEY%/*}"
+	openssl genrsa -out "$SIGN_KEY" 2048 2>/dev/null
+	openssl rsa -in "$SIGN_KEY" -pubout -out "$PUB_KEY"
+	echo "New package signing key $SIGN_KEY; commit its public key $PUB_KEY"
+}
+mkpkg() { # NAME VERSION DIR [--info ...|--trigger ...|--script ...]: $WORK/repo/armv7/NAME-VERSION.apk
+	local name="$1" version="$2" dir="$3" deps
+	shift 3
+	# The libraries the programs link, minus libc and the package's own
+	# (|| true: grep finds nothing in a package without ELF files, pipefail)
+	deps="$(find "$dir" -type f -exec sh -c 'readelf -h "$1" >/dev/null 2>&1 && readelf -d "$1"' _ {} \; |
+		awk '/NEEDED/ { gsub(/[][]/, "", $5); print $5 }' | sort -u |
+		grep -v -E '^(libc\.musl|ld-musl)' |
+		grep -v -x -F -f <(find "$dir" -name '*.so*' -printf '%f\n') |
+		sed 's/^/so:/' | tr '\n' ' ' || true)$MKPKG_DEPS"
+	"$WORK/bin/apk.static" mkpkg --files "$dir" --output "$WORK/repo/armv7/$name-$version.apk" \
+		--sign-key "$SIGN_KEY" --info "name:$name" --info "version:$version" --info "arch:armv7" \
+		--info "depends:$deps" --info "description:PocketGo S30 $name ($PKG_DESC)" "$@"
+	MKPKG_DEPS=
+}
+mkndx() { # the repository's index over every package built so far
+	"$WORK/bin/apk.static" --keys-dir "${PUB_KEY%/*}" mkndx --sign-key "$SIGN_KEY" \
+		--output "$WORK/repo/armv7/APKINDEX.tar.gz" --description "PocketGo S30 $PKG_DESC" \
+		"$WORK"/repo/armv7/*.apk > /dev/null
+}
+step_initramfs() {
+	local root="$WORK/rootfs" loader="$WORK/loader" pkg="$WORK/pkg" mesa_ver d t
+	sign_key
+	rm -rf "$root" "$loader" "$pkg" "$WORK/repo"; mkdir -p "$root" "$loader" "$pkg" "$WORK/repo/armv7"
+	tar -xzf "$(cat "$WORK/rootfs.src")" -C "$root"
+	cp "$PUB_KEY" "$root/etc/apk/keys/"
+	echo "$S30_APK_REPO" >> "$root/etc/apk/repositories"
+	# Packages through apk (downloads cached in $WORK/apk). fakeroot: apk
+	# chowns what it installs. --no-scripts: the packages' install scripts
+	# and triggers are ARM programs; none of ours needs them at build time
+	apk() {
+		fakeroot "$WORK/bin/apk.static" --root "$root" --arch armv7 --no-scripts --no-interactive \
+			--cache-dir "$WORK/apk" --keys-dir "$root/etc/apk/keys" \
+			--repository "$ALPINE_REPO/main" --repository "$ALPINE_REPO/community" \
+			--repository "$WORK/repo" "$@"
+	}
+	PKG_REL="$(git -C "$PROJECT" rev-list --count HEAD)"
+	PKG_DESC="$(git -C "$PROJECT" describe --always --dirty)"
+	# Our Mesa (build.sh mesa) first: it provides Alpine's mesa-* names and
+	# the EGL/GBM/GLES libraries, so what needs them (kmscube) takes ours
+	# and apk never installs Alpine's Mesa (with LLVM)
+	if [ -d "$WORK/mesa-root" ]; then
+		mesa_ver="$(ls "$WORK"/mesa-root/usr/lib/libgallium-*.so | sed 's/.*libgallium-\(.*\)\.so/\1/')"
+		mkpkg s30-mesa "$mesa_ver-r0" "$WORK/mesa-root" \
+			--info "description:Mesa $mesa_ver for the Mali-400 (lima; EGL, GBM, GLES 2; no LLVM)" \
+			--info "provides:so:libEGL.so.1=1 so:libgbm.so.1=1 so:libGLESv2.so.2=2 mesa=$mesa_ver-r0 mesa-egl=$mesa_ver-r0 mesa-gbm=$mesa_ver-r0 mesa-gles=$mesa_ver-r0 mesa-dri-gallium=$mesa_ver-r0" \
+			--info "provider-priority:100"
+		mkndx
+		apk add s30-mesa
+	fi
+	d="$pkg/s30-tools"
+	for t in launcher:s30-launcher s30-fel s30-flash s30-volumed s30-splash s30-keyheld \
+			s30-display s30-screenshot s30-uvc s30-uac s30-mdns; do
+		[ ! -f "$WORK/${t%%:*}.bin" ] ||
+			install -D -m 0755 "$WORK/${t%%:*}.bin" "$d/usr/bin/${t##*:}"
+	done
+	[ ! -f "$WORK/libs30lease.so" ] ||
+		install -D -m 0755 "$WORK/libs30lease.so" "$d/usr/lib/s30/libs30lease.so"
 	# Boot splash: the same image U-Boot shows
-	install -D -m 0644 "$HERE/splash/logo.bmp" "$root/usr/share/s30/splash.bmp"
-	rm -f "$WORK/rootfs.sqfs"
-	mksquashfs "$root" "$WORK/rootfs.sqfs" -all-root -comp zstd -quiet -no-progress
+	install -D -m 0644 "$HERE/splash/logo.bmp" "$d/usr/share/s30/splash.bmp"
+	[ ! -f "$WORK/retroarch.bin" ] ||
+		install -D -m 0755 "$WORK/retroarch.bin" "$pkg/s30-retroarch/usr/bin/retroarch"
+	if [ -d "$WORK/emulationstation-root" ]; then
+		cp -r "$WORK/emulationstation-root" "$pkg/s30-emulationstation"
+		# Theme (submodule external/es-theme-carbon)
+		if [ -f "$PROJECT/external/es-theme-carbon/carbon.xml" ]; then
+			d="$pkg/s30-emulationstation/etc/emulationstation/themes/carbon"
+			mkdir -p "$d"
+			tar -C "$PROJECT/external/es-theme-carbon" -cf - --exclude=.git . | tar -C "$d" -xf -
+		fi
+	fi
+	for d in "$pkg"/*/; do
+		d="${d%/}"
+		mkpkg "$(basename "$d")" "0.$PKG_REL-r0" "$d"
+	done
+	mkndx
+	# shellcheck disable=SC2046
+	apk add $(grep -v '^#' "$HERE/packages") s30-tools s30-retroarch s30-emulationstation
 
+	# The loader (initramfs): busybox and musl from the rootfs
 	mkdir -p "$loader"/{bin,lib,dev,proc,sys}
 	cp -a "$root/bin/busybox" "$loader/bin/"
 	cp -a "$root"/lib/ld-musl-armhf.so.1 "$loader/lib/"
-	# Card check (dosfstools, exfatprogs; libc only)
-	cp -a "$root/sbin/fsck.fat" "$root/usr/sbin/fsck.exfat" "$loader/bin/"
+	# Card check (dosfstools, exfatprogs; libc only) and e2fsck for rootfs.ext4
+	# with its libraries (libblkid pulls in libeconf, that libgcc_s); every
+	# NEEDED checked, a missing one only shows at boot
+	cp -a "$root/sbin/fsck.fat" "$root/usr/sbin/fsck.exfat" "$root/sbin/e2fsck" "$loader/bin/"
+	mkdir -p "$loader/usr/lib"
+	cp -a "$root"/usr/lib/lib{blkid,com_err,e2p,ext2fs,uuid,econf,gcc_s}.so.* "$loader/usr/lib/"
+	for so in $(readelf -d "$loader"/bin/e2fsck "$loader"/usr/lib/*.so.* |
+			awk '/NEEDED/ { gsub(/[][]/, "", $5); print $5 }' | sort -u); do
+		[ "$so" = libc.musl-armv7.so.1 ] || [ -e "$loader/usr/lib/$so" ] ||
+			{ echo "loader: e2fsck needs $so, not copied" >&2; exit 1; }
+	done
 	install -m 0755 "$HERE/s30-loader" "$loader/init"
 	# USB disk mode and the no-card screen (see s30-loader; usb.bmp and
 	# nocard.bmp from tools/make_loader_screens.py)
@@ -523,7 +603,40 @@ step_initramfs() {
 		-d "$HERE/fel.cmd" "$WORK/fel.scr"
 	"$WORK/u-boot/tools/mkimage" -A arm -O linux -T script -C none \
 		-d "$HERE/fel-ram.cmd" "$WORK/fel-ram.scr"
-	ls -l "$WORK/rootfs.sqfs" "$WORK/uInitrd"
+
+	# The boot files (s30-linux, s30-uboot) and the board files (s30-base,
+	# whose trigger installs the boot files on the card: boot-update)
+	d="$pkg/s30-linux/usr/share/s30/boot"
+	install -D -m 0644 -t "$d" "$WORK/boot/zImage" "$WORK/boot/sun8i-a33-pocketgo-s30.dtb" "$WORK/uInitrd"
+	install -m 0644 "$WORK/fel.scr" "$d/boot.scr"
+	mkpkg s30-linux "$(make -s -C "$WORK/linux" kernelversion)-r$PKG_REL" "$pkg/s30-linux"
+	install -D -m 0644 -t "$pkg/s30-uboot/usr/share/s30/boot" "$WORK/u-boot-sunxi-with-spl.bin"
+	mkpkg s30-uboot "$(make -s -C "$WORK/u-boot" ubootversion | tr - _)-r$PKG_REL" "$pkg/s30-uboot"
+	cp -r "$HERE/rootfs-overlay" "$pkg/s30-base"
+	# replaces: /etc/inittab is alpine-baselayout-data's, /etc/udhcpd.conf
+	# busybox-extras'; ours stay through their upgrades (replaces-priority)
+	MKPKG_DEPS=" s30-tools s30-linux s30-uboot"
+	mkpkg s30-base "0.$PKG_REL-r0" "$pkg/s30-base" --trigger /usr/share/s30/boot \
+		--script "trigger:$HERE/rootfs-overlay/usr/libexec/s30/boot-update" \
+		--info "replaces:alpine-baselayout-data busybox-extras" --info "replaces-priority:100"
+	mkndx
+	apk add s30-base
+	unset -f apk
+
+	# ssh login as root with the build user's public keys (override with
+	# S30_SSH_KEYS="file ..."; none found = no key login)
+	mkdir -p -m 700 "$root/root/.ssh"
+	cat ${S30_SSH_KEYS:-"$HOME"/.ssh/id_*.pub} > "$root/root/.ssh/authorized_keys" 2>/dev/null || true
+	chmod 600 "$root/root/.ssh/authorized_keys"
+	rm -f "$WORK/rootfs.sqfs" "$WORK/rootfs.ext4"
+	mksquashfs "$root" "$WORK/rootfs.sqfs" -all-root -comp zstd -quiet -no-progress
+	# Sparse on the host (full size once copied to the card). fakeroot: the
+	# files owned by root in the image. No reserved blocks (root is the only
+	# user); the inode tables and journal written now, not by the kernel in
+	# the background at the first boot
+	fakeroot mkfs.ext4 -q -L s30root -m 0 -E lazy_itable_init=0,lazy_journal_init=0 \
+		-d "$root" "$WORK/rootfs.ext4" "${ROOTFS_EXT4_MB}M"
+	ls -l "$WORK/rootfs.sqfs" "$WORK/rootfs.ext4" "$WORK/uInitrd" "$WORK"/repo/armv7/*.apk
 }
 
 # Boot over USB without installing anything. With the device on stock
@@ -558,48 +671,23 @@ step_fel() {
 	fi
 }
 
-step_image() {
-	local img="$OUT/sdcard.img" part="$WORK/rootfs.ext4"
-	local size_mb=512 offset_mb=2
-	rm -f "$part"
-	fakeroot bash -euo pipefail -c '
-		root="$1/rootfs"; rm -rf "$root"; mkdir -p "$root"
-		tar -xzf "$(cat "$1/rootfs.src")" -C "$root"
-		for apk in "$1"/apk/*.apk; do
-			[ -e "$apk" ] && tar -xzf "$apk" -C "$root" --exclude=".*" 2>/dev/null
-		done
-		cp -r "$2/rootfs-overlay/." "$root/"
-		mkdir -p "$root/boot"
-		cp "$1"/boot/* "$root/boot/"
-		mkfs.ext4 -q -L s30root -d "$root" "$3" "$4M"
-	' _ "$WORK" "$HERE" "$part" "$((size_mb - offset_mb))"
-
-	rm -f "$img"
-	truncate -s "${size_mb}M" "$img"
-	printf 'label: dos\nstart=%dMiB, type=83, bootable\n' "$offset_mb" | sfdisk -q "$img"
-	# A33 boot ROM loads SPL from 8 KiB into the card.
-	dd if="$WORK/u-boot-sunxi-with-spl.bin" of="$img" bs=1k seek=8 conv=notrunc status=none
-	dd if="$part" of="$img" bs=1M seek="$offset_mb" conv=notrunc status=none
-	echo "Wrote $img"
-}
-
 # SPI flash image (8 MiB Zbit ZB25VQ64), written over /dev/mtd0 from Linux.
 # Layout:
 #   0x000000  U-Boot with SPL (BROM loads the SPL; U-Boot proper at 0x8000)
 #   0x0c0000  FIT: zImage, DTB, initramfs (s30-loader), boot script
 #             (flash.its, flash.cmd); U-Boot reads it when spi_booted is set
 #   0x780000  Boot logo, uncompressed BMP (U-Boot patch 0007)
-# The root filesystem (rootfs.sqfs) and user data stay on the SD card. The
+# The system stays on the SD card: flash.cmd boots /boot from the card when
+# it loads (what the packages update) and the FIT's kernel otherwise. The
 # BROM tries the card first: a card with U-Boot at 8 KiB still boots from the
-# card. Install on the device with s30-flash write. Run after linux, uboot
-# and initramfs.
+# card. Installed by hand with s30-flash write (a bootloader update, not
+# every kernel). Run after linux, uboot and initramfs.
 FLASH_SIZE=$((0x800000))
 FLASH_FIT_OFFS=$((0xc0000))
 FLASH_LOGO_OFFS=$((0x780000))
-step_flash() {
-	local img="$OUT/spi-nor.bin" uboot="$WORK/u-boot-sunxi-with-spl.bin"
+build_fit() { # $WORK/flash.itb, checked against the layout
 	local fit="$WORK/flash.itb" n
-	n=$(stat -c %s "$uboot")
+	n=$(stat -c %s "$WORK/u-boot-sunxi-with-spl.bin")
 	[ "$n" -le "$FLASH_FIT_OFFS" ] ||
 		{ echo "U-Boot is $n bytes, over the $FLASH_FIT_OFFS before the FIT" >&2; exit 1; }
 	# dtc resolves /incbin/ paths from the .its file's directory
@@ -610,13 +698,55 @@ step_flash() {
 		{ echo "FIT is $n bytes, over the $((FLASH_LOGO_OFFS - FLASH_FIT_OFFS)) before the logo" >&2; exit 1; }
 	[ "$(stat -c %s "$HERE/splash/logo.bmp")" -le $((FLASH_SIZE - FLASH_LOGO_OFFS)) ] ||
 		{ echo "logo.bmp does not fit after $FLASH_LOGO_OFFS" >&2; exit 1; }
+}
+step_flash() {
+	local img="$OUT/spi-nor.bin" uboot="$WORK/u-boot-sunxi-with-spl.bin" fit="$WORK/flash.itb"
+	build_fit
 	mkdir -p "$OUT"
 	# Erased flash reads 0xff
 	head -c "$FLASH_SIZE" /dev/zero | tr '\0' '\377' > "$img"
 	dd if="$uboot" of="$img" conv=notrunc status=none
 	dd if="$fit" of="$img" bs=1 seek="$FLASH_FIT_OFFS" conv=notrunc status=none
 	dd if="$HERE/splash/logo.bmp" of="$img" bs=1 seek="$FLASH_LOGO_OFFS" conv=notrunc status=none
-	echo "Wrote $img (U-Boot $(stat -c %s "$uboot"), FIT $n of $((FLASH_LOGO_OFFS - FLASH_FIT_OFFS)) bytes)"
+	echo "Wrote $img (U-Boot $(stat -c %s "$uboot"), FIT $(stat -c %s "$fit") of $((FLASH_LOGO_OFFS - FLASH_FIT_OFFS)) bytes)"
+}
+
+# The package repository ($WORK/repo, build.sh initramfs) online: the
+# gh-pages branch of origin, served by GitHub Pages at S30_APK_REPO, where
+# the device's apk update looks. The branch is one commit holding only the
+# current packages (replaced each time: a history of 30 MB publishes would
+# pile up). Pages is switched on for the repository the first time (gh;
+# a token without that right, GitHub Actions', only says so). Run by hand
+# or by .github/workflows/packages.yml on every push to main.
+step_publish() {
+	local repo="$WORK/repo" gh="$WORK/gh-pages" desc slug
+	[ -f "$repo/armv7/APKINDEX.tar.gz" ] || { echo "no $repo/armv7/APKINDEX.tar.gz: run build.sh initramfs first" >&2; exit 1; }
+	# The versions come from the commit count: two builds of one commit
+	# would have the same version, and the devices would never see the second
+	[ -z "$(git -C "$PROJECT" status --porcelain --untracked-files=no --ignore-submodules)" ] ||
+		{ echo "uncommitted changes: commit, build.sh initramfs, then publish" >&2; exit 1; }
+	desc="$(git -C "$PROJECT" describe --always)"
+	git -C "$PROJECT" worktree remove --force "$gh" 2>/dev/null || rm -rf "$gh"
+	git -C "$PROJECT" worktree prune
+	git -C "$PROJECT" branch -qD gh-pages 2>/dev/null || true
+	git -C "$PROJECT" worktree add -q --detach "$gh" HEAD
+	git -C "$gh" checkout -q --orphan gh-pages
+	git -C "$gh" rm -rfq . 2>/dev/null || true
+	rm -rf "$gh"/* 2>/dev/null || true
+	mkdir -p "$gh/apk"
+	cp -r "$repo/." "$gh/apk/"
+	touch "$gh/.nojekyll"
+	git -C "$gh" add -A
+	git -C "$gh" -c user.name="build.sh publish" -c user.email="build@pocketgo-s30" \
+		commit -qm "Packages $desc"
+	git -C "$gh" push -qf origin gh-pages
+	git -C "$PROJECT" worktree remove --force "$gh"
+	git -C "$PROJECT" branch -qD gh-pages
+	slug="$(git -C "$PROJECT" remote get-url origin | sed -E 's#.*github\.com[:/]##; s#\.git$##')"
+	gh api "repos/$slug/pages" > /dev/null 2>&1 ||
+		gh api -X POST "repos/$slug/pages" -f 'source[branch]=gh-pages' -f 'source[path]=/' > /dev/null ||
+		echo "could not switch GitHub Pages on: repository Settings > Pages, deploy from the gh-pages branch" >&2
+	echo "Published $(ls "$repo"/armv7/*.apk | wc -l) packages ($desc) to $S30_APK_REPO (Pages takes a minute)"
 }
 
 # Make an SD card boot on its own (no stock firmware, no FEL): the A33 boot
@@ -641,7 +771,7 @@ step_sdcard() {
 		part="$(lsblk -lnpo NAME,TYPE "$dev" | awk '$2 == "part" { print $1; exit }')"
 		# The new partition starts where the old one did: clear its old
 		# filesystem signature too, or mkfs refuses
-		wipefs -qa "$part"
+		wipefs -qaf "$part" # -f: a FAT boot sector looks like a nested partition table, which wipefs skips otherwise
 		mkfs.exfat -L S30 "$part"
 	fi
 	part="$(lsblk -lnpo NAME,TYPE "$dev" | awk '$2 == "part" { print $1; exit }')"
@@ -661,13 +791,18 @@ step_sdcard() {
 		mount "$part" "$mnt"
 	fi
 	# /boot: system images. /home: $HOME on the device (RetroArch settings in
-	# ~/.config/retroarch, saves, ROMs in ~/roms), created on first boot.
-	mkdir -p "$mnt/boot" "$mnt/home/roms"
+	# ~/.config/retroarch, saves), created on first boot; ROMs in /mnt/sd/roms,
+	# the ports in games/, launch scripts for other apps in apps/.
+	mkdir -p "$mnt/boot" "$mnt/home" "$mnt/roms" "$mnt/games" "$mnt/apps"
 	# Writable from the PC by whoever ran sudo (the device runs as root)
 	# (ext4 only: exFAT/FAT have no owners and refuse chown)
 	[ -z "${SUDO_UID:-}" ] || chown -R "$SUDO_UID:$SUDO_GID" "$mnt/home" 2>/dev/null || true
 	cp "$WORK/boot/zImage" "$WORK/boot/sun8i-a33-pocketgo-s30.dtb" \
 		"$WORK/uInitrd" "$WORK/rootfs.sqfs" "$HERE/splash/logo.bmp" "$mnt/boot/"
+	# The read-write root (preferred by the loader when present); a card
+	# without it boots rootfs.sqfs. Copied in full (1 GiB): exFAT has no
+	# sparse files
+	[ ! -f "$WORK/rootfs.ext4" ] || cp "$WORK/rootfs.ext4" "$mnt/boot/"
 	# U-Boot's default bootcmd (distro boot) runs /boot/boot.scr; same
 	# script as FEL
 	cp "$WORK/fel.scr" "$mnt/boot/boot.scr"
@@ -685,7 +820,6 @@ case "${1:-all}" in
 	linux) step_linux ;;
 	uboot) step_uboot ;;
 	rootfs) step_rootfs ;;
-	image) step_image ;;
 	initramfs) step_initramfs ;;
 	retroarch) step_retroarch ;;
 	emulationstation) step_emulationstation ;;
@@ -695,6 +829,7 @@ case "${1:-all}" in
 	fel) step_fel ;;
 	sdcard) step_sdcard "${2:-}" "${3:-}" ;;
 	flash) step_flash ;;
-	all) step_deps; step_linux; step_uboot; step_rootfs; step_image ;;
-	*) echo "usage: $0 [deps|linux|uboot|rootfs|image|initramfs|retroarch|emulationstation|launcher|mesa|gmloader|fel|sdcard /dev/sdX [format]|flash|all]" >&2; exit 2 ;;
+	publish) step_publish ;;
+	all) step_deps; step_linux; step_uboot; step_rootfs; step_initramfs ;;
+	*) echo "usage: $0 [deps|linux|uboot|rootfs|initramfs|retroarch|emulationstation|launcher|mesa|gmloader|fel|sdcard /dev/sdX [format]|flash|publish|all]" >&2; exit 2 ;;
 esac

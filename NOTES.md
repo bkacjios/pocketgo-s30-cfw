@@ -23,7 +23,7 @@ leaving the stock firmware in SPI flash untouched (remove the card = stock).
   rotation, menu, input, audio, volume keys.
 - **Pending (next session):** test exFAT. U-Boot exFAT fix (patch 0003) is
   built but untested on hardware. Card currently FAT32 and working; to test:
-  back up `home/roms`, `sudo bash build/build.sh sdcard /dev/sdX format`
+  back up `roms/`, `sudo bash build/build.sh sdcard /dev/sdX format`
   (erases the card, makes exFAT), restore ROMs, boot. Also test USB disk
   mode (hold SELECT at power on; see USB below).
 - Open: red/green LED not found (likely charger hardware); stick click dead on the test unit; clean power-off (long press
@@ -51,13 +51,13 @@ n64/                      Shared N64 platform library for ports/oot, mm, sf64, m
                           has the API and the porting checklist).
                           Other ports/ checkouts are not in this repo.
 s30-build/                $WORK: build trees (git worktrees of external/*,
-                          patched there; sysroot) and outputs (boot/, rootfs.sqfs,
-                          uInitrd, fel.scr, retroarch.bin, u-boot-sunxi-with-spl.bin)
+                          patched there; sysroot) and outputs (boot/, rootfs.ext4,
+                          rootfs.sqfs, uInitrd, fel.scr, retroarch.bin,
+                          u-boot-sunxi-with-spl.bin)
 firmware-decoded/         Output of tools/decode_firmware.py
 tools/
   decode_firmware.py      Descrambles the dump into firmware-decoded/
   zklogo.py               Stock boot logo (p4, LZO1X) -> BMP
-  apk_resolve.py          Alpine dependency resolver (APKINDEX, no apk)
   fel_axp_dump.sh         AXP223 (RSB) + CCU register dump from FEL
 linux/
   arch/arm/boot/dts/allwinner/sun8i-a33-pocketgo-s30.dts
@@ -77,13 +77,18 @@ patches/                  Changes to the submodules, one folder each, applied
   emulationstation/       0001 install rules + /usr/share resources (AUR),
                           0002 S30 input setup entries, no hotkey prompt
 build/
-  build.sh                deps|linux|uboot|rootfs|initramfs|retroarch|fel|sdcard
+  build.sh                deps|linux|uboot|rootfs|initramfs|retroarch|fel|sdcard|
+                          flash|publish (packages to gh-pages for System update)
+  s30.rsa                 Package signing key (gitignored; public key in
+                          rootfs-overlay/etc/apk/keys)
   kernel.config           Fragment on top of sunxi_defconfig
   packages                Alpine packages for the rootfs (!name excludes)
-  s30-loader              initramfs /init (mounts SD, squashfs + overlay)
-  rootfs-overlay/         Board files copied into the rootfs: /etc/inittab
+  s30-loader              initramfs /init (mounts SD, rootfs.ext4 or squashfs + overlay)
+  rootfs-overlay/         Board files, the s30-base package: /etc/inittab
                           (BusyBox init), /etc/s30/rc (setup), frontend,
-                          default launcher apps, retroarch.cfg, autoconfig
+                          boot-update (apk trigger: new kernel/U-Boot onto
+                          the card), default launcher apps,
+                          retroarch.cfg, autoconfig
   fel.cmd / fel-ram.cmd   Boot scripts (fel.scr is also /boot/boot.scr on SD)
   splash/logo.bmp         U-Boot splash (stock logo, 320x480 panel-native)
   u-boot/                 defconfig + board devicetree
@@ -245,10 +250,47 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
 
 ## Dev boot loop (stock card, no flashing)
 
-- `build.sh initramfs`: `rootfs.sqfs` (zstd squashfs, ~82 MB: Alpine
-  minirootfs + `build/packages` + rootfs-overlay + retroarch.bin + launcher)
-  and a ~1 MB loader `uInitrd` (busybox + musl + `build/s30-loader`). Also
-  builds `fel.scr`.
+- `build.sh initramfs`: the rootfs tree (Alpine minirootfs, `build/packages`
+  installed by apk itself (`apk.static` for the build host, fetched by
+  `build.sh rootfs`; `--no-scripts`, under fakeroot) so the device's package
+  database is complete. Everything of ours is a package as well (`apk
+  mkpkg`, signed with `build/s30.rsa` (gitignored, made on first use;
+  public key `rootfs-overlay/etc/apk/keys/s30.rsa.pub`); each depends on
+  the libraries its ELF files link, from readelf NEEDED, minus its own),
+  built into the repository `s30-build/repo/armv7` (`apk mkndx`, signed)
+  that the rootfs installs them from: `s30-mesa` first (from mesa-root;
+  provides mesa-egl/gbm/gles/dri-gallium and the so: names, so kmscube
+  etc. resolve to it and Alpine's Mesa with LLVM is never pulled), then
+  `s30-tools` (launcher, utils/, libs30lease, splash.bmp), `s30-retroarch`,
+  `s30-emulationstation` (with the carbon theme) with build/packages, then,
+  once the loader exists, `s30-linux` (zImage, DTB, uInitrd, boot.scr in
+  /usr/share/s30/boot; version <kernel>-r<commit count>),
+  `s30-uboot` (u-boot-sunxi-with-spl.bin; <u-boot>-r<count>) and
+  `s30-base` (rootfs-overlay: init, configs, scripts; depends on those
+  three). Ours are 0.<commit count>-r0 with the commit in the description.
+  `s30-base` has an apk trigger on /usr/share/s30/boot:
+  `/usr/libexec/s30/boot-update` runs after apk unpacked a new kernel,
+  loader or U-Boot and copies them to /boot on the card (as .new + mv;
+  U-Boot dd'd to 8 KiB when the card holds one there and it differs). The
+  SPI flash is never written by it: flash.cmd boots /boot from the card
+  first, so the flash is the bootloader and a fallback kernel, refreshed by
+  hand (`build.sh flash`, `s30-flash write`). `build.sh publish` (clean tree only: versions come from the commit
+  count) copies the repository to the orphan `gh-pages` branch (one
+  commit, force-pushed; `.nojekyll`), switches GitHub Pages on once (gh
+  api) and the device's `/etc/apk/repositories` lists
+  `https://bkacjios.github.io/pocketgo-s30-cfw/apk` (`S30_APK_REPO`), so
+  the System update app upgrades our packages too.
+  `.github/workflows/packages.yml` runs the whole build (deps, linux, uboot,
+  rootfs, mesa, launcher, retroarch, emulationstation, initramfs, publish,
+  flash) on every push to main, the key from the secret `S30_SIGN_KEY`
+  (`gh secret set S30_SIGN_KEY < build/s30.rsa`), and keeps the boot files
+  (spi-nor.bin, U-Boot, zImage, uInitrd, rootfs.sqfs) as the artifact
+  "boot". Then
+  `rootfs.ext4` (1 GiB ext4
+  image, sparse on the host; the device's read-write root, see "Linux
+  system") and `rootfs.sqfs` (zstd squashfs, ~82 MB; the read-only fallback
+  and what `fel` pushes), and a ~1 MB loader `uInitrd` (busybox + musl +
+  e2fsck + `build/s30-loader`). Also builds `fel.scr`.
 - `build.sh fel` with the device on stock (adb up): `adb push --sync` kernel,
   DTB, uInitrd, rootfs.sqfs and logo.bmp to `/boot` on the card (~1 MB/s, only
   changed files), FEL flag, reboot, upload U-Boot + `fel.scr` (loads /boot from
@@ -257,18 +299,39 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
 - Updating a running device over ssh (no reboot needed until you want the
   new files): copy to a temp name, then `mv` into place, `sync`:
   `scp s30-build/boot/zImage s30-build/uInitrd root@10.42.0.2:/mnt/sd/boot/`
-  (as `*.new`, then mv). Never overwrite `rootfs.sqfs` while it is running:
-  it is loop-mounted as `/`, and rewriting it in place breaks the running
-  system. Instead copy it to `/mnt/sd/boot/rootfs.sqfs.new`: `s30-loader`
-  renames it over `rootfs.sqfs` at the next boot, before mounting it.
+  (as `*.new`, then mv). Never overwrite `rootfs.ext4` or `rootfs.sqfs`
+  while it is running: it is loop-mounted as `/`, and rewriting it in place
+  breaks the running system. Instead copy it to `/mnt/sd/boot/rootfs.ext4.new`
+  (`.sqfs.new`): `s30-loader` renames it over the old one at the next boot,
+  before mounting it. With the ext4 root a whole new image also throws away
+  what was changed on the device; for a changed program, `scp` it into place
+  on the live root instead (`/usr/bin/s30-launcher` etc., as `.new` then mv).
 - After boot `rc` clears `/dev/fb0` to black (after `s30-splash 100`), or
   fbcon shows the splash again between apps (when a KMS app exits).
 - The old sunxi-tools (1.4.2) can't pass the script address for SPL header v3;
   `CONFIG_PREBOOT` sets `fel_scriptaddr` instead.
 - USB under Linux is a configfs composite gadget set up by `/etc/s30/rc`:
   ACM serial shell (`/dev/ttyACM*`) plus NCM networking (verified
-  2026-10-29). Device 10.42.0.2, udhcpd hands the host 10.42.0.1 (no
-  router/DNS). `s30-mdns` (utils/, started by `usb-gadget` with the network
+  2026-10-29). Addresses by `/usr/libexec/s30/usb-network` (started by
+  `usb-gadget` with the network function, 2026-11-13): it waits for a host
+  to enumerate the gadget (UDC state `configured`), then asks for a DHCP
+  lease for 6 s (udhcpc, `-r 10.42.0.2`, script `udhcpc-usb0`: address,
+  default route, the host as DNS). A host that shares its connection
+  (NetworkManager "Shared to other computers" = `nmcli con mod <usb
+  connection> ipv4.method shared`, needs dnsmasq installed, hands out
+  10.42.0.10-254; Windows ICS; macOS Internet Sharing) answers, and the
+  device has internet (System update app; the launcher's header shows a
+  chain link left of the battery while a default route exists). Otherwise the
+  device is 10.42.0.2 and udhcpd hands the host 10.42.0.1 (no router/DNS),
+  which needs no host setup. Not both at once: our udhcpd would answer our
+  own udhcpc. When the host goes away (unplug, sleep) everything is dropped
+  and it waits again, so a replug re-decides. Waiting for `configured`
+  matters: at boot the first DISCOVERs sat in the gadget until the host
+  enumerated, the PC's OFFERs came after a 4 s window had closed and the
+  device fell back to serving. Verified 2026-11-13: lease 10.42.0.104,
+  ping and DNS through the PC, System update ran (NTP, apk update, apk
+  upgrade: 93 packages current).
+  `s30-mdns` (utils/, started by `usb-gadget` with the network
   function) answers mDNS A queries for `s30.local` on usb0, so
   `ssh root@s30.local` works on Linux (systemd-resolved with MulticastDNS,
   or avahi), macOS and Windows 10+ without host setup; `10.42.0.2` still
@@ -316,9 +379,26 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   `rootfs.sqfs.new` before installing it. Stage an update as another name
   and `mv` it to `rootfs.sqfs.new` on the device: a reboot during the copy
   once installed a truncated image (recovered through a card reader).
-- Root is squashfs + tmpfs overlay: changes outside the SD card are lost at
-  reboot. For quick tests, edit `/etc/...` live and `killall s30-launcher`
-  (init respawns the frontend).
+- Root (2026-11-13): `/boot/rootfs.ext4`, a 1 GiB ext4 image on the card,
+  loop-mounted read-write as `/` by `s30-loader` (after `e2fsck -p`, silent;
+  exit 4+ gets `e2fsck -y` on the LCD. The loader carries e2fsck's
+  libraries, libeconf and libgcc_s included: without one, the dynamic
+  loader's error went to the LCD for a moment at every boot and no check
+  ran; build.sh now verifies every NEEDED). Changes persist: `apk add`,
+  edits under `/etc`, a program copied over ssh. The card stays exFAT (PC
+  readable), so the root has to be a file; `resize2fs` grows the image
+  after `truncate`/`fallocate` on the PC. Without `rootfs.ext4` the loader
+  falls back to `rootfs.sqfs` + tmpfs overlay (changes lost at reboot).
+  `/run` and `/tmp` are tmpfs either way (rc). At shutdown inittab remounts
+  `/` read-only, syncs, then remounts `/mnt/sd` (same options): the card
+  can't be unmounted or made read-only (the loop device holds the image
+  open for writing, EBUSY), and `sync` alone does not clear exFAT's
+  VolumeDirty flag (set on every write, cleared only by unmount or by any
+  remount, `exfat_reconfigure`); without the remount every boot would run
+  fsck.exfat and wait for START. Verified live 2026-11-13 (flag at byte 106
+  of the partition: 2 after sync, 0 after the remount). A crash or a pulled
+  battery still leaves the card dirty (fsck.exfat, START) and the ext4
+  journal replays.
 
 ## Linux system (BusyBox init)
 
@@ -328,7 +408,10 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
 - `/etc/s30/rc`: mounts, udevd (eudev) + trigger (RetroArch's udev input
   needs `ID_INPUT_JOYSTICK`), mixer levels, USB gadget + udhcpd + dropbear,
   seeds `~/.config/retroarch/retroarch.cfg` from `/etc/retroarch.cfg` and
-  missing `/mnt/sd/apps/*.sh` from `/usr/share/s30/apps`, joystick
+  missing `/mnt/sd/apps/*.sh` from `/usr/share/s30/apps` (RetroArch,
+  EmulationStation, System update: `apk update && apk upgrade` on the LCD
+  (`# s30-console`), after `ntpd -q` sets the clock (the mirror's TLS
+  certificates), START returns; needs the shared connection above), joystick
   calibration, blue LED when done.
 - `HOME=/mnt/sd/home`, `XDG_RUNTIME_DIR=/run/user/0` from
   `/etc/profile.d/s30.sh` (login shells, rc, frontend; `ssh host cmd` is not
@@ -439,7 +522,7 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   fbcon=logo-pos:center loglevel=3` with `/dev/console` = ttyS0 (last
   `console=`): init, rc and kernel errors go to serial, not the panel; apps
   log to `/tmp/frontend.log`.
-- GPU: lima + Mesa 26.1 (`mesa-dri-gallium`), kmscube runs on the panel
+- GPU: lima + Mesa 26.1 (our build, package `s30-mesa`), kmscube runs on the panel
   (`kmscube -D /dev/dri/card1`; card0 is lima, card1 sun4i-drm), renderer
   "Mali400", GLES 2.0. Alpine's gallium pulls in llvm22-libs (~120 MB).
 
@@ -465,7 +548,7 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   L1+R1+Start+Select = menu (the power key is the system menu's), volume keys
   = system volume; clock off (no
   RTC battery); `config_save_on_exit = "true"`; dirs under
-  `~/.config/retroarch`, ROM browser `~/roms`.
+  `~/.config/retroarch`, ROM browser `/mnt/sd/roms`.
 - Gamepad autoconfig: udev joypad numbers buttons in code order from
   BTN_JOYSTICK: SOUTH(B)=0 EAST(A)=1 NORTH(X)=2 WEST(Y)=3 TL 4 TR 5 TL2 6
   TR2 7 SELECT 8 START 9 THUMBL 10 DPAD 11-14; stick axes 0/1.
@@ -489,7 +572,7 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   VLC plugins, so video previews don't play).
 - Launcher app EmulationStation.sh: `--screenrotate 3 --screensize 480 320`
   (window is the panel's 320x480; the canvas is laid out landscape).
-- /etc/emulationstation: es_systems.cfg (gb, gba, nes from ~/roms/<system>
+- /etc/emulationstation: es_systems.cfg (gb, gba, nes from /mnt/sd/roms/<system>
   through RetroArch with gambatte, mgba, fceumm), es_input.cfg (the S30
   gamepad, copied to ~/.emulationstation by rc when missing), themes/carbon
   (submodule external/es-theme-carbon).
@@ -628,8 +711,9 @@ Claude Code has no tty; run it in a normal terminal).
 Card layout:
 
 ```
-/boot/  zImage  sun8i-a33-pocketgo-s30.dtb  uInitrd  rootfs.sqfs  logo.bmp  boot.scr
-/home/  ($HOME) roms/  .config/retroarch/{retroarch.cfg,saves,states,system,screenshots}
+/boot/  zImage  sun8i-a33-pocketgo-s30.dtb  uInitrd  rootfs.ext4  rootfs.sqfs  logo.bmp  boot.scr
+/home/  ($HOME) .config/retroarch/{retroarch.cfg,saves,states,system,screenshots}
+/roms/  /games/  /apps/  /screenshots/
 ```
 
 - U-Boot's fs/exfat was broken on 32-bit ARM (patch 0003): it did not build
@@ -681,7 +765,11 @@ about twice as long per MB. A card with U-Boot at 8 KiB still takes priority.
   splitting into p0..p4 (384/128/7296/128/256 KiB).
 - `build.sh flash` -> `out/spi-nor.bin`: U-Boot+SPL @0, FIT @0xc0000
   (`build/flash.its`: XZ zImage, DTB, initramfs, `flash.cmd`), logo BMP
-  @0x780000. U-Boot patches 0005 (A33 SPL SPI boot, zb25vq64,
+  @0x780000. `flash.cmd` (2026-11-17) loads /boot/zImage, the DTB and
+  uInitrd from the card first (what the s30-linux package and boot-update
+  keep current) and boots the FIT's copies only when those fail, so the
+  flash is a bootloader plus fallback kernel and a kernel upgrade never
+  rewrites it. U-Boot patches 0005 (A33 SPL SPI boot, zb25vq64,
   `spi_booted`), 0006 (display up even without a splash image: the panel
   handoff needs it), 0007 (logo from flash, else the card; header checked:
   erased flash reads size 0xffffffff, which wrapped U-Boot's size check and
@@ -701,6 +789,17 @@ about twice as long per MB. A card with U-Boot at 8 KiB still takes priority.
   after. Reads go in 64 KiB pieces: one 4 MiB SPI transfer (PIO, no DMA)
   timed out while the window started. s30-display treats it like the
   launcher (no FPS overlay, no Exit in the menu).
+- Launcher home (2026-11-13): Games (/mnt/sd/games, the ports' scripts and
+  icons), ROMs (/mnt/sd/roms/<system>), Apps (/mnt/sd/apps: RetroArch,
+  EmulationStation), Screenshots, Files. A ROM (an extension one of the
+  installed cores takes: retroarch.cfg's libretro_directory plus
+  ~/.config/retroarch/cores, described by an .info in libretro_info_path or
+  next to the core) runs with `retroarch -L core`; X on a ROM or on
+  a folder in ROMs picks the core (a ROM's choice, else its folder's or a
+  parent's, else the default: mGBA for gba, Gambatte for gb/gbc, otherwise
+  the first core that takes it), saved in ~/.config/s30/cores as
+  "path=core" lines. EmulationStation and RetroArch's browser use
+  /mnt/sd/roms too. The sdcard step makes games/, roms/, apps/.
 - Launcher: app output goes to the log; a launch script with a
   `# s30-console` line (first 10 lines) also gets it on tty1, which
   s30-display shows whenever no app holds the display.
@@ -732,9 +831,6 @@ sudo bash build/build.sh sdcard /dev/sdX [format]            # standalone card
 Upstream versions are the submodule commits (external/). To move one: check
 out the new tag in external/<name>, commit the submodule, delete
 $WORK/<name> (it is a worktree with the board patches applied) and rebuild.
-
-The old `image` step (ext4 `out/sdcard.img`) predates the squashfs + /boot
-layout and does not match it; use `sdcard`.
 
 ## Display notes
 
@@ -1042,6 +1138,19 @@ rsync -rt zelda data root@10.42.0.2:/mnt/sd/home/ports/oot/
 
 ## Next session
 
+- ext4 root (2026-11-13, verified: boots, persists, clean reboot runs no
+  card check, no console text). The SPI flash FIT still carries the old
+  loader (no rootfs.ext4; boots rootfs.sqfs) and the old flash.cmd (FIT
+  only, never the card's /boot): `build.sh flash` + `s30-flash write
+  out/spi-nor.bin` once, so SPI boot takes the card's kernel.
+- Packages (2026-11-17): signed repo, s30-linux/s30-uboot/s30-base and the
+  boot-update trigger are built but not yet run on the device; `build.sh
+  publish` has not been run (no gh-pages branch yet). To verify: install
+  the new rootfs, publish, bump a commit, publish again, System update on
+  the device: the s30-linux upgrade must print "boot-update: /boot/zImage
+  on the card" and the next boot run the new kernel; with the card's
+  U-Boot gone (dd zeros over 8 KiB), SPI U-Boot must still boot /boot from
+  the card.
 - Test Sleep on hardware: panel off/on, wake on power key, audio after
   resume, current draw while asleep (s2idle saves less than suspend-to-RAM).
 - Verify Shut down from the launcher actually cuts power.
