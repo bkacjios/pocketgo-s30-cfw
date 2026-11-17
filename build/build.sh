@@ -743,6 +743,18 @@ step_publish() {
 	mkdir -p "$gh/apk"
 	cp -r "$repo/." "$gh/apk/"
 	touch "$gh/.nojekyll"
+	# Pages lists no directories: an index.html with the packages (at the
+	# root and next to them)
+	{
+		echo "<!doctype html><meta charset=utf-8><title>PocketGo S30 packages</title>"
+		echo "<h1>PocketGo S30 packages</h1><p>$desc, $(date -u +%Y-%m-%d). Repository line for /etc/apk/repositories: <code>$S30_APK_REPO</code></p><pre>"
+		for f in "$repo"/armv7/*; do
+			printf '<a href="apk/armv7/%s">%s</a>%*s %8d KiB\n' "${f##*/}" "${f##*/}" \
+				$((48 - ${#f} + ${#repo} + 7)) "" $(( ($(stat -c %s "$f") + 1023) / 1024 ))
+		done
+		echo "</pre>"
+	} > "$gh/index.html"
+	sed 's|href="apk/armv7/|href="|' "$gh/index.html" > "$gh/apk/armv7/index.html"
 	git -C "$gh" add -A
 	git -C "$gh" -c user.name="build.sh publish" -c user.email="build@pocketgo-s30" \
 		commit -qm "Packages $desc"
