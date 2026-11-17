@@ -207,15 +207,20 @@ static inline int s30_capture_prepare(int fd, uint32_t plane, S30CapturePlane* p
 	return 0;
 }
 
-/* After the vblank: a flip queued before it has applied by now, so the plane
-   may show another buffer than prepare mapped; map that one instead (the
-   geometry stays). A few ioctls, unlike prepare. */
-static inline int s30_capture_rebuffer(int fd, uint32_t plane, S30CapturePlane* p) {
+/* The plane's framebuffer now */
+static inline uint32_t s30_capture_fb(int fd, uint32_t plane) {
 	drmModePlane* pl = drmModeGetPlane(fd, plane);
 	uint32_t fbId = pl != NULL ? pl->fb_id : 0;
 
 	drmModeFreePlane(pl);
-	if (fbId == p->fbId) {
+	return fbId;
+}
+
+/* After the vblank: a flip queued before it has applied by now, so the plane
+   may show another buffer than prepare mapped; map that one instead (the
+   geometry stays). A few ioctls, unlike prepare. */
+static inline int s30_capture_rebuffer(int fd, uint32_t plane, S30CapturePlane* p) {
+	if (s30_capture_fb(fd, plane) == p->fbId) {
 		return 0;
 	}
 	s30_capture_unmap(fd, p);
@@ -322,8 +327,13 @@ static inline void s30_capture_blend(const S30CapturePlane* p, uint32_t* screen)
    lookups done before it and the buffers looked up again after it (a flip
    the app queued before the vblank applies at it; the buffer it showed
    before is the one the app draws into next, which is what tore before
-   2026-11-17): the buffer on screen after the vblank stays there for at
-   least one frame of the app's while the copy, a few ms, runs. */
+   2026-11-17). The buffer on screen after the vblank normally stays there
+   for a frame of the app's while the copy, a few ms, runs; when it did
+   not (the plane shows another buffer once the copy is done: the app
+   flipped again, and may have drawn into the one copied), the copy is
+   done again at the next vblank, up to S30_CAPTURE_RETRIES times, so a
+   frame is never assembled from a buffer in flux. */
+#define S30_CAPTURE_RETRIES 3
 #ifdef S30_CAPTURE_TRACE
 #include <time.h>
 static inline double s30_capture_ms(void) {
@@ -369,28 +379,41 @@ static inline int s30_capture(const S30Capture* c, int gameOnly, int vsync, uint
 		ok[i] = s30_capture_prepare(c->fd, order[i], &planes[i]) == 0;
 	}
 	S30_TRACE(t2);
-	if (vsync) {
-		drmVBlank vb;
+	for (j = 0;; j++) {
+		int stable = 1;
 
-		memset(&vb, 0, sizeof(vb));
-		vb.request.type = DRM_VBLANK_RELATIVE;
-		vb.request.sequence = 1;
-		drmWaitVBlank(c->fd, &vb);
-	}
-	S30_TRACE(t3);
-	if (vsync) {
-		for (i = 0; i < n; i++) {
-			if (ok[i]) {
-				ok[i] = s30_capture_rebuffer(c->fd, order[i], &planes[i]) == 0;
+		if (vsync) {
+			drmVBlank vb;
+
+			memset(&vb, 0, sizeof(vb));
+			vb.request.type = DRM_VBLANK_RELATIVE;
+			vb.request.sequence = 1;
+			drmWaitVBlank(c->fd, &vb);
+			for (i = 0; i < n; i++) {
+				if (ok[i]) {
+					ok[i] = s30_capture_rebuffer(c->fd, order[i], &planes[i]) == 0;
+				}
 			}
 		}
-	}
-	S30_TRACE(t4);
-	for (i = 0; i < n; i++) {
-		if (ok[i]) {
-			ok[i] = s30_capture_copy(&planes[i]) == 0;
+		for (i = 0; i < n; i++) {
+			if (ok[i]) {
+				ok[i] = s30_capture_copy(&planes[i]) == 0;
+			}
+		}
+		if (!vsync) {
+			break;
+		}
+		for (i = 0; i < n; i++) {
+			if (ok[i] && s30_capture_fb(c->fd, order[i]) != planes[i].fbId) {
+				stable = 0; // flipped during the copy
+			}
+		}
+		if (stable || j == S30_CAPTURE_RETRIES) {
+			break;
 		}
 	}
+	S30_TRACE(t3);
+	S30_TRACE(t4);
 	S30_TRACE(t5);
 	for (i = 0; i < n; i++) {
 		s30_capture_unmap(c->fd, &planes[i]);
@@ -401,8 +424,8 @@ static inline int s30_capture(const S30Capture* c, int gameOnly, int vsync, uint
 		}
 	}
 #ifdef S30_CAPTURE_TRACE
-	fprintf(stderr, "capture: %d planes, list %.1f prepare %.1f vblank %.1f rebuffer %.1f copy %.1f blend %.1f ms\n", n,
-	        t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, s30_capture_ms() - t5);
+	fprintf(stderr, "capture: %d planes, list %.1f prepare %.1f vblank+copy %.1f (%d tries) blend %.1f ms\n", n,
+	        t1 - t0, t2 - t1, t3 - t2, j + 1, s30_capture_ms() - t5);
 #endif
 	return 0;
 }
