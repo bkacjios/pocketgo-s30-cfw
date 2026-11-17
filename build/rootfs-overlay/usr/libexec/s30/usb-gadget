@@ -96,7 +96,9 @@ create() {
 # Rebind with the saved functions
 apply() {
 	create
-	killall s30-uvc s30-uac s30-mdns usb-network udhcpc udhcpd 2>/dev/null
+	# usb0's only: Wi-Fi (the s30-wifi package) runs its own udhcpc and s30-mdns on wlan0
+	killall s30-uvc s30-uac usb-network udhcpd 2>/dev/null
+	pkill -f "s30-mdns usb0" 2>/dev/null; pkill -f "udhcpc -i usb0" 2>/dev/null
 	echo > $G/UDC 2>/dev/null
 	for f in $ORDER; do rm -f $G/configs/c.1/$(inst $f); done
 	any=

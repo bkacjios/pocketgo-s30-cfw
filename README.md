@@ -36,7 +36,8 @@ an ext4 image mounted read-write as the root, so `apk add` and edits under
 The System update app (Apps) runs `apk update` and `apk upgrade` on the
 device: Alpine's packages are installed by apk and everything of ours is a
 package too (`s30-mesa`, `s30-tools`, `s30-retroarch`,
-`s30-emulationstation`, `s30-linux`, `s30-uboot`, `s30-base`), so the
+`s30-emulationstation`, `s30-linux`, `s30-uboot`, `s30-base`; `s30-wifi`
+for a device with a radio), so the
 database covers the whole system. Our packages come from this repository's
 `gh-pages` branch (GitHub Actions builds and publishes on every push to
 main, `.github/workflows/packages.yml`; by hand `bash build/build.sh

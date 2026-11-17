@@ -38,7 +38,9 @@
  * and Shut down; Settings has a brightness slider (D-pad left/right; the
  * level is saved to the file given as argument and restored at start), the
  * performance overlay switch, USB (the gadget's functions, switched by
- * /usr/libexec/s30/usb-gadget, and USB storage) and the stick calibration.
+ * /usr/libexec/s30/usb-gadget, and USB storage), Wi-Fi (only when
+ * /usr/libexec/s30/wifi exists, the s30-wifi package: on/off, the networks
+ * seen, a password keyboard) and the stick calibration.
  * The battery (level, and a bolt while charging)
  * shows in a small box in the screen's top right, where the launcher shows it. That process is frozen (SIGSTOP) and
  * the gamepad grabbed while the menu is open; Exit sends SIGTERM, then
@@ -159,7 +161,7 @@ static uint64_t sOsdUntil, sNextLeaseCheck;
 static pid_t sAppPid;         // process holding the lease
 static int sAppLauncher;      // ... and it is the launcher (no performance overlay)
 static int sMenu, sMenuSel;   // system menu open, selected item
-static int sMenuPage;         // 0: app, 1: system, 2: stick calibration, 3: settings, 4: USB storage confirmation, 5: USB
+static int sMenuPage;         // 0: app, 1: system, 2: stick calibration, 3: settings, 4: USB storage confirmation, 5: USB, 6: Wi-Fi, 7: Wi-Fi password
 enum { PERF_OFF, PERF_FULL, PERF_FPS, PERF_MODES };
 static int sPerf;             // performance overlay (System > Overlay, saved)
 static char sPerfFile[320];   // where sPerf is saved ("" if nowhere)
@@ -454,8 +456,12 @@ enum { APP_EXIT, APP_SCREENSHOT, APP_SYSTEM, APP_RESUME };
 static const char* const kAppItems[] = { "Exit game", "Screenshot", "System", "Resume" };
 enum { SYS_SETTINGS, SYS_SLEEP, SYS_REBOOT, SYS_POWEROFF, SYS_BACK };
 static const char* const kSysItems[] = { "Settings", "Sleep", "Reboot", "Shut down", "Back" };
-enum { SET_BRIGHTNESS, SET_PERF, SET_USB, SET_CALIBRATE, SET_BACK };
-static const char* const kSetItems[] = { NULL, "Overlay", "USB Devices", "Calibrate stick", "Back" };
+enum { SET_BRIGHTNESS, SET_PERF, SET_USB, SET_WIFI, SET_CALIBRATE, SET_BACK, SET_IDS };
+static const char* const kSetItems[SET_IDS] = { NULL, "Overlay", "USB Devices", "Wi-Fi", "Calibrate stick", "Back" };
+/* The Settings rows actually shown (Wi-Fi only with the s30-wifi package:
+   WIFI_CMD exists), set by set_rows at menu_open: row -> id, the labels */
+static int sSetRows[SET_IDS], sSetCount;
+static const char* sSetLabels[SET_IDS];
 /* The USB page: the endpoint slots in use (a bar, not selectable), the
    gadget's functions in usb-gadget's order (each with its cost in pips),
    then USB storage */
@@ -467,25 +473,177 @@ static const char* const kUsbFnNames[USBF_FUNCS] = { "serial", "network", "audio
 enum { USB_TEXT_ROWS = 2, USB_OK = 2, USB_CANCEL };
 static const char* const kUsbItems[] = { "USB storage mode", "reboots the device", "OK", "Cancel" };
 
+/* Wi-Fi (pages 6 and 7), through the s30-wifi package's script: its
+   status and the networks of the last scan, refreshed every WIFI_POLL_MS
+   while the page is open; the password typed on page 7 */
+#define WIFI_CMD "/usr/libexec/s30/wifi"
+#define WIFI_MAX 7 // networks listed
+#define WIFI_SSID_MAX 33
+#define WIFI_POLL_MS 2000
+#define WIFI_MENU_W 300 // pages 6 and 7 are wider than MENU_W
+#define WIFI_PASS_MAX 63
+#define WIFI_PASS_MIN 8 // WPA
+enum { WIFI_TOGGLE, WIFI_FIRST }; // page 6 rows: the switch, the networks, Back
+static int sWifiAvail; // WIFI_CMD exists (the package is installed)
+static struct { int bars, secure, saved; char ssid[WIFI_SSID_MAX]; } sWifiNet[WIFI_MAX];
+static int sWifiCount, sWifiHw, sWifiOn;
+static char sWifiState[16] = "off", sWifiSsid[WIFI_SSID_MAX], sWifiIp[20];
+static uint64_t sWifiNext; // next refresh while page 6 is open
+static int sWifiRow;       // the network row the password page came from
+static char sWifiTarget[WIFI_SSID_MAX], sWifiPass[WIFI_PASS_MAX + 1];
+static int sWifiPassLen, sKbRow, sKbCol, sKbShift, sKbShiftHeld; // Y toggles shift, L1/R1 hold it
+/* The stick moves through the menus like the D-pad: a deflection past
+   STICK_DEAD from the centre (128) is a press, back within STICK_RELEASE
+   a release */
+#define STICK_DEAD 50
+#define STICK_RELEASE 30
+static int sStickDirX, sStickDirY;
+/* The keyboard: rows of KB_COLS keys (plain and shifted), then the actions */
+#define KB_ROWS 4
+#define KB_COLS 10
+enum { KB_TITLE, KB_FIELD, KB_KEYS, KB_ACTIONS = KB_KEYS + KB_ROWS, KB_PAGE_ROWS };
+enum { KBA_SHIFT, KBA_SPACE, KBA_DELETE, KBA_CONNECT, KB_ACTION_COUNT };
+static const char* const kKbPlain[KB_ROWS] = { "1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm,.-" };
+static const char* const kKbShift[KB_ROWS] = { "!@#$%^&*()", "QWERTYUIOP", "ASDFGHJKL\"", "ZXCVBNM;:_" };
+static const char* const kKbActions[KB_ACTION_COUNT] = { "Shift", "Space", "Delete", "Connect" };
+
+static int set_id(int row) {
+	return sSetRows[row];
+}
+
+static int set_row(int id) {
+	int i;
+
+	for (i = 0; i < sSetCount; i++) {
+		if (sSetRows[i] == id) {
+			return i;
+		}
+	}
+	return 0;
+}
+
+static void set_rows(void) {
+	int id;
+
+	sWifiAvail = access(WIFI_CMD, X_OK) == 0;
+	sSetCount = 0;
+	for (id = 0; id < SET_IDS; id++) {
+		if (id == SET_WIFI && !sWifiAvail) {
+			continue;
+		}
+		sSetRows[sSetCount] = id;
+		sSetLabels[sSetCount++] = kSetItems[id];
+	}
+}
+
 static const char* const* menu_items(void) {
 	return sMenuPage == 5   ? kUsbFnItems
 	       : sMenuPage == 4 ? kUsbItems
-	       : sMenuPage == 3 ? kSetItems
+	       : sMenuPage == 3 ? sSetLabels
 	       : sMenuPage == 1 ? kSysItems
-	                        : kAppItems;
+	                        : kAppItems; // pages 6 and 7 draw their own rows
 }
 
 static int menu_count(void) {
-	return sMenuPage == 0 || sMenuPage == 4 ? 4 : sMenuPage == 5 ? 7 : 5;
+	return sMenuPage == 7   ? KB_PAGE_ROWS
+	       : sMenuPage == 6 ? (sWifiHw ? sWifiCount + 2 : 2)
+	       : sMenuPage == 5 ? 7
+	       : sMenuPage == 3 ? sSetCount
+	       : sMenuPage == 0 || sMenuPage == 4 ? 4
+	                                           : 5;
 }
 
 /* The row B returns from (its glyph is drawn there) */
 static int menu_back_row(void) {
-	return sMenuPage == 5   ? USBF_BACK
+	return sMenuPage == 7   ? -1
+	       : sMenuPage == 6 ? menu_count() - 1
+	       : sMenuPage == 5 ? USBF_BACK
 	       : sMenuPage == 4 ? USB_CANCEL
-	       : sMenuPage == 3 ? SET_BACK
+	       : sMenuPage == 3 ? set_row(SET_BACK)
 	       : sMenuPage == 1 ? SYS_BACK
 	                        : APP_RESUME;
+}
+
+/* The menu box: wider for the Wi-Fi pages */
+static int menu_w(void) {
+	return sMenuPage >= 6 ? WIFI_MENU_W : MENU_W;
+}
+
+static int menu_x(void) {
+	return (PANEL_H - menu_w()) / 2;
+}
+
+/* WIFI_CMD with up to three arguments, waited for; its exit status */
+static int wifi_run(const char* a1, const char* a2, const char* a3) {
+	pid_t pid = fork();
+	int status = -1;
+
+	if (pid == 0) {
+		int null = open("/dev/null", O_RDWR | O_CLOEXEC);
+		if (null >= 0) {
+			dup2(null, STDOUT_FILENO);
+			dup2(null, STDERR_FILENO);
+		}
+		execl(WIFI_CMD, "wifi", a1, a2, a3, (char*)NULL);
+		_exit(127);
+	}
+	if (pid > 0) {
+		waitpid(pid, &status, 0);
+	}
+	return status;
+}
+
+/* The status and the networks seen, from WIFI_CMD */
+static void wifi_refresh(void) {
+	FILE* f = popen(WIFI_CMD " status", "r");
+	char line[128], key[16], val[80];
+
+	sWifiHw = sWifiOn = 0;
+	snprintf(sWifiState, sizeof(sWifiState), "off");
+	sWifiSsid[0] = sWifiIp[0] = '\0';
+	while (f != NULL && fgets(line, sizeof(line), f) != NULL) {
+		if (sscanf(line, "%15s %79[^\n]", key, val) != 2) {
+			continue;
+		}
+		if (strcmp(key, "hw") == 0) {
+			sWifiHw = strcmp(val, "yes") == 0;
+		} else if (strcmp(key, "on") == 0) {
+			sWifiOn = strcmp(val, "yes") == 0;
+		} else if (strcmp(key, "state") == 0) {
+			snprintf(sWifiState, sizeof(sWifiState), "%s", val);
+		} else if (strcmp(key, "ssid") == 0) {
+			snprintf(sWifiSsid, sizeof(sWifiSsid), "%s", val);
+		} else if (strcmp(key, "ip") == 0) {
+			snprintf(sWifiIp, sizeof(sWifiIp), "%s", val);
+		}
+	}
+	if (f != NULL) {
+		pclose(f);
+	}
+	sWifiCount = 0;
+	if (!sWifiOn) {
+		return;
+	}
+	f = popen(WIFI_CMD " networks", "r");
+	while (f != NULL && sWifiCount < WIFI_MAX && fgets(line, sizeof(line), f) != NULL) {
+		int bars, secure, saved;
+		char ssid[WIFI_SSID_MAX];
+
+		if (sscanf(line, "%d %d %d %32[^\n]", &bars, &secure, &saved, ssid) != 4) {
+			continue;
+		}
+		sWifiNet[sWifiCount].bars = bars;
+		sWifiNet[sWifiCount].secure = secure;
+		sWifiNet[sWifiCount].saved = saved;
+		snprintf(sWifiNet[sWifiCount].ssid, WIFI_SSID_MAX, "%s", ssid);
+		sWifiCount++;
+	}
+	if (f != NULL) {
+		pclose(f);
+	}
+	if (sMenuPage == 6 && sMenuSel >= menu_count()) {
+		sMenuSel = menu_count() - 1; // fewer networks than before
+	}
 }
 
 /* The gadget's functions as usb-gadget reports them (it owns the switches,
@@ -530,7 +688,7 @@ static void usb_status(void) {
 }
 
 static int on_brightness_row(void) {
-	return sMenuPage == 3 && sMenuSel == SET_BRIGHTNESS;
+	return sMenuPage == 3 && set_id(sMenuSel) == SET_BRIGHTNESS;
 }
 
 static int brightness_min(void);
@@ -603,33 +761,202 @@ static void draw_usb_pips(int y, int fn, int selected) {
 	}
 }
 
+/* Signal strength: four bars of rising height, `bars` of them lit */
+static void draw_wifi_bars(int x, int y, int bars, uint32_t lit, uint32_t dim) {
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		int h = 4 + i * 3;
+		fill(x + i * 4, y + 12 - h, 3, h, argb(i < bars ? lit : dim, 1.0f));
+	}
+}
+
+/* A padlock: the shackle over the body */
+static void draw_wifi_lock(int x, int y, uint32_t rgb) {
+	fill(x + 2, y, 5, 2, argb(rgb, 1.0f));
+	fill(x + 1, y + 1, 2, 4, argb(rgb, 1.0f));
+	fill(x + 6, y + 1, 2, 4, argb(rgb, 1.0f));
+	fill(x, y + 5, 9, 7, argb(rgb, 1.0f));
+}
+
+/* Page 6, row i at y: the switch with the connection's state, a network
+   (bars, lock, name, "Saved" or "On" on the right), Back */
+static void draw_wifi_row(int i, int y, int selected) {
+	const int x0 = menu_x() + 12, textY = y + (MENU_ROW_H - 16) / 2;
+	const uint32_t white = argb(0xffffff, 1.0f), dim = argb(selected ? 0xd0c8f0 : 0x9090a0, 1.0f);
+	char label[48];
+
+	if (i == WIFI_TOGGLE) {
+		const char* right = !sWifiHw                               ? ""
+		                    : !sWifiOn                             ? ""
+		                    : strcmp(sWifiState, "connected") == 0 ? sWifiIp
+		                    : strcmp(sWifiState, "connecting") == 0 ? "Connecting..."
+		                                                           : "Not connected";
+		if (!sWifiHw) {
+			snprintf(label, sizeof(label), "No Wi-Fi hardware");
+			draw_text(label, menu_x() + (menu_w() - (int)strlen(label) * 8) / 2, textY, 1, argb(0xc0c0c0, 1.0f));
+			return;
+		}
+		snprintf(label, sizeof(label), "Wi-Fi: %s", sWifiOn ? "On" : "Off");
+		draw_text(label, x0, textY, 1, white);
+		draw_text(right, menu_x() + menu_w() - 12 - (int)strlen(right) * 8, textY, 1, dim);
+	} else if (i < menu_count() - 1) {
+		const int n = i - WIFI_FIRST, connected = strcmp(sWifiState, "connected") == 0 && strcmp(sWifiNet[n].ssid, sWifiSsid) == 0;
+		const char* right = connected ? "On" : sWifiNet[n].saved ? "Saved" : "";
+		int x = x0;
+
+		draw_wifi_bars(x, y + (MENU_ROW_H - 12) / 2, sWifiNet[n].bars, 0xffffff, selected ? 0x3a2a70 : 0x404048);
+		x += 22;
+		if (sWifiNet[n].secure) {
+			draw_wifi_lock(x, y + (MENU_ROW_H - 12) / 2, 0xffffff);
+		}
+		x += 16;
+		snprintf(label, sizeof(label), "%.26s", sWifiNet[n].ssid);
+		draw_text(label, x, textY, 1, white);
+		draw_text(right, menu_x() + menu_w() - 12 - (int)strlen(right) * 8, textY, 1,
+		          connected ? argb(0x60e0a0, 1.0f) : dim);
+	} else {
+		int x = menu_x() + (menu_w() - 4 * 8) / 2;
+		draw_text("Back", x, textY, 1, white);
+		draw_button(x - 6 - 14, y + (MENU_ROW_H - 14) / 2, kLetterB);
+	}
+}
+
+static int kb_shift(void) {
+	return sKbShift != sKbShiftHeld;
+}
+
+/* Page 7: "Password for NAME", the password with a cursor, the keys (the
+   one under the cursor on the selection colour), the actions */
+static void draw_wifi_keyboard(int top) {
+	const int cellW = menu_w() / KB_COLS, keyX0 = menu_x() + (menu_w() - cellW * KB_COLS) / 2;
+	const int actW = menu_w() / KB_ACTION_COUNT;
+	char label[64];
+	int r, c;
+
+	snprintf(label, sizeof(label), "Password for %.22s", sWifiTarget);
+	draw_text(label, menu_x() + (menu_w() - (int)strlen(label) * 8) / 2, top + (MENU_ROW_H - 16) / 2, 1,
+	          argb(0xc0c0c0, 1.0f));
+	// The field: the last 34 characters, a cursor after them
+	{
+		const int y = top + KB_FIELD * MENU_ROW_H, maxChars = (menu_w() - 24) / 8 - 1;
+		const char* shown = sWifiPass + (sWifiPassLen > maxChars ? sWifiPassLen - maxChars : 0);
+		int x = menu_x() + 12;
+
+		fill(menu_x() + 8, y + 2, menu_w() - 16, MENU_ROW_H - 4, argb(0x202028, 1.0f));
+		draw_text(shown, x, y + (MENU_ROW_H - 16) / 2, 1, argb(0xffffff, 1.0f));
+		x += (int)strlen(shown) * 8;
+		fill(x, y + 4, 2, MENU_ROW_H - 8, argb(sWifiPassLen >= WIFI_PASS_MIN ? 0x60e0a0 : 0x8060e0, 1.0f));
+	}
+	for (r = 0; r < KB_ROWS; r++) {
+		const char* keys = kb_shift() ? kKbShift[r] : kKbPlain[r];
+		const int y = top + (KB_KEYS + r) * MENU_ROW_H;
+
+		for (c = 0; c < KB_COLS && keys[c] != '\0'; c++) {
+			const int x = keyX0 + c * cellW, sel = sKbRow == r && sKbCol == c;
+			char ch[2] = { keys[c], '\0' };
+
+			if (sel) {
+				fill(x + 1, y + 1, cellW - 2, MENU_ROW_H - 2, argb(0x8060e0, 1.0f));
+			}
+			draw_text(ch, x + (cellW - 8) / 2, y + (MENU_ROW_H - 16) / 2, 1, argb(0xffffff, 1.0f));
+		}
+	}
+	for (c = 0; c < KB_ACTION_COUNT; c++) {
+		const int x = menu_x() + c * actW, y = top + KB_ACTIONS * MENU_ROW_H;
+		const int sel = sKbRow == KB_ROWS && sKbCol == c, on = c == KBA_SHIFT && kb_shift();
+		const int len = (int)strlen(kKbActions[c]);
+
+		if (sel || on) {
+			fill(x + 2, y + 1, actW - 4, MENU_ROW_H - 2, argb(sel ? 0x8060e0 : 0x3a2a70, 1.0f));
+		}
+		draw_text(kKbActions[c], x + (actW - len * 8) / 2, y + (MENU_ROW_H - 16) / 2, 1,
+		          argb(c == KBA_CONNECT && sWifiPassLen < WIFI_PASS_MIN ? 0x606068 : 0xffffff, 1.0f));
+	}
+}
+
+/* The Wi-Fi pages end with a row of button hints (not selectable) */
+static int menu_hint_rows(void) {
+	return sMenuPage >= 6;
+}
+
+/* START as a pill with the word on it, like the face buttons */
+static void draw_pill(int x0, int y0, const char* const* const* word, int letters) {
+	const int w = pill_width(letters);
+	int x, y;
+
+	for (y = 0; y < BUTTON_SIZE; y++) {
+		for (x = 0; x < w; x++) {
+			blend(x0 + x, y0 + y, pill_letter(word, letters, x, y) ? BUTTON_DARK : BUTTON_LIGHT, pill_coverage(x, y, w));
+		}
+	}
+}
+
+/* A button glyph (NULL: the START pill) and what it does, dimmed; the x after it */
+static int menu_hint(int x, int y, const char* const* letter, const char* label) {
+	if (letter != NULL) {
+		draw_button(x, y + 1, letter);
+		x += BUTTON_SIZE + 4;
+	} else {
+		draw_pill(x, y + 1, kWordStart, 5);
+		x += pill_width(5) + 4;
+	}
+	draw_text(label, x, y, 1, argb(0xa0a0b0, 1.0f));
+	return x + (int)strlen(label) * 8 + 12;
+}
+
+static void draw_menu_hints(int y) {
+	int x = menu_x() + 10;
+
+	y += (MENU_ROW_H - 16) / 2;
+	if (sMenuPage == 6) {
+		x = menu_hint(x, y, kLetterA, "Connect");
+		x = menu_hint(x, y, kLetterX, "Forget");
+		menu_hint(x, y, kLetterY, "Rescan");
+	} else {
+		x = menu_hint(x, y, kLetterX, "Delete");
+		x = menu_hint(x, y, kLetterY, "Shift");
+		x = menu_hint(x, y, NULL, "Connect");
+		menu_hint(x, y, kLetterB, "Back");
+	}
+}
+
 /* Top of menu row i */
 static int menu_row_y(int i) {
-	const int h = menu_count() * MENU_ROW_H + 2 * MENU_PAD;
+	const int h = (menu_count() + menu_hint_rows()) * MENU_ROW_H + 2 * MENU_PAD;
 
 	return (PANEL_W - h) / 2 + MENU_PAD + i * MENU_ROW_H;
 }
 
 static void draw_menu(void) {
 	const char* const* items = menu_items();
-	const int rowH = MENU_ROW_H, count = menu_count(), h = count * rowH + 2 * MENU_PAD;
+	const int rowH = MENU_ROW_H, count = menu_count(), h = (count + menu_hint_rows()) * rowH + 2 * MENU_PAD;
 	const int y0 = (PANEL_W - h) / 2, top = y0 + MENU_PAD;
 	int i, capacity, charging;
 
-	draw_box(MENU_X, y0, MENU_W, h, 0.92f);
+	fill(BOX_X, BOX_Y, BOX_W, BOX_H, 0); // the OSD box above the menu, as osd_frame left it (a tall menu reaches into it)
+	draw_box(menu_x(), y0, menu_w(), h, 0.92f);
 	external_power(&capacity, &charging);
 	draw_battery(capacity, charging, 1.0f);
-	fill(BOX_X, BOX_Y, BOX_W, BOX_H, 0); // the OSD box above the menu, as osd_frame left it
 	if (sAlpha > 0.0f && !osd_is_battery()) { // the menu shows the battery itself
 		draw_osd(BOX_X, BOX_Y, sIcon, sShown, sAlpha);
+	}
+	if (menu_hint_rows()) {
+		draw_menu_hints(top + count * rowH);
+	}
+	if (sMenuPage == 7) {
+		draw_wifi_keyboard(top);
+		return;
 	}
 	for (i = 0; i < count; i++) {
 		int y = top + i * rowH;
 
 		if (i == sMenuSel) {
-			fill(MENU_X + 6, y + 1, MENU_W - 12, rowH - 2, argb(0x8060e0, 1.0f));
+			fill(menu_x() + 6, y + 1, menu_w() - 12, rowH - 2, argb(0x8060e0, 1.0f));
 		}
-		if (items[i] == NULL) {
+		if (sMenuPage == 6) {
+			draw_wifi_row(i, y, i == sMenuSel);
+		} else if (items[i] == NULL) {
 			draw_brightness_row(y, i == sMenuSel);
 		} else if (sMenuPage == 5 && i == USBF_SLOTS) {
 			draw_usb_slots(y);
@@ -637,7 +964,7 @@ static void draw_menu(void) {
 			char label[32];
 			int len, x;
 
-			if (sMenuPage == 3 && i == SET_PERF) {
+			if (sMenuPage == 3 && set_id(i) == SET_PERF) {
 				static const char* const modes[] = { "Off", "Full", "FPS" };
 				snprintf(label, sizeof(label), "%s: %s", items[i], modes[sPerf]);
 			} else if (sMenuPage == 5 && i >= USBF_SERIAL && i < USBF_STORAGE) {
@@ -648,7 +975,7 @@ static void draw_menu(void) {
 				snprintf(label, sizeof(label), "%s", items[i]);
 			}
 			len = (int)strlen(label);
-			x = MENU_X + (MENU_W - len * 8) / 2;
+			x = menu_x() + (menu_w() - len * 8) / 2;
 			if (sMenuPage == 5 && i >= USBF_SERIAL && i < USBF_STORAGE) { // left, the pips on the right
 				x = MENU_X + 12;
 				draw_usb_pips(y, i - USBF_SERIAL, i == sMenuSel);
@@ -1469,6 +1796,7 @@ static void menu_open(void) {
 		return;
 	}
 	sMenuLauncher = is_launcher(sAppPid);
+	set_rows();
 	sPadFd = open_input("PocketGo S30 Gamepad");
 	if (sPadFd >= 0) {
 		ioctl(sPadFd, EVIOCGRAB, 1); // the app stops getting input
@@ -1500,6 +1828,7 @@ static void menu_close(int exitApp) {
 	sAlpha = 0.0f; // the OSD box goes with the menu
 	sOsdUntil = 0;
 	sRepeatDir = 0;
+	sStickDirX = sStickDirY = sKbShiftHeld = 0;
 	if (sLessee != 0) {
 		// Back to the (transparent) OSD strip, or the whole screen for the
 		// performance overlay, before the app runs again
@@ -1837,13 +2166,21 @@ static void perf_save(void);
    page (over an app), else out of the menu */
 static void menu_back(void) {
 	sRepeatDir = 0;
-	if (sMenuPage == 4) {
+	if (sMenuPage == 7) {
+		sMenuPage = 6;
+		sMenuSel = sWifiRow;
+		menu_redraw();
+	} else if (sMenuPage == 6) {
+		sMenuPage = 3;
+		sMenuSel = set_row(SET_WIFI);
+		menu_redraw();
+	} else if (sMenuPage == 4) {
 		sMenuPage = 5;
 		sMenuSel = USBF_STORAGE;
 		menu_redraw();
 	} else if (sMenuPage == 5) {
 		sMenuPage = 3;
-		sMenuSel = SET_USB;
+		sMenuSel = set_row(SET_USB);
 		menu_redraw();
 	} else if (sMenuPage == 3) {
 		sMenuPage = 1;
@@ -1858,7 +2195,103 @@ static void menu_back(void) {
 	}
 }
 
+/* Page 7: the key or action under the cursor */
+static void wifi_kb_press(void) {
+	if (sKbRow < KB_ROWS) {
+		const char* keys = kb_shift() ? kKbShift[sKbRow] : kKbPlain[sKbRow];
+		if (sWifiPassLen < WIFI_PASS_MAX) {
+			sWifiPass[sWifiPassLen++] = keys[sKbCol];
+			sWifiPass[sWifiPassLen] = '\0';
+		}
+		return;
+	}
+	switch (sKbCol) {
+		case KBA_SHIFT:
+			sKbShift = !sKbShift;
+			break;
+		case KBA_SPACE:
+			if (sWifiPassLen < WIFI_PASS_MAX) {
+				sWifiPass[sWifiPassLen++] = ' ';
+				sWifiPass[sWifiPassLen] = '\0';
+			}
+			break;
+		case KBA_DELETE:
+			if (sWifiPassLen > 0) {
+				sWifiPass[--sWifiPassLen] = '\0';
+			}
+			break;
+		case KBA_CONNECT:
+			if (sWifiPassLen >= WIFI_PASS_MIN) {
+				wifi_run("connect", sWifiTarget, sWifiPass);
+				memset(sWifiPass, 0, sizeof(sWifiPass));
+				sWifiPassLen = 0;
+				menu_back(); // page 6, which shows the connection coming up
+				wifi_refresh();
+				menu_redraw();
+			}
+			break;
+	}
+}
+
+/* Page 7: the D-pad moves over the keys; from the key rows into the action
+   row and back, the column follows proportionally */
+static void wifi_kb_move(int dr, int dc) {
+	if (dr != 0) {
+		int row = (sKbRow + dr + KB_ROWS + 1) % (KB_ROWS + 1);
+		if (row == KB_ROWS) {
+			sKbCol = sKbCol * KB_ACTION_COUNT / KB_COLS;
+		} else if (sKbRow == KB_ROWS) {
+			sKbCol = sKbCol * KB_COLS / KB_ACTION_COUNT + 1;
+		}
+		sKbRow = row;
+	}
+	if (dc != 0) {
+		int cols = sKbRow == KB_ROWS ? KB_ACTION_COUNT : KB_COLS;
+		sKbCol = (sKbCol + dc + cols) % cols;
+	}
+}
+
+/* Page 6: A on the switch turns Wi-Fi on or off; on a network it connects
+   (straight away when open or kept, else the password page) */
+static void wifi_confirm(void) {
+	if (sMenuSel == WIFI_TOGGLE) {
+		if (sWifiHw) {
+			wifi_run(sWifiOn ? "off" : "on", NULL, NULL);
+			wifi_refresh();
+			sWifiNext = now_ms() + WIFI_POLL_MS;
+		}
+		menu_redraw();
+	} else if (sMenuSel < menu_count() - 1) {
+		const int n = sMenuSel - WIFI_FIRST;
+		if (sWifiNet[n].saved || !sWifiNet[n].secure) {
+			wifi_run("connect", sWifiNet[n].ssid, NULL);
+			wifi_refresh();
+			menu_redraw();
+		} else {
+			snprintf(sWifiTarget, sizeof(sWifiTarget), "%s", sWifiNet[n].ssid);
+			memset(sWifiPass, 0, sizeof(sWifiPass));
+			sWifiPassLen = sKbRow = sKbCol = sKbShift = 0;
+			sWifiRow = sMenuSel;
+			sMenuPage = 7;
+			menu_redraw();
+		}
+	} else {
+		menu_back();
+	}
+}
+
 static void menu_confirm(void) {
+	if (sMenuPage == 7) {
+		wifi_kb_press();
+		if (sMenuPage == 7) {
+			menu_redraw();
+		}
+		return;
+	}
+	if (sMenuPage == 6) {
+		wifi_confirm();
+		return;
+	}
 	if (!sMenuPage) {
 		if (sMenuSel == APP_SYSTEM) {
 			sMenuPage = 1;
@@ -1901,7 +2334,7 @@ static void menu_confirm(void) {
 		switch (sMenuSel) {
 			case SYS_SETTINGS:
 				sMenuPage = 3;
-				sMenuSel = SET_BRIGHTNESS;
+				sMenuSel = set_row(SET_BRIGHTNESS);
 				menu_redraw();
 				break;
 			case SYS_SLEEP:
@@ -1919,7 +2352,7 @@ static void menu_confirm(void) {
 		}
 		return;
 	}
-	switch (sMenuSel) {
+	switch (set_id(sMenuSel)) {
 		case SET_PERF:
 			sPerf = (sPerf + 1) % PERF_MODES;
 			perf_save();
@@ -1929,6 +2362,16 @@ static void menu_confirm(void) {
 			usb_status();
 			sMenuPage = 5;
 			sMenuSel = USBF_SERIAL;
+			menu_redraw();
+			break;
+		case SET_WIFI:
+			wifi_refresh();
+			if (sWifiOn) {
+				wifi_run("scan", NULL, NULL);
+			}
+			sWifiNext = now_ms() + WIFI_POLL_MS;
+			sMenuPage = 6;
+			sMenuSel = WIFI_TOGGLE;
 			menu_redraw();
 			break;
 		case SET_CALIBRATE:
@@ -2074,17 +2517,117 @@ static void brightness_nudge(int dir) {
 }
 
 /* Gamepad events while the menu is open */
+/* A press: a button, or the stick deflected (as its D-pad code). Returns
+   1 when the menu needs redrawing, -1 when the page changed or the menu
+   closed (drawn already; the rest of the events are dropped), else 0 */
+static int menu_press(int code) {
+	if (sMenuPage == 7) {
+		switch (code) {
+			case BTN_DPAD_UP: wifi_kb_move(-1, 0); break;
+			case BTN_DPAD_DOWN: wifi_kb_move(1, 0); break;
+			case BTN_DPAD_LEFT: wifi_kb_move(0, -1); break;
+			case BTN_DPAD_RIGHT: wifi_kb_move(0, 1); break;
+			case BTN_EAST: menu_confirm(); return -1; // A: the key
+			case BTN_SOUTH: menu_back(); return -1;   // B: cancel
+			case BTN_NORTH: // X: delete
+				if (sWifiPassLen > 0) {
+					sWifiPass[--sWifiPassLen] = '\0';
+				}
+				break;
+			case BTN_WEST: sKbShift = !sKbShift; break; // Y: shift
+			case BTN_START: // connect
+				sKbRow = KB_ROWS;
+				sKbCol = KBA_CONNECT;
+				menu_confirm();
+				return -1;
+			default: return 0;
+		}
+		return 1;
+	}
+	if (sMenuPage == 6 && (code == BTN_NORTH || code == BTN_WEST)) {
+		if (code == BTN_WEST && sWifiOn) { // Y: scan again
+			wifi_run("scan", NULL, NULL);
+			sWifiNext = now_ms() + WIFI_POLL_MS;
+		} else if (code == BTN_NORTH && sMenuSel >= WIFI_FIRST && sMenuSel < menu_count() - 1 &&
+		           sWifiNet[sMenuSel - WIFI_FIRST].saved) { // X: forget
+			wifi_run("forget", sWifiNet[sMenuSel - WIFI_FIRST].ssid, NULL);
+			wifi_refresh();
+			return 1;
+		}
+		return 0;
+	}
+	switch (code) {
+		case BTN_DPAD_UP:
+		case BTN_DPAD_DOWN:
+			sMenuSel = (sMenuSel + (code == BTN_DPAD_UP ? menu_count() - 1 : 1)) % menu_count();
+			if (sMenuPage == 4 && sMenuSel < USB_TEXT_ROWS) {
+				sMenuSel = code == BTN_DPAD_UP ? USB_CANCEL : USB_OK; // over the text
+			}
+			if (sMenuPage == 5 && sMenuSel == USBF_SLOTS) {
+				sMenuSel = code == BTN_DPAD_UP ? USBF_BACK : USBF_SERIAL; // over the slot bar
+			}
+			sRepeatDir = 0;
+			return 1;
+		case BTN_DPAD_LEFT:
+		case BTN_DPAD_RIGHT:
+			if (on_brightness_row() && sBacklight[0] != '\0') {
+				sRepeatDir = code == BTN_DPAD_RIGHT ? 1 : -1;
+				sRepeatAt = now_ms() + REPEAT_DELAY_MS;
+				brightness_nudge(sRepeatDir);
+				return 1;
+			}
+			return 0;
+		case BTN_EAST: // A: confirm
+			menu_confirm();
+			return -1;
+		case BTN_SOUTH: // B: back
+			menu_back();
+			return -1;
+	}
+	return 0;
+}
+
 static void menu_input(void) {
 	struct input_event ev[16];
 	ssize_t n = read(sPadFd, ev, sizeof(ev));
-	int i, redraw = 0;
+	int i, r, redraw = 0;
 
 	for (i = 0; n > 0 && i < (int)(n / sizeof(ev[0])); i++) {
 		if (sMenuPage == 2) {
 			cal_input(&ev[i]);
 			continue;
 		}
+		if (ev[i].type == EV_ABS && (ev[i].code == ABS_X || ev[i].code == ABS_Y)) {
+			int* dir = ev[i].code == ABS_X ? &sStickDirX : &sStickDirY;
+			int v = ev[i].value - 128;
+			int d = v < -STICK_DEAD ? -1 : v > STICK_DEAD ? 1 : v > -STICK_RELEASE && v < STICK_RELEASE ? 0 : *dir;
+
+			if (d == *dir) {
+				continue;
+			}
+			*dir = d;
+			if (d == 0) {
+				if (ev[i].code == ABS_X) {
+					sRepeatDir = 0; // the slider's "key" released
+				}
+				continue;
+			}
+			r = menu_press(ev[i].code == ABS_X ? (d < 0 ? BTN_DPAD_LEFT : BTN_DPAD_RIGHT)
+			                                   : (d < 0 ? BTN_DPAD_UP : BTN_DPAD_DOWN));
+			if (r < 0) {
+				return;
+			}
+			redraw |= r;
+			continue;
+		}
 		if (ev[i].type != EV_KEY) {
+			continue;
+		}
+		if (ev[i].code == BTN_TL || ev[i].code == BTN_TR) { // L1/R1: shift while held (keyboard)
+			if (ev[i].value != 2) {
+				sKbShiftHeld = ev[i].value == 1;
+				redraw |= sMenuPage == 7;
+			}
 			continue;
 		}
 		if (ev[i].value == 0 && (ev[i].code == BTN_DPAD_LEFT || ev[i].code == BTN_DPAD_RIGHT)) {
@@ -2094,35 +2637,11 @@ static void menu_input(void) {
 		if (ev[i].value != 1) {
 			continue;
 		}
-		switch (ev[i].code) {
-			case BTN_DPAD_UP:
-			case BTN_DPAD_DOWN:
-				sMenuSel = (sMenuSel + (ev[i].code == BTN_DPAD_UP ? menu_count() - 1 : 1)) % menu_count();
-				if (sMenuPage == 4 && sMenuSel < USB_TEXT_ROWS) {
-					sMenuSel = ev[i].code == BTN_DPAD_UP ? USB_CANCEL : USB_OK; // over the text
-				}
-				if (sMenuPage == 5 && sMenuSel == USBF_SLOTS) {
-					sMenuSel = ev[i].code == BTN_DPAD_UP ? USBF_BACK : USBF_SERIAL; // over the slot bar
-				}
-				sRepeatDir = 0;
-				redraw = 1;
-				break;
-			case BTN_DPAD_LEFT:
-			case BTN_DPAD_RIGHT:
-				if (on_brightness_row() && sBacklight[0] != '\0') {
-					sRepeatDir = ev[i].code == BTN_DPAD_RIGHT ? 1 : -1;
-					sRepeatAt = now_ms() + REPEAT_DELAY_MS;
-					brightness_nudge(sRepeatDir);
-					redraw = 1;
-				}
-				break;
-			case BTN_EAST: // A: confirm
-				menu_confirm();
-				return;
-			case BTN_SOUTH: // B: back
-				menu_back();
-				return;
+		r = menu_press(ev[i].code);
+		if (r < 0) {
+			return;
 		}
+		redraw |= r;
 	}
 	if (redraw) {
 		draw_menu();
@@ -2858,8 +3377,18 @@ int main(int argc, char** argv) {
 			}
 			sKillAt = 0;
 		}
+		if (sMenu && sMenuPage == 6 && t >= sWifiNext) {
+			wifi_refresh(); // the scan's results, the connection coming up
+			sWifiNext = t + WIFI_POLL_MS;
+			draw_menu();
+			present_synced();
+		}
 		// poll() ignores entries with a negative fd
 		timeout = animating ? 0 : (int)(sOsdUntil > t && sPlaneOn ? sOsdUntil - t : LEASE_POLL_MS);
+		if (sMenu && sMenuPage == 6) {
+			int w = sWifiNext > t ? (int)(sWifiNext - t) : 0;
+			timeout = w < timeout ? w : timeout;
+		}
 		if (sMenu && sRepeatDir != 0) {
 			int r = sRepeatAt > t ? (int)(sRepeatAt - t) : 0; // next slider repeat
 			timeout = r < timeout ? r : timeout;

@@ -81,6 +81,7 @@ build/
                           flash|publish (packages to gh-pages for System update)
   s30.rsa                 Package signing key (gitignored; public key in
                           rootfs-overlay/etc/apk/keys)
+  s30-wifi/               The s30-wifi package (wifi script), for the A30
   kernel.config           Fragment on top of sunxi_defconfig
   packages                Alpine packages for the rootfs (!name excludes)
   s30-loader              initramfs /init (mounts SD, rootfs.ext4 or squashfs + overlay)
@@ -267,7 +268,8 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   /usr/share/s30/boot; version <kernel>-r<count>),
   `s30-uboot` (u-boot-sunxi-with-spl.bin; <u-boot>-r<count>) and
   `s30-base` (rootfs-overlay: init, configs, scripts; depends on those
-  three). Versions (2026-11-17): each package by the last commit that
+  three) and `s30-wifi` (build/s30-wifi, see "Wi-Fi"; built but not
+  installed here). Versions (2026-11-17): each package by the last commit that
   touched its inputs (`changed` in build.sh: sources, patches, submodule;
   s30-linux also the loader's files), 0.<commit count at that commit>-r0
   (upstream version -r<count> for linux, u-boot, mesa), that commit in the
@@ -321,7 +323,7 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   2026-10-29). Addresses by `/usr/libexec/s30/usb-network` (started by
   `usb-gadget` with the network function, 2026-11-13): it waits for a host
   to enumerate the gadget (UDC state `configured`), then asks for a DHCP
-  lease for 6 s (udhcpc, `-r 10.42.0.2`, script `udhcpc-usb0`: address,
+  lease for 6 s (udhcpc, `-r 10.42.0.2`, script `udhcpc-script`: address,
   default route, the host as DNS). A host that shares its connection
   (NetworkManager "Shared to other computers" = `nmcli con mod <usb
   connection> ipv4.method shared`, needs dnsmasq installed, hands out
@@ -1145,6 +1147,79 @@ rsync -rt zelda data root@10.42.0.2:/mnt/sd/home/ports/oot/
   the overlay's clock wrapped `now - t` and showed "-"; fixed (frame_age).
 - Card backups in /mnt/sd/boot: zImage.pre60 (61.8 Hz), zImage.60only,
   rootfs.sqfs.pre-fps, uInitrd.pre-fps.
+
+## USB video streaming: tearing and stutter under a busy game (fixed 2026-11-17)
+
+Symptoms in OBS with Majora's Mask at 19 fps: a horizontal seam (two
+frames merged) and frames repeating. Measured with `v4l2-ctl -d
+/dev/videoN --stream-mmap=4 --stream-count=600 --stream-to=f.yuv
+--verbose` on the host (frame sizes; ffmpeg's "corrupted data" count is
+useless, its own start-up churn) and a row-hash tear detector over the raw
+file. Four causes, all in utils/s30-uvc.c and s30-capture.h:
+
+- The plane's framebuffer was looked up before the vblank, right after
+  the app's flip was queued: that is the buffer being replaced, which the
+  app draws into next, so every frame of a continuously rendering game was
+  read while being overwritten. Now the buffers are looked up again after
+  the vblank (`s30_capture_rebuffer`, a few ioctls; the geometry lookups
+  stay before it).
+- s30-uvc ran at normal priority: the copy out of the write-combined
+  display buffer (600 KB, 4.5 ms idle, 11-15 ms with the game's memory
+  traffic; a 64-byte NEON loop measured 3x slower than memcpy) was
+  preempted past the app's next flip. SCHED_FIFO 1 + mlockall now.
+- The capture (vblank wait up to 16 ms, copy, an 8 ms blend, a 9 ms
+  rotate+YUYV) took 35 ms with two USB buffers: the bus ran dry (38 ms per
+  frame on the wire) and the host saw the last frame again. Now three
+  buffers, the flip wait dropped (40 ms of latency the post-vblank lookup
+  made unnecessary), the opaque plane blended by row copy and the alpha
+  plane skipped on its alpha byte, the YUYV conversion in 32x32 tiles.
+- musb is PIO, one interrupt per microframe (8000/s), all interrupts on
+  CPU0 with the GPU's (gp/pp 1400/s) and the gamepad's I2C (500/s); a
+  packet not loaded in time is dropped silently (musb_g_tx: "We NAKed, no
+  big deal") and the host gets a short frame or two frames merged at a
+  seam. `usb_cpu()` pins the musb IRQ (smp_affinity), the gadget's UVCG
+  pump kthread (SCHED_FIFO 2, above s30-uvc) and s30-uvc to the last CPU.
+  600 frames with the game: 8 short + 5 torn frames default, 0 torn with
+  it, duplicates 65 -> 31; short frames only in the first second (stream
+  start).
+  Stream rate with the game: 21 fps (capture-bound), 26 idle (bus-bound).
+  Kernel: EP5 TX is a 1024-byte double-buffered FIFO (drivers/usb/musb/
+  sunxi.c, our patch) for this endpoint.
+
+## Wi-Fi (2026-11-17, built for the Miyoo A30; untested on a radio)
+
+The S30 has no radio. For the A30 (same A33; its chip is undocumented
+online, most likely a Realtek RTL8189FTV/ETV on SDIO with the out-of-tree
+8189fs/8189es driver; on the device `cat /sys/bus/sdio/devices/*/vendor
+/sys/bus/sdio/devices/*/device` and `lsmod` under the stock firmware settle
+it) everything but the driver is in place:
+
+- Package `s30-wifi` (build/s30-wifi; depends on Alpine's wpa_supplicant,
+  s30-tools, s30-base), built into the repository, not installed on the
+  S30: `apk add s30-wifi` on a device with a radio. `/usr/libexec/s30/wifi
+  status|on|off|boot|scan|networks|connect SSID [PASSWORD]|forget SSID`:
+  wpa_supplicant on wlan0 with `~/.config/s30/wpa_supplicant.conf`
+  (update_config=1, the networks kept there), `wpa_cli -a` running the
+  script itself on CONNECTED/DISCONNECTED (udhcpc with udhcpc-script, and
+  s30-mdns on wlan0), on/off remembered in `~/.config/s30/wifi` (rc runs
+  `wifi boot`). `networks` prints "BARS SECURE SAVED SSID" from the last
+  scan, strongest first. usb-gadget now kills only usb0's udhcpc and
+  s30-mdns.
+- s30-display: Settings shows a Wi-Fi row only when that script exists
+  (set_rows at menu_open). Page 6 (300 px wide): the switch with the
+  state or address, the networks (bars, lock, Saved/On), Back; refreshed
+  every 2 s while open (wifi status + networks). A on a kept or open
+  network connects, on a locked one opens page 7, the password keyboard
+  (4 rows of keys, Shift/Space/Delete/Connect; Y toggles shift, L1/R1 hold
+  it, X deletes, START connects, B cancels; at least 8 characters). X
+  forgets a kept network, Y rescans. Both pages end with a row of button
+  hints. The stick moves through every menu page like the D-pad (a
+  deflection past 50 from the centre is a press, within 30 a release;
+  held on the brightness slider it repeats).
+- Tested on the S30 with a fixture script at /usr/libexec/s30/wifi that
+  answered canned status/networks: the pages, the keyboard and connect/
+  forget calls. Not tested: wpa_supplicant itself, the kernel side
+  (cfg80211, the SDIO driver, the A30's DTS).
 
 ## Next session
 

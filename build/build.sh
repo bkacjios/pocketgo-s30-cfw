@@ -474,6 +474,8 @@ step_gmloader() {
 #   s30-linux             zImage, DTB, the loader (uInitrd) and boot.scr, in
 #                         /usr/share/s30/boot
 #   s30-uboot             u-boot-sunxi-with-spl.bin, same place
+#   s30-wifi              build/s30-wifi: Wi-Fi (wpa_supplicant) for devices
+#                         with a radio; built, not installed in this rootfs
 #   s30-base              rootfs-overlay (init, configs, scripts); its apk
 #                         trigger on /usr/share/s30/boot runs boot-update,
 #                         which copies the new boot files to /boot on the
@@ -650,6 +652,12 @@ step_initramfs() {
 	mkpkg s30-base "0.$PKG_REL-r0" "$pkg/s30-base" --trigger /usr/share/s30/boot \
 		--script "trigger:$HERE/rootfs-overlay/usr/libexec/s30/boot-update" \
 		--info "replaces:alpine-baselayout-data busybox-extras" --info "replaces-priority:100"
+	# s30-wifi (build/s30-wifi: the wifi script; wpa_supplicant from Alpine):
+	# in the repository for devices with a radio (the A30), not installed here
+	cp -r "$HERE/s30-wifi" "$pkg/s30-wifi"
+	changed build/s30-wifi
+	MKPKG_DEPS=" wpa_supplicant s30-tools s30-base"
+	mkpkg s30-wifi "0.$PKG_REL-r0" "$pkg/s30-wifi"
 	mkndx
 	apk add s30-base
 	unset -f apk

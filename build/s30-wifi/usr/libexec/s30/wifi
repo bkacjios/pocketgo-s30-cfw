@@ -1,0 +1,154 @@
+#!/bin/sh
+# wifi: Wi-Fi on wlan0 (wpa_supplicant, udhcpc) for the system menu
+# (s30-display, Settings > Wi-Fi) and /etc/s30/rc. The s30-wifi package:
+# only devices with a radio install it; the menu shows Wi-Fi when this file
+# exists.
+#
+# Usage: wifi status | on | off | boot | scan | networks |
+#        connect SSID [PASSWORD] | forget SSID
+#   status    "hw yes|no" (a wlan0), "on yes|no", "state off|disconnected|
+#             connecting|connected", "ssid NAME", "ip ADDRESS"
+#   on, off   wpa_supplicant and udhcpc up or down; remembered in $STATE
+#   boot      on, when it was on last time (rc)
+#   networks  the last scan, strongest first: "BARS SECURE SAVED SSID"
+#             (BARS 0-4, SECURE 1 for WPA/WEP, SAVED 1 with a password kept)
+#   connect   add or update the network (open without a password), connect
+#             to it, keep it; forget drops a kept network
+# Networks are kept in $CONF, wpa_supplicant's own file (update_config=1).
+# wpa_cli -a runs this script with "wlan0 CONNECTED|DISCONNECTED": udhcpc is
+# started on each association (a new network needs a new lease) and stopped
+# with its address when the link goes.
+. /etc/profile.d/s30.sh
+IF=wlan0
+CONF=$HOME/.config/s30/wpa_supplicant.conf
+STATE=$HOME/.config/s30/wifi
+CTRL=/run/wpa_supplicant
+DHCP_PID=/run/udhcpc-$IF.pid
+
+cli() { wpa_cli -i $IF -p $CTRL "$@"; }
+
+running() { [ -S $CTRL/$IF ] && cli ping 2>/dev/null | grep -q PONG; }
+
+dhcp_stop() {
+	[ -f $DHCP_PID ] && kill "$(cat $DHCP_PID)" 2>/dev/null
+	rm -f $DHCP_PID
+	ip -4 route del default dev $IF 2>/dev/null
+	ip -4 addr flush dev $IF 2>/dev/null
+}
+
+dhcp_start() {
+	dhcp_stop
+	udhcpc -i $IF -b -p $DHCP_PID -s /usr/libexec/s30/udhcpc-script -R >/dev/null 2>&1
+}
+
+# Network id in wpa_supplicant for an SSID, or nothing
+net_id() {
+	cli list_networks 2>/dev/null | awk -F'\t' -v s="$1" 'NR > 1 && $2 == s { print $1; exit }'
+}
+
+case "$1" in
+status)
+	if [ ! -d /sys/class/net/$IF ]; then
+		echo "hw no"; echo "on no"; echo "state off"; exit 0
+	fi
+	echo "hw yes"
+	if ! running; then
+		echo "on no"; echo "state off"; exit 0
+	fi
+	echo "on yes"
+	st=$(cli status 2>/dev/null)
+	ssid=$(echo "$st" | sed -n 's/^ssid=//p' | head -1)
+	ip=$(ip -4 -o addr show dev $IF 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4; exit }')
+	case "$(echo "$st" | sed -n 's/^wpa_state=//p')" in
+	COMPLETED) [ -n "$ip" ] && echo "state connected" || echo "state connecting" ;;
+	SCANNING|AUTHENTICATING|ASSOCIATING|ASSOCIATED|4WAY_HANDSHAKE|GROUP_HANDSHAKE) echo "state connecting" ;;
+	*) echo "state disconnected" ;;
+	esac
+	[ -z "$ssid" ] || echo "ssid $ssid"
+	[ -z "$ip" ] || echo "ip $ip"
+	;;
+on)
+	[ -d /sys/class/net/$IF ] || { echo "wifi: no $IF" >&2; exit 1; }
+	mkdir -p "${CONF%/*}"
+	echo on > $STATE
+	if [ ! -f $CONF ]; then
+		printf 'ctrl_interface=%s\nupdate_config=1\n' $CTRL > $CONF
+	fi
+	running && exit 0
+	rfkill unblock wifi 2>/dev/null
+	ip link set $IF up
+	wpa_supplicant -B -i $IF -c $CONF -P /run/wpa_supplicant-$IF.pid || exit 1
+	for i in 1 2 3 4 5 6 7 8 9 10; do running && break; sleep 0.2; done
+	# Associations: this script as the action script (CONNECTED/DISCONNECTED)
+	cli -B -a /usr/libexec/s30/wifi -P /run/wpa_cli-$IF.pid >/dev/null 2>&1
+	cli scan >/dev/null 2>&1
+	;;
+off)
+	echo off > $STATE
+	dhcp_stop
+	for p in /run/wpa_cli-$IF.pid /run/wpa_supplicant-$IF.pid; do
+		[ -f $p ] && kill "$(cat $p)" 2>/dev/null
+		rm -f $p
+	done
+	pkill -f "s30-mdns $IF" 2>/dev/null
+	ip link set $IF down 2>/dev/null
+	;;
+boot)
+	[ "$(cat $STATE 2>/dev/null)" = on ] && exec "$0" on
+	;;
+scan)
+	running || exit 1
+	cli scan >/dev/null 2>&1
+	;;
+networks)
+	running || exit 1
+	saved=$(cli list_networks 2>/dev/null | awk -F'\t' 'NR > 1 { print $2 }')
+	# bssid, frequency, signal (dBm), flags, ssid: the best signal per SSID
+	cli scan_results 2>/dev/null | awk -F'\t' -v saved="$saved" '
+		BEGIN { n = split(saved, s, "\n"); for (i = 1; i <= n; i++) kept[s[i]] = 1 }
+		NR > 1 && $5 != "" { if (!($5 in best) || $3 > best[$5]) { best[$5] = $3; flags[$5] = $4 } }
+		END {
+			for (ssid in best) {
+				db = best[ssid]
+				bars = db >= -55 ? 4 : db >= -65 ? 3 : db >= -75 ? 2 : db >= -85 ? 1 : 0
+				secure = (flags[ssid] ~ /WPA|WEP/) ? 1 : 0
+				printf "%d %d %d %s\n", bars, secure, (ssid in kept) ? 1 : 0, ssid
+			}
+		}' | sort -rn
+	;;
+connect)
+	running || exit 1
+	[ -n "$2" ] || { echo "wifi: connect SSID [PASSWORD]" >&2; exit 2; }
+	id=$(net_id "$2")
+	[ -n "$id" ] || id=$(cli add_network)
+	cli set_network "$id" ssid "\"$2\"" >/dev/null
+	if [ -n "$3" ]; then
+		cli set_network "$id" psk "\"$3\"" >/dev/null || { cli remove_network "$id" >/dev/null; echo "wifi: bad password" >&2; exit 1; }
+	else
+		cli set_network "$id" key_mgmt NONE >/dev/null
+	fi
+	cli select_network "$id" >/dev/null # this one now (disables the others)...
+	cli enable_network all >/dev/null   # ...and all of them again, so they stay kept
+	cli save_config >/dev/null
+	;;
+forget)
+	running || exit 1
+	id=$(net_id "$2")
+	[ -n "$id" ] || exit 0
+	cli remove_network "$id" >/dev/null
+	cli save_config >/dev/null
+	;;
+$IF) # wpa_cli action: $2 is the event
+	case "$2" in
+	CONNECTED)
+		dhcp_start
+		pgrep -f "s30-mdns $IF" >/dev/null || s30-mdns $IF s30 </dev/null >>/tmp/s30-mdns.log 2>&1 &
+		;;
+	DISCONNECTED) dhcp_stop ;;
+	esac
+	;;
+*)
+	echo "usage: wifi status|on|off|boot|scan|networks|connect SSID [PASSWORD]|forget SSID" >&2
+	exit 2
+	;;
+esac

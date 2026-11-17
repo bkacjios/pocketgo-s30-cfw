@@ -45,6 +45,8 @@ ifconfig lo 127.0.0.1 up
 # 10.42.0.2;
 # see /etc/udhcpd.conf)
 /usr/libexec/s30/usb-gadget
+# Wi-Fi (the s30-wifi package, devices with a radio): back on when it was on
+[ ! -x /usr/libexec/s30/wifi ] || /usr/libexec/s30/wifi boot &
 s30-splash 60
 
 # ssh (root, keys baked in by build.sh initramfs). Host key kept on the SD

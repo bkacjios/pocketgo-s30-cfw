@@ -6,9 +6,11 @@
  * (root: the buffer handles need CAP_SYS_ADMIN), mapped as a dumb buffer and
  * blended in zpos order, the alpha formats over what is below. Nothing has
  * to cooperate: it works over the launcher, a game or s30-display's menu.
- * The buffers are write-combined (uncached, ~90 MB/s to read), so the
- * visible rows of every plane are copied out first, back to back, and
- * blended from the copies.
+ * The buffers are write-combined (uncached, ~105 MB/s to read with memcpy;
+ * 64-byte NEON loads with prefetch measured three times slower, 2026-11-17),
+ * so the visible rows of every plane are copied out first, back to back,
+ * and blended from the copies. The copy must not be preempted when it has
+ * to land within a frame (s30-uvc runs SCHED_FIFO for that).
  */
 #ifndef S30_CAPTURE_H
 #define S30_CAPTURE_H
@@ -101,6 +103,7 @@ typedef struct {
 	int cx, cy, cw, ch; // where it shows (CRTC_*)
 	int sx, sy, rowPx;  // the part of the buffer shown (SRC_*), visible row width
 	uint32_t pitch, offset, height;
+	uint32_t fbId;            // the framebuffer mapped
 	struct drm_gem_close gem; // the handle GETFB2 opened for us
 	const uint8_t* mem;       // the mapped buffer (write-combined)
 	size_t size;
@@ -109,19 +112,22 @@ typedef struct {
 } S30CapturePlane;
 
 /* A plane's buffer and geometry, mapped; -1 if it can't be read */
-static inline int s30_capture_prepare(int fd, uint32_t plane, S30CapturePlane* p) {
+/* The plane's current framebuffer (GETFB2) mapped into p; -1 if it has none
+   or it can't be mapped. On success p->fbId names it. */
+static inline int s30_capture_map(int fd, uint32_t plane, S30CapturePlane* p) {
 	drmModePlane* pl = drmModeGetPlane(fd, plane);
 	drmModeFB2* fb;
 	struct drm_mode_map_dumb map = { 0 };
 	void* mem;
+	uint32_t fbId;
 
 	p->mem = NULL;
-	if (pl == NULL || pl->fb_id == 0) {
-		drmModeFreePlane(pl);
+	fbId = pl != NULL ? pl->fb_id : 0;
+	drmModeFreePlane(pl);
+	if (fbId == 0) {
 		return -1;
 	}
-	fb = drmModeGetFB2(fd, pl->fb_id);
-	drmModeFreePlane(pl);
+	fb = drmModeGetFB2(fd, fbId);
 	if (fb == NULL || fb->handles[0] == 0) {
 		fprintf(stderr, "s30-capture: plane %u: no buffer handle (not root?)\n", plane);
 		drmModeFreeFB2(fb);
@@ -148,6 +154,7 @@ static inline int s30_capture_prepare(int fd, uint32_t plane, S30CapturePlane* p
 	p->pitch = fb->pitches[0];
 	p->offset = fb->offsets[0];
 	p->height = fb->height;
+	p->fbId = fbId;
 	map.handle = fb->handles[0];
 	p->size = (size_t)fb->pitches[0] * fb->height + fb->offsets[0];
 	if (drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &map) != 0 ||
@@ -158,6 +165,31 @@ static inline int s30_capture_prepare(int fd, uint32_t plane, S30CapturePlane* p
 		return -1;
 	}
 	p->mem = mem;
+	drmModeFreeFB2(fb);
+	return 0;
+}
+
+static inline void s30_capture_unmap(int fd, S30CapturePlane* p) {
+	if (p->mem != NULL) {
+		munmap((void*)p->mem, p->size);
+		p->mem = NULL;
+		drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &p->gem);
+	}
+}
+
+/* The plane's buffer and where it is shown: the geometry (property lookups,
+   slow) and the buffer (s30_capture_map) */
+static inline int s30_capture_prepare(int fd, uint32_t plane, S30CapturePlane* p) {
+	drmModeFB2* fb;
+
+	if (s30_capture_map(fd, plane, p) != 0) {
+		return -1;
+	}
+	fb = drmModeGetFB2(fd, p->fbId);
+	if (fb == NULL) {
+		s30_capture_unmap(fd, p);
+		return -1;
+	}
 	p->cx = (int)(int64_t)s30_capture_prop(fd, plane, "CRTC_X", 0);
 	p->cy = (int)(int64_t)s30_capture_prop(fd, plane, "CRTC_Y", 0);
 	p->cw = (int)s30_capture_prop(fd, plane, "CRTC_W", fb->width);
@@ -173,6 +205,21 @@ static inline int s30_capture_prepare(int fd, uint32_t plane, S30CapturePlane* p
 	}
 	drmModeFreeFB2(fb);
 	return 0;
+}
+
+/* After the vblank: a flip queued before it has applied by now, so the plane
+   may show another buffer than prepare mapped; map that one instead (the
+   geometry stays). A few ioctls, unlike prepare. */
+static inline int s30_capture_rebuffer(int fd, uint32_t plane, S30CapturePlane* p) {
+	drmModePlane* pl = drmModeGetPlane(fd, plane);
+	uint32_t fbId = pl != NULL ? pl->fb_id : 0;
+
+	drmModeFreePlane(pl);
+	if (fbId == p->fbId) {
+		return 0;
+	}
+	s30_capture_unmap(fd, p);
+	return s30_capture_map(fd, plane, p);
 }
 
 /* The visible rows out of the buffer, as fast as it reads: plain memcpy is
@@ -207,12 +254,38 @@ static inline int s30_capture_copy(S30CapturePlane* p) {
 
 /* The copied rows blended into `screen` (panel layout, 0xRRGGBB) */
 static inline void s30_capture_blend(const S30CapturePlane* p, uint32_t* screen) {
+	const int inside = p->cx >= 0 && p->cx + p->rowPx <= PANEL_W; // no per-pixel bounds checks
 	int x, y;
 
 	for (y = 0; y < p->ch; y++) {
 		const uint8_t* line = p->copy + (size_t)y * p->rowPx * p->bpp;
 
 		if (p->cy + y < 0 || p->cy + y >= PANEL_H) {
+			continue;
+		}
+		if (inside && p->bpp == 4) {
+			// Fast paths: an opaque 32-bit plane is a row copy (the X byte
+			// is ignored downstream); an alpha plane skips its transparent
+			// pixels on the alpha byte alone
+			uint32_t* d = &screen[(p->cy + y) * PANEL_W + p->cx];
+			const uint32_t* s32 = (const uint32_t*)line;
+
+			if (!p->alpha) {
+				memcpy(d, line, (size_t)p->rowPx * 4);
+				continue;
+			}
+			for (x = 0; x < p->rowPx; x++) {
+				uint32_t c = s32[x], a = c >> 24;
+
+				if (a == 255) {
+					d[x] = c & 0xffffff;
+				} else if (a != 0) {
+					uint32_t r = (((c >> 16) & 255) * a + ((d[x] >> 16) & 255) * (255 - a)) / 255;
+					uint32_t g = (((c >> 8) & 255) * a + ((d[x] >> 8) & 255) * (255 - a)) / 255;
+					uint32_t b = ((c & 255) * a + (d[x] & 255) * (255 - a)) / 255;
+					d[x] = r << 16 | g << 8 | b;
+				}
+			}
 			continue;
 		}
 		for (x = 0; x < p->rowPx; x++) {
@@ -246,15 +319,30 @@ static inline void s30_capture_blend(const S30CapturePlane* p, uint32_t* screen)
 /* The screen into `screen` (panel layout, PANEL_W x PANEL_H, 0xRRGGBB).
    gameOnly: the primary plane only (no OSD, menu or performance overlay).
    vsync: the planes are copied right after the next vblank, the slow
-   lookups done before it: a buffer an app has just flipped to is then on
-   screen (rendered), and stays there for at least the panel's frame, while
-   the copy, a few ms, runs. */
+   lookups done before it and the buffers looked up again after it (a flip
+   the app queued before the vblank applies at it; the buffer it showed
+   before is the one the app draws into next, which is what tore before
+   2026-11-17): the buffer on screen after the vblank stays there for at
+   least one frame of the app's while the copy, a few ms, runs. */
+#ifdef S30_CAPTURE_TRACE
+#include <time.h>
+static inline double s30_capture_ms(void) {
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+#define S30_TRACE(var) double var = s30_capture_ms()
+#else
+#define S30_TRACE(var)
+#endif
+
 static inline int s30_capture(const S30Capture* c, int gameOnly, int vsync, uint32_t* screen) {
 	static S30CapturePlane planes[16];
 	drmModePlaneRes* res = drmModeGetPlaneResources(c->fd);
 	uint32_t order[16];
 	uint64_t zpos[16];
 	int i, j, n = 0, ok[16];
+	S30_TRACE(t0);
 
 	memset(screen, 0, sizeof(uint32_t) * PANEL_W * PANEL_H);
 	for (i = 0; res != NULL && i < (int)res->count_planes && n < 16; i++) {
@@ -276,9 +364,11 @@ static inline int s30_capture(const S30Capture* c, int gameOnly, int vsync, uint
 		drmModeFreePlane(p);
 	}
 	drmModeFreePlaneResources(res);
+	S30_TRACE(t1);
 	for (i = 0; i < n; i++) {
 		ok[i] = s30_capture_prepare(c->fd, order[i], &planes[i]) == 0;
 	}
+	S30_TRACE(t2);
 	if (vsync) {
 		drmVBlank vb;
 
@@ -287,23 +377,33 @@ static inline int s30_capture(const S30Capture* c, int gameOnly, int vsync, uint
 		vb.request.sequence = 1;
 		drmWaitVBlank(c->fd, &vb);
 	}
+	S30_TRACE(t3);
+	if (vsync) {
+		for (i = 0; i < n; i++) {
+			if (ok[i]) {
+				ok[i] = s30_capture_rebuffer(c->fd, order[i], &planes[i]) == 0;
+			}
+		}
+	}
+	S30_TRACE(t4);
 	for (i = 0; i < n; i++) {
 		if (ok[i]) {
 			ok[i] = s30_capture_copy(&planes[i]) == 0;
 		}
 	}
+	S30_TRACE(t5);
 	for (i = 0; i < n; i++) {
-		if (planes[i].mem != NULL) {
-			munmap((void*)planes[i].mem, planes[i].size);
-			planes[i].mem = NULL;
-			drmIoctl(c->fd, DRM_IOCTL_GEM_CLOSE, &planes[i].gem);
-		}
+		s30_capture_unmap(c->fd, &planes[i]);
 	}
 	for (i = 0; i < n; i++) {
 		if (ok[i]) {
 			s30_capture_blend(&planes[i], screen);
 		}
 	}
+#ifdef S30_CAPTURE_TRACE
+	fprintf(stderr, "capture: %d planes, list %.1f prepare %.1f vblank %.1f rebuffer %.1f copy %.1f blend %.1f ms\n", n,
+	        t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, s30_capture_ms() - t5);
+#endif
 	return 0;
 }
 

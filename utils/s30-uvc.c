@@ -11,20 +11,39 @@
  * Bandwidth: one 1024-byte isochronous packet per microframe (the musb
  * controller has no high-bandwidth mode), about 8 MB/s, so a 300 KB frame
  * takes ~38 ms: the host gets up to ~26 frames per second whatever interval
- * it asks for. Frames are captured only when a buffer comes back, so a
- * frame is never older than the transfer before it.
+ * it asks for. A frame is captured when a buffer comes back from the
+ * transfer; NBUFS buffers keep the bus fed while a capture runs (under a
+ * busy game a capture is 25-35 ms: the copy out of the display buffers
+ * slows with the game's memory traffic, the blend and the YUYV conversion
+ * compete for the CPU), or the host saw the last frame again.
  *
- * No tearing: a capture waits for the app's next page flip (the frame ring
- * libs30lease.so marks, s30-frames.h) and then the vblank after it, and
- * copies the planes then: the frame just flipped to stays on screen for a
- * frame of the app's, and the copy takes a few ms. A screen that doesn't
- * flip (nothing moving) is captured after FLIP_WAIT_MS.
+ * No tearing: the planes are copied right after a vblank, their buffers
+ * looked up after it (s30-capture.h): the buffer on screen then stays for
+ * at least a frame of the app's, and the copy, ~5 ms idle, ~12 ms under a
+ * game, lands in it. That needs the copy not preempted: the daemon runs
+ * SCHED_FIFO (like s30-display), locked in memory. (Until 2026-11-17 the
+ * buffer was looked up before the vblank, after the app's flip was queued:
+ * the one being replaced, which the app draws into next; every frame of a
+ * busy game tore.)
+ *
+ * One CPU for the USB side (usb_cpu): the musb interrupt (one per
+ * microframe, 8000 a second, PIO: a packet the CPU hasn't loaded in time is
+ * silently lost, and the host then gets a short frame or two frames merged
+ * at a seam), the gadget's pump thread (UVCG, given a priority above this
+ * daemon's: they share the CPU and a capture takes tens of ms) and this
+ * daemon go to the last CPU; a game's threads land elsewhere. Measured
+ * 2026-11-17 with a busy game, 600 frames: 8 short and 5 torn frames on
+ * the default (all interrupts on CPU0), 5 short (all at stream start) and
+ * 1 torn with this.
  *
  * Usage: s30-uvc   (as root, for the display card's buffer handles)
  */
+#define _GNU_SOURCE // CPU_SET
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,6 +51,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 #include <linux/usb/ch9.h>
@@ -39,14 +59,13 @@
 #include <linux/usb/video.h>
 #include <linux/videodev2.h>
 #include "s30-capture.h"
-#include "s30-frames.h"
 
 #define WIDTH PANEL_H // landscape
 #define HEIGHT PANEL_W
 #define FRAME_SIZE (WIDTH * HEIGHT * 2)
 #define MAX_PAYLOAD 1024 // the function's streaming_maxpacket
-#define NBUFS 2
-#define FLIP_WAIT_MS 40
+#define NBUFS 3 // two in flight on the bus while one is captured
+#define TILE 32 // the YUYV conversion's tiles (output pixels)
 
 /* The frame intervals the gadget's descriptor lists (100 ns units, 30 and 15
    fps); the first is the default */
@@ -115,56 +134,118 @@ static void fill_control(struct uvc_streaming_control* c, uint32_t interval) {
 }
 
 /* ---------------------------------------------------------------------------
+ * The USB side on one CPU (see the top)
+ * ------------------------------------------------------------------------- */
+
+#define UVCG_PRIORITY 2 // SCHED_FIFO, above this daemon's 1
+
+/* The pid of the kernel thread named `comm`, 0 if none */
+static pid_t find_thread(const char* comm) {
+	DIR* d = opendir("/proc");
+	struct dirent* e;
+	pid_t pid = 0;
+
+	while (d != NULL && pid == 0 && (e = readdir(d)) != NULL) {
+		char path[64], name[32];
+		FILE* f;
+
+		if (e->d_name[0] < '0' || e->d_name[0] > '9') {
+			continue;
+		}
+		snprintf(path, sizeof(path), "/proc/%s/comm", e->d_name);
+		f = fopen(path, "r");
+		if (f != NULL) {
+			if (fgets(name, sizeof(name), f) != NULL && strncmp(name, comm, strlen(comm)) == 0 &&
+			    (name[strlen(comm)] == '\n' || name[strlen(comm)] == '\0')) {
+				pid = atoi(e->d_name);
+			}
+			fclose(f);
+		}
+	}
+	if (d != NULL) {
+		closedir(d);
+	}
+	return pid;
+}
+
+static void usb_cpu(void) {
+	const int cpu = (int)sysconf(_SC_NPROCESSORS_ONLN) - 1;
+	cpu_set_t set;
+	pid_t pump;
+	FILE* f;
+	char line[256];
+
+	if (cpu < 1) {
+		return;
+	}
+	CPU_ZERO(&set);
+	CPU_SET(cpu, &set);
+	sched_setaffinity(0, sizeof(set), &set);
+	pump = find_thread("UVCG");
+	if (pump > 0) {
+		struct sched_param sp = { .sched_priority = UVCG_PRIORITY };
+
+		sched_setaffinity(pump, sizeof(set), &set);
+		syscall(SYS_sched_setscheduler, pump, SCHED_FIFO, &sp);
+	}
+	// The controller's interrupt line, by its name in /proc/interrupts
+	f = fopen("/proc/interrupts", "r");
+	while (f != NULL && fgets(line, sizeof(line), f) != NULL) {
+		int irq;
+
+		if (strstr(line, "musb") != NULL && sscanf(line, " %d:", &irq) == 1) {
+			char path[64];
+			FILE* a;
+
+			snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity", irq);
+			a = fopen(path, "w");
+			if (a != NULL) {
+				fprintf(a, "%x\n", 1 << cpu);
+				fclose(a);
+			}
+			break;
+		}
+	}
+	if (f != NULL) {
+		fclose(f);
+	}
+	fprintf(stderr, "s30-uvc: USB on CPU %d (pump thread %d)\n", cpu, (int)pump);
+}
+
+/* ---------------------------------------------------------------------------
  * Frames
  * ------------------------------------------------------------------------- */
 
-/* Until the app's next page flip, FLIP_WAIT_MS at most. The ring is opened
-   each time: s30-display makes a new one when it restarts. */
-static void wait_flip(void) {
-	int fd = open(S30_FRAMES_PATH, O_RDONLY | O_CLOEXEC);
-	const S30Frames* ring = NULL;
-	uint64_t end = now_ms() + FLIP_WAIT_MS;
+/* Two neighbouring landscape pixels as one YUYV macropixel */
+static inline void yuyv_pair(uint32_t c0, uint32_t c1, uint8_t* out) {
+	int r0 = (int)(c0 >> 16) & 255, g0 = (int)(c0 >> 8) & 255, b0 = (int)c0 & 255;
+	int r1 = (int)(c1 >> 16) & 255, g1 = (int)(c1 >> 8) & 255, b1 = (int)c1 & 255;
+	int r = (r0 + r1) >> 1, g = (g0 + g1) >> 1, b = (b0 + b1) >> 1;
 
-	if (fd >= 0) {
-		void* m = mmap(NULL, sizeof(S30Frames), PROT_READ, MAP_SHARED, fd, 0);
-
-		ring = m == MAP_FAILED ? NULL : m;
-		close(fd);
-	}
-	if (ring == NULL) {
-		return;
-	}
-	{
-		uint32_t start = ring->count;
-		struct timespec ms1 = { 0, 1000000 };
-
-		while (ring->count == start && now_ms() < end) {
-			nanosleep(&ms1, NULL);
-		}
-	}
-	munmap((void*)ring, sizeof(S30Frames));
+	out[0] = (uint8_t)(((66 * r0 + 129 * g0 + 25 * b0 + 128) >> 8) + 16);
+	out[1] = (uint8_t)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+	out[2] = (uint8_t)(((66 * r1 + 129 * g1 + 25 * b1 + 128) >> 8) + 16);
+	out[3] = (uint8_t)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
 }
 
-/* The screen, rotated to landscape, as YUYV into `out` */
+/* The screen, rotated to landscape, as YUYV into `out`. A landscape row
+   reads a panel column (a stride of PANEL_W pixels per step), so the work
+   goes in TILE x TILE tiles, where the column's lines stay in the cache
+   (about a quarter faster than row by row). */
 static void capture_yuyv(uint8_t* out) {
 	static uint32_t screen[PANEL_W * PANEL_H];
-	int x, y;
+	int tx, ty, x, y;
 
-	wait_flip();
 	s30_capture(&sCap, 0, 1, screen);
-	for (y = 0; y < HEIGHT; y++) {
-		for (x = 0; x < WIDTH; x += 2) {
-			uint32_t c0 = screen[(PANEL_H - 1 - x) * PANEL_W + y];
-			uint32_t c1 = screen[(PANEL_H - 2 - x) * PANEL_W + y];
-			int r0 = (int)(c0 >> 16) & 255, g0 = (int)(c0 >> 8) & 255, b0 = (int)c0 & 255;
-			int r1 = (int)(c1 >> 16) & 255, g1 = (int)(c1 >> 8) & 255, b1 = (int)c1 & 255;
-			int r = (r0 + r1) >> 1, g = (g0 + g1) >> 1, b = (b0 + b1) >> 1;
+	for (ty = 0; ty < HEIGHT; ty += TILE) {
+		for (tx = 0; tx < WIDTH; tx += TILE) {
+			for (y = ty; y < ty + TILE; y++) {
+				uint8_t* o = out + ((size_t)y * WIDTH + tx) * 2;
 
-			out[0] = (uint8_t)(((66 * r0 + 129 * g0 + 25 * b0 + 128) >> 8) + 16);
-			out[1] = (uint8_t)(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
-			out[2] = (uint8_t)(((66 * r1 + 129 * g1 + 25 * b1 + 128) >> 8) + 16);
-			out[3] = (uint8_t)(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
-			out += 4;
+				for (x = tx; x < tx + TILE; x += 2, o += 4) {
+					yuyv_pair(screen[(PANEL_H - 1 - x) * PANEL_W + y], screen[(PANEL_H - 2 - x) * PANEL_W + y], o);
+				}
+			}
 		}
 	}
 }
@@ -402,6 +483,15 @@ int main(void) {
 	if (s30_capture_open(&sCap) != 0) {
 		return 1;
 	}
+	{
+		// The copy after the vblank must not be preempted (see the top).
+		// musl's sched_setscheduler() is a stub: the system call itself.
+		struct sched_param sp = { .sched_priority = 1 };
+
+		syscall(SYS_sched_setscheduler, 0, SCHED_FIFO | SCHED_RESET_ON_FORK, &sp);
+		mlockall(MCL_CURRENT | MCL_FUTURE);
+	}
+	usb_cpu();
 	fill_control(&sProbe, kIntervals[0]);
 	sCommit = sProbe;
 	for (i = 0; i < sizeof(kEvents) / sizeof(kEvents[0]); i++) {

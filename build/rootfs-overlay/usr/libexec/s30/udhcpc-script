@@ -1,7 +1,7 @@
 #!/bin/sh
-# udhcpc script for usb0 (see usb-gadget): the lease from a host that shares
-# its connection gives the device its address, the default route and the
-# host as DNS. Called by udhcpc with the event in $1 and the lease in the
+# udhcpc script for usb0 (usb-network) and wlan0 (wifi, the s30-wifi
+# package): the lease gives the device its address, the default route and
+# DNS. Called by udhcpc with the event in $1 and the lease in the
 # environment (interface, ip, mask, router, dns).
 case "$1" in
 bound|renew)
