@@ -148,6 +148,9 @@ step_linux() {
 	install -D "$src/arch/arm/boot/zImage" "$WORK/boot/zImage"
 	install -D "$src/arch/arm/boot/dts/allwinner/sun8i-a33-pocketgo-s30.dtb" \
 		"$WORK/boot/sun8i-a33-pocketgo-s30.dtb"
+	# For the s30-linux package version (the tree may be gone by then: CI
+	# restores only these outputs from its cache)
+	make -s -C "$src" kernelversion > "$WORK/boot/linux.version"
 }
 
 step_uboot() {
@@ -182,8 +185,12 @@ step_uboot() {
 	make -C "$src" pocketgo_s30_defconfig
 	make -C "$src" -j"$JOBS"
 	install -D "$src/u-boot-sunxi-with-spl.bin" "$WORK/u-boot-sunxi-with-spl.bin"
+	# mkimage for the later steps (initramfs, flash), the version for the
+	# s30-uboot package: outputs, like the binary (see step_linux)
+	install -D "$src/tools/mkimage" "$WORK/bin/mkimage"
+	make -s -C "$src" ubootversion > "$WORK/u-boot.version"
 	mkdir -p "$WORK/boot"
-	"$src/tools/mkimage" -A arm -O linux -T script -C none \
+	"$WORK/bin/mkimage" -A arm -O linux -T script -C none \
 		-d "$HERE/boot.cmd" "$WORK/boot/boot.scr"
 }
 
@@ -597,11 +604,11 @@ step_initramfs() {
 	fakeroot sh -c 'mknod -m 600 "$1/dev/console" c 5 1 &&
 		cd "$1" && find . | cpio -o -H newc --quiet | gzip -9 > "$2"' \
 		_ "$loader" "$WORK/initramfs.cpio.gz"
-	"$WORK/u-boot/tools/mkimage" -A arm -O linux -T ramdisk -C none \
+	"$WORK/bin/mkimage" -A arm -O linux -T ramdisk -C none \
 		-n s30-initramfs -d "$WORK/initramfs.cpio.gz" "$WORK/uInitrd"
-	"$WORK/u-boot/tools/mkimage" -A arm -O linux -T script -C none \
+	"$WORK/bin/mkimage" -A arm -O linux -T script -C none \
 		-d "$HERE/fel.cmd" "$WORK/fel.scr"
-	"$WORK/u-boot/tools/mkimage" -A arm -O linux -T script -C none \
+	"$WORK/bin/mkimage" -A arm -O linux -T script -C none \
 		-d "$HERE/fel-ram.cmd" "$WORK/fel-ram.scr"
 
 	# The boot files (s30-linux, s30-uboot) and the board files (s30-base,
@@ -609,9 +616,9 @@ step_initramfs() {
 	d="$pkg/s30-linux/usr/share/s30/boot"
 	install -D -m 0644 -t "$d" "$WORK/boot/zImage" "$WORK/boot/sun8i-a33-pocketgo-s30.dtb" "$WORK/uInitrd"
 	install -m 0644 "$WORK/fel.scr" "$d/boot.scr"
-	mkpkg s30-linux "$(make -s -C "$WORK/linux" kernelversion)-r$PKG_REL" "$pkg/s30-linux"
+	mkpkg s30-linux "$(cat "$WORK/boot/linux.version")-r$PKG_REL" "$pkg/s30-linux"
 	install -D -m 0644 -t "$pkg/s30-uboot/usr/share/s30/boot" "$WORK/u-boot-sunxi-with-spl.bin"
-	mkpkg s30-uboot "$(make -s -C "$WORK/u-boot" ubootversion | tr - _)-r$PKG_REL" "$pkg/s30-uboot"
+	mkpkg s30-uboot "$(tr - _ < "$WORK/u-boot.version")-r$PKG_REL" "$pkg/s30-uboot"
 	cp -r "$HERE/rootfs-overlay" "$pkg/s30-base"
 	# replaces: /etc/inittab is alpine-baselayout-data's, /etc/udhcpd.conf
 	# busybox-extras'; ours stay through their upgrades (replaces-priority)
@@ -692,7 +699,7 @@ build_fit() { # $WORK/flash.itb, checked against the layout
 		{ echo "U-Boot is $n bytes, over the $FLASH_FIT_OFFS before the FIT" >&2; exit 1; }
 	# dtc resolves /incbin/ paths from the .its file's directory
 	cp "$HERE/flash.cmd" "$HERE/flash.its" "$WORK/"
-	"$WORK/u-boot/tools/mkimage" -f "$WORK/flash.its" "$fit" > /dev/null
+	"$WORK/bin/mkimage" -f "$WORK/flash.its" "$fit" > /dev/null
 	n=$(stat -c %s "$fit")
 	[ "$n" -le $((FLASH_LOGO_OFFS - FLASH_FIT_OFFS)) ] ||
 		{ echo "FIT is $n bytes, over the $((FLASH_LOGO_OFFS - FLASH_FIT_OFFS)) before the logo" >&2; exit 1; }

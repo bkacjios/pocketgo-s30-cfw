@@ -2,7 +2,13 @@
 # repository to the gh-pages branch, where the devices' System update app
 # looks (build.sh publish, S30_APK_REPO). The signing key is the secret
 # S30_SIGN_KEY (the contents of build/s30.rsa): without it build.sh stops,
-# since the public key in the tree only matches that key. About an hour.
+# since the public key in the tree only matches that key.
+#
+# The slow parts (kernel, U-Boot, Mesa, RetroArch, EmulationStation) are
+# skipped when their outputs are in the Actions cache under a key made of
+# everything they are built from: the submodule commit, the patches and
+# board files, their build.sh step. A full build is about an hour; with the
+# caches a run is the rootfs and the packaging, a few minutes.
 name: packages
 on:
   push:
@@ -30,14 +36,76 @@ jobs:
           S30_SIGN_KEY: ${{ secrets.S30_SIGN_KEY }}
       - name: Submodules build.sh does not fetch itself
         run: git submodule update --init --depth 1 external/es-theme-carbon
+      - name: Cache keys (what each step is built from)
+        id: keys
+        run: |
+          key() { # NAME SUBMODULE PATHS...: sha256 of the submodule commit, the files' blob ids, the step's text (and NAME_VERSION=)
+            local name="$1" sub="$2"; shift 2
+            { [ -z "$sub" ] || git rev-parse "HEAD:external/$sub"
+              git ls-files -s "$@"
+              sed -n "/^step_$name() {/,/^}/p" build/build.sh
+              grep "^${name^^}_VERSION=" build/build.sh || true
+            } | sha256sum | cut -c1-16 | sed "s/^/$name=${{ runner.os }}-$name-/" >> "$GITHUB_OUTPUT"
+          }
+          key linux linux patches/linux linux build/kernel.config
+          key uboot u-boot patches/u-boot build/u-boot build/boot.cmd
+          key mesa "" patches/mesa
+          key retroarch retroarch patches/retroarch
+          key emulationstation emulationstation patches/emulationstation
+          cat "$GITHUB_OUTPUT"
       - run: bash build/build.sh deps
-      - run: bash build/build.sh linux
-      - run: bash build/build.sh uboot
+
+      - uses: actions/cache@v4
+        id: cache-linux
+        with:
+          key: ${{ steps.keys.outputs.linux }}
+          path: |
+            s30-build/boot/zImage
+            s30-build/boot/sun8i-a33-pocketgo-s30.dtb
+            s30-build/boot/linux.version
+      - if: steps.cache-linux.outputs.cache-hit != 'true'
+        run: bash build/build.sh linux
+
+      - uses: actions/cache@v4
+        id: cache-uboot
+        with:
+          key: ${{ steps.keys.outputs.uboot }}
+          path: |
+            s30-build/u-boot-sunxi-with-spl.bin
+            s30-build/u-boot.version
+            s30-build/bin/mkimage
+            s30-build/boot/boot.scr
+      - if: steps.cache-uboot.outputs.cache-hit != 'true'
+        run: bash build/build.sh uboot
+
       - run: bash build/build.sh rootfs
-      - run: bash build/build.sh mesa
+
+      - uses: actions/cache@v4
+        id: cache-mesa
+        with:
+          key: ${{ steps.keys.outputs.mesa }}
+          path: s30-build/mesa-root
+      - if: steps.cache-mesa.outputs.cache-hit != 'true'
+        run: bash build/build.sh mesa
+
       - run: bash build/build.sh launcher
-      - run: bash build/build.sh retroarch
-      - run: bash build/build.sh emulationstation
+
+      - uses: actions/cache@v4
+        id: cache-retroarch
+        with:
+          key: ${{ steps.keys.outputs.retroarch }}
+          path: s30-build/retroarch.bin
+      - if: steps.cache-retroarch.outputs.cache-hit != 'true'
+        run: bash build/build.sh retroarch
+
+      - uses: actions/cache@v4
+        id: cache-emulationstation
+        with:
+          key: ${{ steps.keys.outputs.emulationstation }}
+          path: s30-build/emulationstation-root
+      - if: steps.cache-emulationstation.outputs.cache-hit != 'true'
+        run: bash build/build.sh emulationstation
+
       - run: bash build/build.sh initramfs
       - run: bash build/build.sh publish
       - name: Flash image and loader (for a card or s30-flash by hand)
