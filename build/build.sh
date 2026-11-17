@@ -55,7 +55,7 @@ upstream_tree() {
 		echo "$src is not at the commit external/$name pins ($pinned); delete it to rebuild" >&2
 		exit 1
 	fi
-	echo "$name: $(git -C "$src" describe --tags)"
+	echo "$name: $(git -C "$src" describe --tags --always)"
 }
 
 # Pick the ARM cross toolchain prefix: $CROSS_COMPILE if set, else the first
