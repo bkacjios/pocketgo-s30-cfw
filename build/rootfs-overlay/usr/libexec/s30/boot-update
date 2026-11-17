@@ -27,10 +27,14 @@ if [ -b /dev/mmcblk0 ] &&
 	[ "$(dd if=/dev/mmcblk0 bs=4 skip=2049 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 65474f4e2e425430 ]; then
 	uboot=$B/u-boot-sunxi-with-spl.bin
 	n=$(stat -c %s $uboot)
-	if dd if=/dev/mmcblk0 bs=1k skip=8 count=$(((n + 1023) / 1024)) 2>/dev/null | head -c "$n" | cmp -s - $uboot; then
+	# Through a file: cmp stops at the first difference, and apk runs this
+	# with SIGPIPE ignored, so head on a closed pipe would report an I/O error
+	dd if=/dev/mmcblk0 bs=1k skip=8 count=$(((n + 1023) / 1024)) 2>/dev/null | head -c "$n" > /run/u-boot.card
+	if cmp -s /run/u-boot.card $uboot; then
 		echo "boot-update: U-Boot on the card is current"
 	else
 		echo "boot-update: writing U-Boot to the card"
 		dd if=$uboot of=/dev/mmcblk0 bs=1k seek=8 conv=notrunc,fsync status=none
 	fi
+	rm -f /run/u-boot.card
 fi
