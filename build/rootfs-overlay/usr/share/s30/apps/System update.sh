@@ -7,17 +7,19 @@
 # certificates need a sane date); the output is on the LCD (s30-console).
 . /etc/profile.d/s30.sh
 
-finish() { # STATUS [reboot]: START exits; with reboot, A (BTN_EAST 305) reboots first
+finish() { # STATUS [reboot]: START (315) exits; with reboot, A (305) reboots instead
 	echo
 	if [ "${2:-}" = reboot ]; then
 		echo "Press A to reboot now, START to exit."
-		until s30-keyheld 315; do
-			s30-keyheld 305 && { echo "Rebooting..."; sync; reboot; sleep 10; }
-			sleep 0.2
-		done
+		if [ "$(s30-keyheld -w 315 305)" = 305 ]; then
+			echo "Rebooting..."
+			sync
+			reboot
+			sleep 10
+		fi
 	else
 		echo "Press START to exit."
-		until s30-keyheld 315; do sleep 0.2; done
+		s30-keyheld -w 315 > /dev/null
 	fi
 	exit "$1"
 }

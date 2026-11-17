@@ -105,7 +105,7 @@ if [ -n "$fsck" ]; then
 	rc=$?
 	set +o pipefail
 	printf '\nPress START to continue\n' > /dev/tty1
-	until s30-keyheld 315; do sleep 0.1; done
+	s30-keyheld -w 315 > /dev/null
 	if [ "${fsck%% *}" = fsck.fat ] && [ $rc -le 1 ]; then # 1: errors corrected
 		s=$(card_byte 65)
 		bk=$(dd if=/dev/mmcblk0p1 bs=1 skip=50 count=2 2>/dev/null | od -An -tu2 | tr -d ' ')

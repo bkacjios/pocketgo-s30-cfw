@@ -357,6 +357,10 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   writes). Kernel + uInitrd copied to the card 2026-10-30, untested on
   hardware: unknown whether the gamepad (I2C) and the UDC are up in time
   (`s30-keyheld` waits 2 s, the loader 5 s for `/sys/class/udc`).
+  `s30-keyheld -w CODE...` (2026-11-17) blocks on the devices' events until
+  one of the codes is pressed and prints it: the "Press START" prompts
+  (System update, the loader's card check) use it; polling the held state
+  every 0.2 s missed short presses.
 - Host side: NetworkManager profile `pocketgo-s30`, matched on the gadget's
   host MAC 02:53:33:30:00:01, DHCP, never-default, ignore DNS. Don't
   `nmcli dev connect` the USB interface without it: NM moves the unbound
