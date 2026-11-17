@@ -1,5 +1,9 @@
-# Extra Alpine packages (armv7, latest-stable) installed into the rootfs.
-# Dependencies are resolved by tools/apk_resolve.py; !name excludes a package.
+# Extra Alpine packages (armv7, latest-stable) installed into the rootfs by
+# apk itself (apk.static on the build host, build.sh initramfs), so the
+# device's package database knows them and "apk upgrade" (the System update
+# app) keeps them current. Our own Mesa (build.sh mesa: lima, no LLVM) is
+# installed first as the package s30-mesa, which provides Alpine's mesa-*
+# names and the EGL/GBM/GLES libraries, so nothing pulls Alpine's Mesa.
 devmem2
 i2c-tools
 tinyalsa
@@ -12,15 +16,6 @@ dropbear
 openssh-sftp-server
 rsync
 busybox-extras
-# Mesa: our own build (build.sh mesa: lima, EGL/GBM/GLES 2, no LLVM) in place
-# of Alpine's, whose one libgallium has every driver and links libLLVM
-!mesa
-!mesa-dri-gallium
-!mesa-egl
-!mesa-gbm
-!mesa-gles
-!llvm22-libs
-!spirv-tools
 # RetroArch itself is built by build.sh retroarch (patched for screen
 # rotation); these are its runtime libraries, udevd for joypad detection,
 # core info files and cores.
@@ -32,9 +27,11 @@ libretro-core-info
 # RetroArch menu assets (Ozone/XMB/GLUI themes, fonts, sounds) in
 # /usr/share/libretro/assets; the launcher uses its Ozone fonts
 retroarch-assets
-# fsck.fat / fsck.exfat for the loader's card check (see s30-loader)
+# fsck.fat / fsck.exfat for the loader's card check, e2fsck for the ext4
+# root image (see s30-loader); resize2fs to grow the image
 dosfstools
 exfatprogs
+e2fsprogs
 # Launcher (build.sh launcher)
 sdl2
 sdl2_ttf

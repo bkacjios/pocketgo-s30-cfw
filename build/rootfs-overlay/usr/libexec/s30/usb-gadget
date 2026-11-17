@@ -96,7 +96,7 @@ create() {
 # Rebind with the saved functions
 apply() {
 	create
-	killall s30-uvc s30-uac s30-mdns 2>/dev/null
+	killall s30-uvc s30-uac s30-mdns usb-network udhcpc udhcpd 2>/dev/null
 	echo > $G/UDC 2>/dev/null
 	for f in $ORDER; do rm -f $G/configs/c.1/$(inst $f); done
 	any=
@@ -108,10 +108,12 @@ apply() {
 	[ -n "$any" ] || return 0
 	ls /sys/class/udc > $G/UDC || return 1
 	if enabled network; then
-		ifconfig usb0 10.42.0.2 netmask 255.255.255.0 up
-		touch /tmp/udhcpd.leases
-		pidof udhcpd >/dev/null || busybox-extras udhcpd /etc/udhcpd.conf
-		# The host resolves s30.local to 10.42.0.2 (mDNS, A record only)
+		ifconfig usb0 up
+		# Addresses: a lease from a host that shares its connection, else
+		# 10.42.0.2 and udhcpd for the host (usb-network, which waits for a
+		# host and starts over at each plug-in)
+		/usr/libexec/s30/usb-network </dev/null >/dev/null 2>&1 &
+		# The host resolves s30.local to the usb0 address (mDNS, A record only)
 		s30-mdns usb0 s30 </dev/null >>/tmp/s30-mdns.log 2>&1 &
 	fi
 	enabled audio && s30-uac </dev/null >>/tmp/s30-uac.log 2>&1 &

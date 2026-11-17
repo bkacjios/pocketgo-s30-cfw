@@ -9,7 +9,7 @@ exec >>/tmp/frontend.log 2>&1
 # The display through s30-display (DRM lease), so its OSD can show over apps
 [ -f /usr/lib/s30/libs30lease.so ] && export LD_PRELOAD=/usr/lib/s30/libs30lease.so
 if [ -x /usr/bin/s30-launcher ]; then
-	s30-launcher /mnt/sd/apps
+	s30-launcher
 else
 	# The boot splash to black (the launcher does this once its window is
 	# up); dd stops at the end of the framebuffer (No space left on device)

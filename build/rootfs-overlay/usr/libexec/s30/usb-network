@@ -1,0 +1,29 @@
+#!/bin/sh
+# The USB network's addresses, started by usb-gadget with the network
+# function and kept running: each time a host enumerates the gadget (UDC
+# state "configured": boot with the cable in, a plug-in, a host waking) it
+# asks the host for a DHCP lease for 6 s. A host that shares its connection
+# (NetworkManager "Shared to other computers", Windows ICS, macOS Internet
+# Sharing) answers: address, default route, the host as DNS (udhcpc-usb0),
+# internet for the System update app. Otherwise the device is 10.42.0.2 and
+# hands the host 10.42.0.1 itself (udhcpd), which needs no setup on the PC.
+# Not both at once: our udhcpd would answer our own udhcpc. When the host
+# goes away everything is dropped and the wait starts over.
+state() { cat /sys/class/udc/*/state 2>/dev/null; }
+stop() {
+	[ -f /run/udhcpc.usb0.pid ] && kill "$(cat /run/udhcpc.usb0.pid)" 2>/dev/null # -R: released, deconfig
+	pkill -x udhcpd
+	ip -4 addr flush dev usb0
+}
+trap 'stop; exit 0' TERM INT
+while :; do
+	until [ "$(state)" = configured ]; do sleep 0.5; done
+	if ! udhcpc -i usb0 -n -t 3 -T 2 -R -r 10.42.0.2 -s /usr/libexec/s30/udhcpc-usb0 \
+			-p /run/udhcpc.usb0.pid >/dev/null 2>&1; then
+		ifconfig usb0 10.42.0.2 netmask 255.255.255.0 up
+		touch /tmp/udhcpd.leases
+		busybox-extras udhcpd /etc/udhcpd.conf
+	fi
+	while [ "$(state)" = configured ]; do sleep 2; done
+	stop
+done

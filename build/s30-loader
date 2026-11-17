@@ -1,6 +1,9 @@
 #!/bin/busybox sh
-# initramfs /init: mount the SD card, loop-mount /boot/rootfs.sqfs (read-only
-# system) under a tmpfs overlay (writable, lost at reboot) and switch to it.
+# initramfs /init: mount the SD card and switch to the system on it:
+# /boot/rootfs.ext4 (the Alpine root in an ext4 image, loop-mounted
+# read-write, so changes persist) when there is one, else
+# /boot/rootfs.sqfs (read-only squashfs) under a tmpfs overlay (writable,
+# lost at reboot).
 /bin/busybox --install -s /bin
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -122,20 +125,35 @@ until mount /dev/mmcblk0p1 /sd; do
 done
 # Staged update (copied over ssh while the old one is in use as /): installed
 # only if it mounts, so a copy cut short by a reboot is dropped, not booted
-if [ -f /sd/boot/rootfs.sqfs.new ]; then
-	if mount -t squashfs -o loop,ro /sd/boot/rootfs.sqfs.new /ro; then
+stage() { # NAME FSTYPE: /boot/NAME.new replaces /boot/NAME
+	[ -f "/sd/boot/$1.new" ] || return 0
+	if mount -t "$2" -o loop,ro "/sd/boot/$1.new" /ro; then
 		umount /ro
-		mv /sd/boot/rootfs.sqfs.new /sd/boot/rootfs.sqfs
+		mv "/sd/boot/$1.new" "/sd/boot/$1"
 	else
-		echo "s30-loader: rootfs.sqfs.new does not mount, dropped" > /dev/console
-		rm -f /sd/boot/rootfs.sqfs.new
+		echo "s30-loader: $1.new does not mount, dropped" > /dev/console
+		rm -f "/sd/boot/$1.new"
 	fi
+}
+stage rootfs.ext4 ext4
+stage rootfs.sqfs squashfs
+if [ -f /sd/boot/rootfs.ext4 ]; then
+	# The journal is replayed and the usual repairs made silently (-p; its
+	# "clean" line would show on the LCD: /dev/console is tty1 too); what
+	# preen won't touch (exit 4 and up; 1: errors corrected) gets a full
+	# repair on the LCD
+	e2fsck -p /sd/boot/rootfs.ext4 > /dev/null 2>&1
+	[ $? -le 1 ] ||
+		e2fsck -y /sd/boot/rootfs.ext4 2>&1 | tee /dev/console > /dev/tty1
+	mount -t ext4 -o loop,noatime /sd/boot/rootfs.ext4 /root ||
+		fail "cannot mount /boot/rootfs.ext4"
+else
+	mount -t squashfs -o loop,ro /sd/boot/rootfs.sqfs /ro || fail "cannot mount /boot/rootfs.sqfs"
+	mount -t tmpfs -o mode=755 tmpfs /rw
+	mkdir -p /rw/upper /rw/work
+	mount -t overlay overlay -o lowerdir=/ro,upperdir=/rw/upper,workdir=/rw/work /root ||
+		fail "cannot mount overlay"
 fi
-mount -t squashfs -o loop,ro /sd/boot/rootfs.sqfs /ro || fail "cannot mount /boot/rootfs.sqfs"
-mount -t tmpfs -o mode=755 tmpfs /rw
-mkdir -p /rw/upper /rw/work
-mount -t overlay overlay -o lowerdir=/ro,upperdir=/rw/upper,workdir=/rw/work /root ||
-	fail "cannot mount overlay"
 
 mkdir -p /root/mnt/sd
 mount --move /sd /root/mnt/sd

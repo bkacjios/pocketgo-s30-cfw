@@ -1,0 +1,23 @@
+#!/bin/sh
+# udhcpc script for usb0 (see usb-gadget): the lease from a host that shares
+# its connection gives the device its address, the default route and the
+# host as DNS. Called by udhcpc with the event in $1 and the lease in the
+# environment (interface, ip, mask, router, dns).
+case "$1" in
+bound|renew)
+	ip -4 addr replace "$ip/${mask:-24}" dev "$interface"
+	for r in $router; do
+		ip -4 route replace default via "$r" dev "$interface"
+		break
+	done
+	if [ -n "$dns" ]; then
+		printf 'nameserver %s\n' $dns > /etc/resolv.conf.$$
+		mv -f /etc/resolv.conf.$$ /etc/resolv.conf
+	fi
+	;;
+deconfig)
+	ip -4 route del default dev "$interface" 2>/dev/null
+	rm -f /etc/resolv.conf
+	;;
+esac
+exit 0

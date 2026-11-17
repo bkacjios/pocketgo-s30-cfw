@@ -5,6 +5,10 @@ mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts
+# RAM for the runtime and scratch files: the root may be the ext4 image on the
+# card (see s30-loader), and /tmp holds the frontend's log
+mount -t tmpfs -o mode=755 tmpfs /run
+mount -t tmpfs -o mode=1777 tmpfs /tmp
 hostname pocketgo-s30
 # Boot splash: the U-Boot image with a progress bar
 s30-splash 5

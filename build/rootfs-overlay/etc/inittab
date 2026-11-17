@@ -11,7 +11,14 @@ ttyS0::respawn:-/bin/sh
 ttyGS0::respawn:-/bin/sh
 
 ::ctrlaltdel:/sbin/reboot
+# The root (rootfs.ext4, a loop device over a file on the card) read-only
+# first, so nothing writes to the card after the sync. The card itself stays
+# busy (the loop device holds its file open for writing), so it can neither
+# be unmounted nor made read-only; a plain remount is allowed and clears its
+# dirty flag (exfat_reconfigure), which otherwise makes s30-loader check the
+# card at every boot (see there). umount's complaints about the busy card
+# would show on the LCD (the console is tty1 too).
+::shutdown:/bin/mount -o remount,ro /
 ::shutdown:/bin/sync
-# The card unmounted (busy: read-only), so its FAT is marked clean; else
-# s30-loader checks it at every boot (see there)
-::shutdown:/bin/umount -a -r
+::shutdown:/bin/mount -o remount /mnt/sd
+::shutdown:/bin/umount -a -r >/dev/null 2>&1

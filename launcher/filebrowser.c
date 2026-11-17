@@ -8,14 +8,30 @@
  * onto the portrait panel), the gamepad read straight from evdev, text in
  * the system menu's font (ui.c).
  *
- * Home: Screenshots (/mnt/sd/screenshots, where the system menu's
- * Screenshot saves) and Files, then the apps in /mnt/sd/apps (or argv[1]).
+ * Home: Games (/mnt/sd/games: the ports' launch scripts), ROMs
+ * (/mnt/sd/roms, any folders), Apps (/mnt/sd/apps: RetroArch, tools),
+ * Screenshots (/mnt/sd/screenshots, where the system menu's Screenshot
+ * saves) and Files. A section lists its folders, launch scripts, ROMs and
+ * pictures (other files are hidden); B goes up to the section's tile.
  * Files opens a browser at the card (/mnt/sd): everything listed, B up to
  * /, X back home. D-pad/stick: move, A: open/run, B: parent folder, Y: tiles
- * or a list (saved in ~/.config/s30/launcher_view; the list pages with
- * left/right). Folders open; *.sh files run with /bin/sh;
+ * or a list (each folder remembers its own, in ~/.config/s30/launcher_view;
+ * the list pages with left/right). Folders open; *.sh files run with /bin/sh;
  * ELF binaries run directly (on exFAT every file looks executable, so the
- * file type decides). While an app runs the launcher releases the display
+ * file type decides).
+ *
+ * ROMs: a file whose extension one of the installed RetroArch cores (the
+ * _libretro.so files in retroarch.cfg's libretro_directory and in
+ * ~/.config/retroarch/cores, described by an .info file in its
+ * libretro_info_path or next to the core) supports runs in RetroArch with
+ * that core.
+ * Which core: the ROM's own choice, else its folder's (or a parent folder's),
+ * else the first core that takes the extension (mGBA before gpSP for GBA,
+ * Gambatte for GB/GBC). X on a ROM, or on a folder in ROMs, picks the core
+ * from the ones that fit (a ROM can also go back to its folder's choice);
+ * saved in ~/.config/s30/cores as "path=core" lines.
+ *
+ * While an app runs the launcher releases the display
  * and waits for it. The app's output (stdout, stderr) goes to the launcher's
  * own (the frontend's log). A launch script with a "# s30-console" line in
  * its first lines also gets it on the text console (tty1), which
@@ -30,6 +46,7 @@
  * back. In Screenshots (and its viewer) X deletes the picture, after a
  * confirmation (A delete, B cancel).
  */
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -54,9 +71,16 @@
 #define SCRW UI_W
 #define SCRH UI_H
 
-#define DEFAULT_DIR "/mnt/sd/apps"
+#define GAMES_DIR "/mnt/sd/games"
+#define ROMS_DIR "/mnt/sd/roms"
+#define APPS_DIR "/mnt/sd/apps"
 #define SHOTS_DIR "/mnt/sd/screenshots"
 #define FILES_DIR "/mnt/sd" // where the Files tile's browser starts
+#define CORES_DIR "/usr/lib/libretro" // unless retroarch.cfg says libretro_directory
+#define USER_CORES_DIR "/.config/retroarch/cores" // under $HOME: scanned as well (wins by name)
+#define CORES_INFO_DIR "/usr/share/libretro/info" // unless it says libretro_info_path
+#define CORES_FILE "/.config/s30/cores" // under $HOME: "path=core" lines
+#define RETROARCH_CFG "/.config/retroarch/retroarch.cfg" // under $HOME
 
 /* Grid: 4 x 2 tiles under the header, the footer below */
 #define HEADER_H 34
@@ -77,7 +101,7 @@
 #define LIST_ROW_H 24
 #define LIST_ROWS ((FOOTER_Y - 2 - GRID_Y) / LIST_ROW_H)
 #define LIST_ICON 20
-#define VIEW_FILE "/.config/s30/launcher_view" // under $HOME: "list" or "grid"
+#define VIEW_FILE "/.config/s30/launcher_view" // under $HOME: "path=list|grid" lines ("home" for home)
 
 static const SDL_Color kBgTop = { 34, 30, 64, 255 };
 static const SDL_Color kBgBottom = { 4, 4, 10, 255 };
@@ -91,7 +115,7 @@ static const SDL_Color kLine = { 70, 64, 110, 255 };
  * Directory listing
  * ------------------------------------------------------------------------- */
 
-typedef enum { K_DIR, K_APP, K_IMAGE, K_FILE } Kind;
+typedef enum { K_DIR, K_APP, K_ROM, K_IMAGE, K_FILE } Kind;
 
 typedef struct {
     char* name;     // as listed
@@ -111,37 +135,357 @@ static struct {
     int scroll; // first visible row
 } sDir;
 
-static char sStartDir[PATH_MAX];
-static bool sBrowsing; // in Files: every entry listed; else home or Screenshots
+static bool sBrowsing; // in Files: every entry listed; else home or a section
 static bool sList;     // the list view, else tiles (Y)
 
-static void view_mode_path(char* path, size_t size) {
+/* Home is no folder: sDir.path is empty there */
+static bool is_home(void) {
+    return !sBrowsing && sDir.path[0] == 0;
+}
+
+/* The section (home tile) a path is the root of, or NULL */
+static const char* section_name(const char* path) {
+    return strcmp(path, GAMES_DIR) == 0   ? "Games"
+           : strcmp(path, ROMS_DIR) == 0  ? "ROMs"
+           : strcmp(path, APPS_DIR) == 0  ? "Apps"
+           : strcmp(path, SHOTS_DIR) == 0 ? "Screenshots"
+                                          : NULL;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Settings files: "key=value" lines under $HOME (the view per folder, the
+ * core per ROM or folder)
+ * ------------------------------------------------------------------------- */
+
+static void home_path(char* out, size_t size, const char* suffix) {
     const char* home = getenv("HOME");
-    snprintf(path, size, "%s%s", home != NULL ? home : "", VIEW_FILE);
+    snprintf(out, size, "%s%s", home != NULL ? home : "/root", suffix);
 }
 
-static void view_mode_load(void) {
-    char path[PATH_MAX], mode[8] = "";
+typedef struct {
+    char file[PATH_MAX];
+    char** keys;
+    char** values;
+    int count;
+} KvFile;
+
+static void kv_load(KvFile* kv, const char* suffix) {
+    char line[PATH_MAX + 64];
     FILE* f;
 
-    view_mode_path(path, sizeof(path));
-    f = fopen(path, "r");
-    if (f != NULL) {
-        sList = fscanf(f, "%7s", mode) == 1 && strcmp(mode, "list") == 0;
-        fclose(f);
+    home_path(kv->file, sizeof(kv->file), suffix);
+    f = fopen(kv->file, "r");
+    if (f == NULL) {
+        return;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char* eq = strrchr(line, '=');
+        char* nl = strchr(line, '\n');
+        if (nl != NULL) {
+            *nl = 0;
+        }
+        if (eq == NULL || eq == line) {
+            continue;
+        }
+        *eq = 0;
+        kv->keys = realloc(kv->keys, (kv->count + 1) * sizeof(char*));
+        kv->values = realloc(kv->values, (kv->count + 1) * sizeof(char*));
+        kv->keys[kv->count] = strdup(line);
+        kv->values[kv->count] = strdup(eq + 1);
+        kv->count++;
+    }
+    fclose(f);
+}
+
+static void kv_save(const KvFile* kv) {
+    char dir[PATH_MAX];
+    FILE* f;
+    int i;
+
+    snprintf(dir, sizeof(dir), "%s", kv->file);
+    mkdir(dirname(dir), 0755);
+    f = fopen(kv->file, "w");
+    if (f == NULL) {
+        return;
+    }
+    for (i = 0; i < kv->count; i++) {
+        fprintf(f, "%s=%s\n", kv->keys[i], kv->values[i]);
+    }
+    fclose(f);
+}
+
+static const char* kv_get(const KvFile* kv, const char* key) {
+    int i;
+    for (i = 0; i < kv->count; i++) {
+        if (strcmp(kv->keys[i], key) == 0) {
+            return kv->values[i];
+        }
+    }
+    return NULL;
+}
+
+/* Sets (value != NULL) or removes a key, and saves */
+static void kv_set(KvFile* kv, const char* key, const char* value) {
+    int i;
+
+    for (i = 0; i < kv->count; i++) {
+        if (strcmp(kv->keys[i], key) == 0) {
+            free(kv->keys[i]);
+            free(kv->values[i]);
+            kv->count--;
+            memmove(&kv->keys[i], &kv->keys[i + 1], (kv->count - i) * sizeof(char*));
+            memmove(&kv->values[i], &kv->values[i + 1], (kv->count - i) * sizeof(char*));
+            break;
+        }
+    }
+    if (value != NULL) {
+        kv->keys = realloc(kv->keys, (kv->count + 1) * sizeof(char*));
+        kv->values = realloc(kv->values, (kv->count + 1) * sizeof(char*));
+        kv->keys[kv->count] = strdup(key);
+        kv->values[kv->count] = strdup(value);
+        kv->count++;
+    }
+    kv_save(kv);
+}
+
+/* ---------------------------------------------------------------------------
+ * RetroArch cores: the installed ones and which runs which ROM
+ * ------------------------------------------------------------------------- */
+
+static const char* extension(const char* name);
+
+
+#define MAX_CORES 32
+
+typedef struct {
+    char name[48];       // "mgba" (mgba_libretro.so)
+    char path[PATH_MAX]; // the .so
+    char display[96];    // from the info file, else the name
+    char exts[128];      // "|gb|gbc|gba|"
+} Core;
+
+static Core sCores[MAX_CORES];
+static int sNumCores;
+
+static KvFile sCoreMap; // CORES_FILE: a ROM or folder path = core name
+
+/* An info file's quoted value for `key`, or "" */
+static void info_value(const char* path, const char* key, char* out, size_t size) {
+    FILE* f = fopen(path, "r");
+    char line[512];
+    size_t klen = strlen(key);
+
+    out[0] = 0;
+    if (f == NULL) {
+        return;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char* q;
+        if (strncmp(line, key, klen) != 0 || line[klen] != ' ') {
+            continue;
+        }
+        q = strchr(line, '"');
+        if (q != NULL) {
+            char* end = strchr(q + 1, '"');
+            if (end != NULL) {
+                *end = 0;
+            }
+            snprintf(out, size, "%s", q + 1);
+        }
+        break;
+    }
+    fclose(f);
+}
+
+static char sCoresDir[PATH_MAX], sCoresInfoDir[PATH_MAX];
+
+/* A "key = "value"" setting of retroarch.cfg, ~ expanded, else `fallback` */
+static void cfg_dir(const char* key, const char* fallback, char* out, size_t size) {
+    char cfg[PATH_MAX], value[PATH_MAX];
+
+    home_path(cfg, sizeof(cfg), RETROARCH_CFG);
+    info_value(cfg, key, value, sizeof(value));
+    if (value[0] == '~') {
+        home_path(out, size, value + 1);
+    } else {
+        snprintf(out, size, "%s", value[0] ? value : fallback);
     }
 }
 
-static void view_mode_save(void) {
-    char path[PATH_MAX];
-    FILE* f;
+static const Core* core_by_name(const char* name);
 
-    view_mode_path(path, sizeof(path));
-    f = fopen(path, "w");
-    if (f != NULL) {
-        fputs(sList ? "list\n" : "grid\n", f);
-        fclose(f);
+/* The cores in one folder; a name already listed (from the user's folder,
+   scanned first) is kept */
+static void cores_scan(const char* folder) {
+    char pattern[PATH_MAX];
+    glob_t g;
+    size_t i;
+
+    snprintf(pattern, sizeof(pattern), "%s/*_libretro.so", folder);
+    if (glob(pattern, 0, NULL, &g) != 0) {
+        return;
     }
+    for (i = 0; i < g.gl_pathc && sNumCores < MAX_CORES; i++) {
+        Core* c = &sCores[sNumCores];
+        char base[NAME_MAX + 1], info[PATH_MAX], exts[128];
+        char* suffix;
+
+        snprintf(base, sizeof(base), "%s", basename(g.gl_pathv[i]));
+        suffix = strstr(base, "_libretro.so");
+        if (suffix == NULL) {
+            continue;
+        }
+        *suffix = 0;
+        if (core_by_name(base) != NULL) {
+            continue;
+        }
+        snprintf(c->name, sizeof(c->name), "%s", base);
+        snprintf(c->path, sizeof(c->path), "%s", g.gl_pathv[i]);
+        snprintf(info, sizeof(info), "%s/%s_libretro.info", sCoresInfoDir, base);
+        if (access(info, R_OK) != 0) { // else next to the core
+            snprintf(info, sizeof(info), "%s/%s_libretro.info", folder, base);
+        }
+        info_value(info, "display_name", c->display, sizeof(c->display));
+        if (c->display[0] == 0) {
+            snprintf(c->display, sizeof(c->display), "%s", base);
+        }
+        info_value(info, "supported_extensions", exts, sizeof(exts));
+        snprintf(c->exts, sizeof(c->exts), "|%s|", exts);
+        sNumCores++;
+    }
+    globfree(&g);
+}
+
+static void cores_load(void) {
+    char user[PATH_MAX];
+
+    sNumCores = 0;
+    cfg_dir("libretro_directory", CORES_DIR, sCoresDir, sizeof(sCoresDir));
+    cfg_dir("libretro_info_path", CORES_INFO_DIR, sCoresInfoDir, sizeof(sCoresInfoDir));
+    home_path(user, sizeof(user), USER_CORES_DIR);
+    cores_scan(user);
+    cores_scan(sCoresDir);
+}
+
+static const Core* core_by_name(const char* name) {
+    int i;
+    for (i = 0; i < sNumCores; i++) {
+        if (strcmp(sCores[i].name, name) == 0) {
+            return &sCores[i];
+        }
+    }
+    return NULL;
+}
+
+/* The extension (no dot, lower case) of a file name */
+static void rom_ext(const char* name, char* out, size_t size) {
+    const char* e = extension(name);
+    size_t i;
+
+    snprintf(out, size, "%s", e[0] ? e + 1 : "");
+    for (i = 0; out[i]; i++) {
+        out[i] = tolower((unsigned char)out[i]);
+    }
+}
+
+static bool core_takes(const Core* c, const char* ext) {
+    char key[64];
+    snprintf(key, sizeof(key), "|%s|", ext);
+    return ext[0] != 0 && strstr(c->exts, key) != NULL;
+}
+
+static bool is_rom_name(const char* name) {
+    char ext[32];
+    int i;
+
+    rom_ext(name, ext, sizeof(ext));
+    for (i = 0; i < sNumCores; i++) {
+        if (core_takes(&sCores[i], ext)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The default core for an extension: the preferred one when installed,
+   else the first that takes it */
+static const Core* core_default(const char* ext) {
+    static const char* const kPreferred[][2] = { { "gba", "mgba" }, { "gb", "gambatte" }, { "gbc", "gambatte" } };
+    size_t i;
+    int j;
+
+    for (i = 0; i < sizeof(kPreferred) / sizeof(kPreferred[0]); i++) {
+        if (strcmp(ext, kPreferred[i][0]) == 0) {
+            const Core* c = core_by_name(kPreferred[i][1]);
+            if (c != NULL && core_takes(c, ext)) {
+                return c;
+            }
+        }
+    }
+    for (j = 0; j < sNumCores; j++) {
+        if (core_takes(&sCores[j], ext)) {
+            return &sCores[j];
+        }
+    }
+    return NULL;
+}
+
+static const char* core_map_get(const char* path) {
+    return kv_get(&sCoreMap, path);
+}
+
+static void core_map_set(const char* path, const char* core) {
+    kv_set(&sCoreMap, path, core);
+}
+
+/* The core set for a folder or one of its parents (the nearest), or NULL */
+static const char* core_for_folder(const char* dir) {
+    char cur[PATH_MAX];
+
+    snprintf(cur, sizeof(cur), "%s", dir);
+    while (strcmp(cur, "/") != 0) {
+        const char* c = core_map_get(cur);
+        char tmp[PATH_MAX];
+
+        if (c != NULL) {
+            return c;
+        }
+        snprintf(tmp, sizeof(tmp), "%s", cur);
+        snprintf(cur, sizeof(cur), "%s", dirname(tmp));
+    }
+    return NULL;
+}
+
+/* The core a ROM runs on (installed), or NULL */
+static const Core* core_for_rom(const char* path) {
+    char dir[PATH_MAX], ext[32];
+    const char* name = core_map_get(path);
+    const Core* c;
+
+    if (name != NULL && (c = core_by_name(name)) != NULL) {
+        return c;
+    }
+    snprintf(dir, sizeof(dir), "%s", path);
+    name = core_for_folder(dirname(dir));
+    if (name != NULL && (c = core_by_name(name)) != NULL) {
+        return c;
+    }
+    rom_ext(basename((char*)path), ext, sizeof(ext));
+    return core_default(ext);
+}
+
+static KvFile sViews; // VIEW_FILE
+
+/* The key a folder's view is saved under */
+static const char* view_key(void) {
+    return is_home() ? "home" : sDir.path;
+}
+
+/* Applies the folder's saved view (tiles unless it chose the list) */
+static void view_apply(void) {
+    const char* v = kv_get(&sViews, view_key());
+    sList = v != NULL && strcmp(v, "list") == 0;
 }
 
 static const char* extension(const char* name) {
@@ -282,41 +626,26 @@ static void dir_open(const char* path, const char* select) {
         kind = S_ISDIR(st.st_mode)                            ? K_DIR
                : strcasecmp(extension(de->d_name), ".sh") == 0 ? K_APP
                : is_image_name(de->d_name)                     ? K_IMAGE
+               : is_rom_name(de->d_name)                       ? K_ROM
                                                                : K_FILE;
         entry_add(de->d_name, full, kind);
     }
     closedir(d);
     attach_icons();
-    if (!sBrowsing && strcmp(resolved, sStartDir) == 0) { // home: the apps only
+    if (!sBrowsing) { // a section: folders, launch scripts, ROMs and pictures
         int n = 0;
 
         for (i = 0; i < sDir.count; i++) {
-            if (sDir.entries[i].kind == K_APP) {
+            if (sDir.entries[i].kind != K_FILE) {
                 sDir.entries[n++] = sDir.entries[i];
             } else {
                 entry_free(&sDir.entries[i]);
             }
         }
         sDir.count = n;
-        qsort(sDir.entries, sDir.count, sizeof(Entry), entry_cmp);
-        // Screenshots and Files first
-        n = 0;
-        if (stat(SHOTS_DIR, &st) == 0 && S_ISDIR(st.st_mode)) {
-            entry_add("Screenshots", SHOTS_DIR, K_DIR);
-            n++;
-        }
-        entry_add("Files", FILES_DIR, K_DIR);
-        n++;
-        {
-            Entry front[2];
-
-            memcpy(front, &sDir.entries[sDir.count - n], n * sizeof(Entry));
-            memmove(&sDir.entries[n], &sDir.entries[0], (sDir.count - n) * sizeof(Entry));
-            memcpy(sDir.entries, front, n * sizeof(Entry));
-        }
-    } else {
-        qsort(sDir.entries, sDir.count, sizeof(Entry), entry_cmp);
     }
+    qsort(sDir.entries, sDir.count, sizeof(Entry), entry_cmp);
+    view_apply();
     sDir.selected = 0;
     sDir.scroll = 0;
     for (i = 0; select != NULL && i < sDir.count; i++) {
@@ -326,14 +655,40 @@ static void dir_open(const char* path, const char* select) {
     }
 }
 
+/* Home: the sections (those that exist) and Files */
+static void home_open(const char* select) {
+    static const char* const kSections[][2] = {
+        { "Games", GAMES_DIR }, { "ROMs", ROMS_DIR }, { "Apps", APPS_DIR }, { "Screenshots", SHOTS_DIR }
+    };
+    struct stat st;
+    size_t i;
+
+    dir_free();
+    sDir.path[0] = 0;
+    for (i = 0; i < sizeof(kSections) / sizeof(kSections[0]); i++) {
+        if (stat(kSections[i][1], &st) == 0 && S_ISDIR(st.st_mode)) {
+            entry_add(kSections[i][0], kSections[i][1], K_DIR);
+        }
+    }
+    entry_add("Files", FILES_DIR, K_DIR);
+    view_apply();
+    sDir.selected = 0;
+    sDir.scroll = 0;
+    for (i = 0; select != NULL && (int)i < sDir.count; i++) {
+        if (strcmp(sDir.entries[i].name, select) == 0) {
+            sDir.selected = i;
+        }
+    }
+}
+
 static void dir_parent(void) {
     char cur[PATH_MAX], name[PATH_MAX], parent[PATH_MAX];
 
-    if (!sBrowsing && strcmp(sDir.path, sStartDir) == 0) {
-        return; // home
+    if (is_home()) {
+        return;
     }
-    if (!sBrowsing) { // Screenshots: back home, to its tile
-        dir_open(sStartDir, "Screenshots");
+    if (!sBrowsing && section_name(sDir.path) != NULL) { // a section's root: home, to its tile
+        home_open(section_name(sDir.path));
         return;
     }
     if (strcmp(sDir.path, "/") == 0) {
@@ -394,18 +749,49 @@ static int battery(bool* charging) {
     return pct;
 }
 
+/* Internet through the USB host: the default route that usb-network's DHCP
+   lease brings (a host that shares its connection) */
+static bool online(void) {
+    FILE* f = fopen("/proc/net/route", "r");
+    char line[256];
+    bool found = false;
+
+    while (f != NULL && !found && fgets(line, sizeof(line), f) != NULL) {
+        char iface[16];
+        unsigned dest;
+        found = sscanf(line, "%15s %x", iface, &dest) == 2 && dest == 0;
+    }
+    if (f != NULL) {
+        fclose(f);
+    }
+    return found;
+}
+
+/* A 2x pixel glyph: rows of '#' and '.' */
+static void draw_glyph(const char* const* rows, int n, int x, int y, SDL_Color c) {
+    int i, j;
+    for (j = 0; j < n; j++) {
+        for (i = 0; rows[j][i]; i++) {
+            if (rows[j][i] == '#') {
+                ui_fill((SDL_Rect){ x + i * 2, y + j * 2, 2, 2 }, c);
+            }
+        }
+    }
+}
+
 /* Battery, right-aligned to `right` and centred on `cy`, as in the system
    menu (s30-display): filled to the level in green, yellow or red with the
-   percentage inside, a pixel bolt to its left while charging (the battery
-   itself never moves) */
-static void draw_battery(int right, int cy, int pct, bool charging) {
+   percentage inside, a pixel bolt to its left while charging, a chain link
+   left of that while online (the battery and the link never move) */
+static void draw_battery(int right, int cy, int pct, bool charging, bool net) {
     static const char* const bolt[7] = { "...##", "..##.", ".##..", "#####", "..##.", ".##..", "##..." };
+    static const char* const link[5] = { ".###...###.", "#...#.#...#", "#..#####..#", "#...#.#...#", ".###...###." };
     const int bw = 42, bh = 18, y = cy - bh / 2, x = right - 3 - bw;
     SDL_Color c = pct > 50 ? (SDL_Color){ 70, 200, 90, 255 }
                   : pct > 20 ? (SDL_Color){ 235, 190, 40, 255 }
                              : (SDL_Color){ 225, 60, 50, 255 };
     char text[8];
-    int len, i, j;
+    int len;
 
     pct = pct > 100 ? 100 : pct;
     ui_fill((SDL_Rect){ x, y, bw, bh }, (SDL_Color){ 200, 200, 200, 255 });
@@ -419,13 +805,10 @@ static void draw_battery(int right, int cy, int pct, bool charging) {
     ui_text(text, UI_TEXT, x + (bw - len * 8) / 2, y + bh / 2 - 7, bw);
 
     if (charging) {
-        for (j = 0; j < 7; j++) {
-            for (i = 0; i < 5; i++) {
-                if (bolt[j][i] == '#') {
-                    ui_fill((SDL_Rect){ x - 14 + i * 2, y + 2 + j * 2, 2, 2 }, UI_TEXT);
-                }
-            }
-        }
+        draw_glyph(bolt, 7, x - 14, y + 2, UI_TEXT);
+    }
+    if (net) {
+        draw_glyph(link, 5, x - 14 - 6 - 22, y + 4, UI_TEXT);
     }
 }
 
@@ -494,6 +877,11 @@ static void draw_default_icon(const Entry* e, SDL_Rect box, bool selected) {
         fill_triangle(left, y + h / 3.0f, left + tw, y + h / 2.0f, left, y + h * 2 / 3.0f, body);
         break;
     }
+    case K_ROM: // a cartridge: body, a label, the edge connector
+        ui_fill((SDL_Rect){ x + w / 5, y + h / 6, w * 3 / 5, h * 2 / 3 }, shade);
+        ui_fill((SDL_Rect){ x + w / 5 + 4, y + h / 6 + 4, w * 3 / 5 - 8, h / 3 }, body);
+        ui_fill((SDL_Rect){ x + w / 5 + w / 10, y + h / 6 + h * 2 / 3 - h / 8, w * 3 / 5 - w / 5, h / 8 }, body);
+        break;
     default: // a sheet with a folded corner
         ui_fill((SDL_Rect){ x + w / 4, y + h / 6, w / 2, h * 2 / 3 }, body);
         ui_fill((SDL_Rect){ x + w * 3 / 4 - w / 6, y + h / 6, w / 6, h / 6 }, shade);
@@ -579,9 +967,9 @@ static void draw_header(const char* title) {
     bool charging;
     int pct = battery(&charging);
 
-    ui_text(title, UI_ACCENT, 12, (HEADER_H - UI_CHAR_H) / 2, SCRW - 90);
+    ui_text(title, UI_ACCENT, 12, (HEADER_H - UI_CHAR_H) / 2, SCRW - 120);
     if (pct >= 0) {
-        draw_battery(SCRW - 10, HEADER_H / 2, pct, charging);
+        draw_battery(SCRW - 10, HEADER_H / 2, pct, charging, online());
     }
     ui_fill((SDL_Rect){ 8, HEADER_H - 1, SCRW - 16, 1 }, kLine);
 }
@@ -619,6 +1007,125 @@ static void draw_confirm(void) {
     ui_text("Cancel", UI_DIM, x, box.y + 53, SCRW);
 }
 
+/* ---------------------------------------------------------------------------
+ * Core picker (X): the cores for the selected ROM, or every core for a
+ * folder inside ROMs
+ * ------------------------------------------------------------------------- */
+
+static struct {
+    bool open;
+    char path[PATH_MAX]; // the ROM or folder being set
+    bool isDir;
+    int items[MAX_CORES + 1]; // core indexes; -1: the folder's choice (ROM) or none (folder)
+    int count, selected;
+} sPick;
+
+static bool can_pick_core(void) {
+    const Entry* e;
+
+    if (sDir.count == 0 || sNumCores == 0 || is_home()) {
+        return false;
+    }
+    e = &sDir.entries[sDir.selected];
+    return e->kind == K_ROM || (e->kind == K_DIR && !sBrowsing && strncmp(sDir.path, ROMS_DIR, strlen(ROMS_DIR)) == 0);
+}
+
+static void pick_open(void) {
+    const Entry* e = &sDir.entries[sDir.selected];
+    const char* current = core_map_get(e->path);
+    char ext[32];
+    int i;
+
+    snprintf(sPick.path, sizeof(sPick.path), "%s", e->path);
+    sPick.isDir = e->kind == K_DIR;
+    sPick.count = 0;
+    sPick.items[sPick.count++] = -1;
+    rom_ext(e->name, ext, sizeof(ext));
+    for (i = 0; i < sNumCores; i++) {
+        if (sPick.isDir || core_takes(&sCores[i], ext)) {
+            sPick.items[sPick.count++] = i;
+        }
+    }
+    sPick.selected = 0;
+    for (i = 1; i < sPick.count; i++) {
+        if (current != NULL && strcmp(sCores[sPick.items[i]].name, current) == 0) {
+            sPick.selected = i;
+        }
+    }
+    sPick.open = true;
+}
+
+static void pick_apply(void) {
+    int item = sPick.items[sPick.selected];
+    core_map_set(sPick.path, item < 0 ? NULL : sCores[item].name);
+    sPick.open = false;
+}
+
+/* The picker, a box over whatever is drawn: a row per choice, the current
+   one marked */
+static void draw_pick(void) {
+    const int rowH = 20, pad = 10;
+    const int boxH = pad + UI_CHAR_H + 8 + sPick.count * rowH + pad + 20;
+    const SDL_Rect box = { SCRW / 2 - 190, (SCRH - boxH) / 2, 380, boxH };
+    const char* current = core_map_get(sPick.path);
+    char title[NAME_MAX + 32], name[NAME_MAX + 1];
+    int i, y = box.y + pad + UI_CHAR_H + 8;
+    const Entry* e = &sDir.entries[sDir.selected];
+
+    ui_fill((SDL_Rect){ 0, 0, SCRW, SCRH }, (SDL_Color){ 0, 0, 0, 120 });
+    ui_fill(box, kTile);
+    ui_box(box, kSelectedEdge, 2);
+    stem(e, name, sizeof(name));
+    snprintf(title, sizeof(title), "Core for %s", name);
+    ui_text(title, UI_ACCENT, box.x + pad, box.y + pad, box.w - 2 * pad);
+    for (i = 0; i < sPick.count; i++) {
+        const SDL_Rect row = { box.x + 6, y + i * rowH, box.w - 12, rowH - 2 };
+        char label[160];
+        bool isCurrent;
+
+        if (sPick.items[i] < 0) {
+            if (sPick.isDir) {
+                snprintf(label, sizeof(label), "No choice (each ROM's own, or the default)");
+            } else {
+                char dir[PATH_MAX];
+                const char* folder;
+                const Core* d;
+
+                snprintf(dir, sizeof(dir), "%s", sPick.path);
+                folder = core_for_folder(dirname(dir));
+                d = folder != NULL ? core_by_name(folder) : NULL;
+                if (d == NULL) {
+                    char ext[32];
+                    rom_ext(e->name, ext, sizeof(ext));
+                    d = core_default(ext);
+                }
+                snprintf(label, sizeof(label), "Folder's choice (%s)", d != NULL ? d->display : "none");
+            }
+            isCurrent = current == NULL;
+        } else {
+            snprintf(label, sizeof(label), "%s", sCores[sPick.items[i]].display);
+            isCurrent = current != NULL && strcmp(current, sCores[sPick.items[i]].name) == 0;
+        }
+        if (i == sPick.selected) {
+            ui_fill(row, kSelected);
+            ui_box(row, kSelectedEdge, 1);
+        }
+        ui_text(isCurrent ? "*" : " ", UI_ACCENT, row.x + 6, row.y + 1, 12);
+        ui_text(label, i == sPick.selected ? UI_TEXT : UI_DIM, row.x + 20, row.y + 1, row.w - 26);
+    }
+    {
+        int x = box.x + pad;
+        const int by = box.y + box.h - 22;
+        ui_button(kLetterA, x, by + 1);
+        x += BUTTON_SIZE + 5;
+        ui_text("Choose", UI_TEXT, x, by, SCRW);
+        x += ui_text_width("Choose") + 20;
+        ui_button(kLetterB, x, by + 1);
+        x += BUTTON_SIZE + 5;
+        ui_text("Cancel", UI_DIM, x, by, SCRW);
+    }
+}
+
 /* "(A) action   (B) Back" (where B goes somewhere: not home, not / in
    Files), in Files "(X) Exit" (in Screenshots "(X) Delete"), then "(Y)
    List" or "(Y) Tiles" at the left; `name` right-aligned */
@@ -633,7 +1140,7 @@ static void draw_footer(const char* action, const char* name) {
         ui_text(action, UI_DIM, x, ty, SCRW);
         x += ui_text_width(action) + 14;
     }
-    if (sBrowsing ? strcmp(sDir.path, "/") != 0 : strcmp(sDir.path, sStartDir) != 0) {
+    if (sBrowsing ? strcmp(sDir.path, "/") != 0 : !is_home()) {
         ui_button(kLetterB, x, by);
         x += BUTTON_SIZE + 5;
         ui_text("Back", UI_DIM, x, ty, SCRW);
@@ -649,6 +1156,12 @@ static void draw_footer(const char* action, const char* name) {
         x += BUTTON_SIZE + 5;
         ui_text("Delete", UI_DIM, x, ty, SCRW);
         x += ui_text_width("Delete") + 14;
+    }
+    if (can_pick_core()) {
+        ui_button(kLetterX, x, by);
+        x += BUTTON_SIZE + 5;
+        ui_text("Core", UI_DIM, x, ty, SCRW);
+        x += ui_text_width("Core") + 14;
     }
     ui_button(kLetterY, x, by);
     x += BUTTON_SIZE + 5;
@@ -705,8 +1218,9 @@ static void render_dir(void) {
     ui_begin();
     ui_gradient((SDL_Rect){ 0, 0, SCRW, SCRH }, kBgTop, kBgBottom);
     snprintf(title, sizeof(title), "%s", sDir.path);
-    draw_header(!sBrowsing && strcmp(sDir.path, sStartDir) == 0 ? "PocketGo S30"
+    draw_header(is_home()                                        ? "PocketGo S30"
                 : sBrowsing && strcmp(sDir.path, FILES_DIR) == 0 ? "Files"
+                : !sBrowsing && section_name(sDir.path) != NULL  ? section_name(sDir.path)
                                                                   : basename(title));
 
     if (sDir.count == 0) {
@@ -732,10 +1246,14 @@ static void render_dir(void) {
     draw_footer(sDir.count == 0                               ? NULL
                 : sDir.entries[sDir.selected].kind == K_DIR   ? "Open"
                 : sDir.entries[sDir.selected].kind == K_IMAGE ? "View"
+                : sDir.entries[sDir.selected].kind == K_ROM   ? "Play"
                                                               : "Run",
                 name);
     if (sConfirm) {
         draw_confirm();
+    }
+    if (sPick.open) {
+        draw_pick();
     }
     ui_present();
     if (more) {
@@ -914,16 +1432,14 @@ static bool wants_console(const char* path) {
     return found;
 }
 
-static void run(const char* path) {
-    const char* dot = strrchr(path, '.');
-    bool script = dot != NULL && strcmp(dot, ".sh") == 0;
+/* Runs a command (argv[0] by PATH) in the folder of `path`, which is what
+   the console relay and the log name it; `console` copies its output to
+   tty1 */
+static void run_command(const char* path, char* const argv[], bool console) {
     char dir[PATH_MAX];
     int pipefd[2] = { -1, -1 }, tty;
     pid_t pid;
 
-    if (!script && !is_elf(path)) {
-        return; // not something we can start
-    }
     printf("launcher: running %s\n", path);
     ui_video_close();
     snprintf(dir, sizeof(dir), "%s", path);
@@ -933,7 +1449,7 @@ static void run(const char* path) {
         // not fatal
     }
     // Output to the console too only when the script asks for it
-    if (script && tty >= 0 && wants_console(path) && pipe2(pipefd, O_CLOEXEC) != 0) {
+    if (console && tty >= 0 && pipe2(pipefd, O_CLOEXEC) != 0) {
         pipefd[0] = pipefd[1] = -1;
     }
     pid = fork();
@@ -945,12 +1461,8 @@ static void run(const char* path) {
         if (chdir(dirname(dir)) != 0) {
             _exit(127);
         }
-        if (script) {
-            execl("/bin/sh", "sh", path, (char*)NULL);
-        } else {
-            execl(path, path, (char*)NULL);
-        }
-        fprintf(stderr, "launcher: exec %s: %s\n", path, strerror(errno));
+        execvp(argv[0], argv);
+        fprintf(stderr, "launcher: exec %s: %s\n", argv[0], strerror(errno));
         _exit(127);
     } else if (pid > 0) {
         if (pipefd[1] >= 0) {
@@ -986,6 +1498,35 @@ static void run(const char* path) {
         }
     }
     pad_flush();
+}
+
+/* A launch script (with /bin/sh) or an ELF binary */
+static void run(const char* path) {
+    const char* dot = strrchr(path, '.');
+    bool script = dot != NULL && strcmp(dot, ".sh") == 0;
+
+    if (script) {
+        char* const argv[] = { "sh", (char*)path, NULL };
+        run_command(path, argv, wants_console(path));
+    } else if (is_elf(path)) {
+        char* const argv[] = { (char*)path, NULL };
+        run_command(path, argv, false);
+    }
+}
+
+/* A ROM in RetroArch with its core */
+static void run_rom(const char* path) {
+    const Core* c = core_for_rom(path);
+    char cfg[PATH_MAX];
+
+    if (c == NULL) {
+        return;
+    }
+    home_path(cfg, sizeof(cfg), RETROARCH_CFG);
+    {
+        char* const argv[] = { "retroarch", "-c", cfg, "-L", (char*)c->path, (char*)path, NULL };
+        run_command(path, argv, false);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1027,18 +1568,19 @@ int main(int argc, char** argv) {
     if (!ui_init()) {
         return 1;
     }
-    view_mode_load();
+    kv_load(&sViews, VIEW_FILE);
     sPadFd = ui_pad_open();
     pad_flush();
     sAxisXCentre = sAxisX;
     sAxisYCentre = sAxisY;
-    if (realpath(argc > 1 ? argv[1] : DEFAULT_DIR, sStartDir) == NULL) {
-        snprintf(sStartDir, sizeof(sStartDir), "/");
-    }
-    dir_open(sStartDir, NULL);
-    if (sDir.path[0] == 0) {
-        dir_open("/", NULL);
-    }
+    (void)argc;
+    (void)argv;
+    mkdir(GAMES_DIR, 0755);
+    mkdir(ROMS_DIR, 0755);
+    mkdir(APPS_DIR, 0755);
+    cores_load();
+    kv_load(&sCoreMap, CORES_FILE);
+    home_open(NULL);
 
     for (;;) {
         Uint32 now = SDL_GetTicks();
@@ -1089,8 +1631,24 @@ int main(int argc, char** argv) {
                 sConfirm = false;
                 dirty = true;
             }
+        } else if (sPick.open) { // up/down, A or B
+            if (repeat && dy != 0) {
+                int n = sPick.selected + dy;
+                sPick.selected = n < 0 ? 0 : n >= sPick.count ? sPick.count - 1 : n;
+                dirty = true;
+            }
+            if (a && !prevA) {
+                pick_apply();
+                dirty = true;
+            } else if (b && !prevB) {
+                sPick.open = false;
+                dirty = true;
+            }
         } else if (xb && !prevX && can_delete()) {
             sConfirm = true;
+            dirty = true;
+        } else if (xb && !prevX && can_pick_core()) {
+            pick_open();
             dirty = true;
         } else if (sView.open) {
             if (repeat && dx != 0) {
@@ -1113,13 +1671,15 @@ int main(int argc, char** argv) {
             if (a && !prevA && sDir.count > 0) {
                 Entry* e = &sDir.entries[sDir.selected];
                 if (e->kind == K_DIR) {
-                    if (!sBrowsing && strcmp(sDir.path, sStartDir) == 0 && strcmp(e->name, "Files") == 0 &&
-                        strcmp(e->path, FILES_DIR) == 0) {
+                    if (is_home() && strcmp(e->name, "Files") == 0 && strcmp(e->path, FILES_DIR) == 0) {
                         sBrowsing = true; // the Files tile
                     }
                     dir_open(e->path, NULL);
                 } else if (e->kind == K_IMAGE) {
                     view_open();
+                } else if (e->kind == K_ROM) {
+                    run_rom(e->path);
+                    a = b = false;
                 } else {
                     run(e->path);
                     a = b = false;
@@ -1131,11 +1691,11 @@ int main(int argc, char** argv) {
             } else if (yb && !prevY) { // tiles or list
                 sList = !sList;
                 sDir.scroll = 0; // render_dir brings the selection into view
-                view_mode_save();
+                kv_set(&sViews, view_key(), sList ? "list" : "grid");
                 dirty = true;
             } else if (xb && !prevX && sBrowsing) { // out of Files, from anywhere
                 sBrowsing = false;
-                dir_open(sStartDir, "Files");
+                home_open("Files");
                 dirty = true;
             }
         }
