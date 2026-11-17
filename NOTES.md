@@ -264,10 +264,16 @@ Alternative: `fel-sdboot.sunxi` at 8 KiB on a card (cold FEL, see below).
   `s30-tools` (launcher, utils/, libs30lease, splash.bmp), `s30-retroarch`,
   `s30-emulationstation` (with the carbon theme) with build/packages, then,
   once the loader exists, `s30-linux` (zImage, DTB, uInitrd, boot.scr in
-  /usr/share/s30/boot; version <kernel>-r<commit count>),
+  /usr/share/s30/boot; version <kernel>-r<count>),
   `s30-uboot` (u-boot-sunxi-with-spl.bin; <u-boot>-r<count>) and
   `s30-base` (rootfs-overlay: init, configs, scripts; depends on those
-  three). Ours are 0.<commit count>-r0 with the commit in the description.
+  three). Versions (2026-11-17): each package by the last commit that
+  touched its inputs (`changed` in build.sh: sources, patches, submodule;
+  s30-linux also the loader's files), 0.<commit count at that commit>-r0
+  (upstream version -r<count> for linux, u-boot, mesa), that commit in the
+  description, so one change bumps one package and devices fetch only it.
+  A change only in build.sh bumps nothing; a dirty tree keeps the last
+  commit's version (`-dirty` in the description only).
   `s30-base` has an apk trigger on /usr/share/s30/boot:
   `/usr/libexec/s30/boot-update` runs after apk unpacked a new kernel,
   loader or U-Boot and copies them to /boot on the card (as .new + mv;

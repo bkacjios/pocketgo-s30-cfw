@@ -480,12 +480,25 @@ step_gmloader() {
 #                         card (and U-Boot to 8 KiB when the card has one).
 #                         The SPI flash (U-Boot, fallback kernel) is only
 #                         written by hand: build.sh flash, s30-flash write
-# Versions: 0.<commit count>-r0 (s30-linux and s30-uboot: the upstream
-# version, -r<commit count>), so a later commit always upgrades; the
-# description names the commit.
+# Versions: each package by the last commit that changed what it is made
+# from (changed: its sources, patches, submodule), 0.<commit count at that
+# commit>-r0; s30-linux, s30-uboot and s30-mesa <upstream version>-r<count>.
+# So a push that changes one thing bumps one package and the devices fetch
+# that one. A change only in build.sh bumps nothing (touch a file among the
+# package's inputs when it must). The description names that commit.
 ROOTFS_EXT4_MB=1024 # the image's size; the tree is ~300 MB, the rest is free for apk add
-PKG_REL= PKG_DESC= # commit count, git describe (step_initramfs)
+PKG_REL= PKG_DESC= # set by changed(): commit count, describe (-dirty) of the last change
+REPO_DESC=         # describe --dirty of HEAD (the index)
 MKPKG_DEPS=        # extra depends for the next mkpkg
+changed() { # PATHS...: PKG_REL and PKG_DESC from the last commit touching PATHS
+	local c
+	c="$(git -C "$PROJECT" log -1 --format=%H -- "$@")"
+	[ -n "$c" ] || c=HEAD # nothing committed there yet
+	PKG_REL="$(git -C "$PROJECT" rev-list --count "$c")"
+	PKG_DESC="$(git -C "$PROJECT" describe --always "$c")"
+	[ -z "$(git -C "$PROJECT" status --porcelain --ignore-submodules=dirty -- "$@")" ] ||
+		PKG_DESC="$PKG_DESC-dirty"
+}
 sign_key() {
 	[ -f "$SIGN_KEY" ] && return
 	if [ -f "$PUB_KEY" ]; then
@@ -515,7 +528,7 @@ mkpkg() { # NAME VERSION DIR [--info ...|--trigger ...|--script ...]: $WORK/repo
 }
 mkndx() { # the repository's index over every package built so far
 	"$WORK/bin/apk.static" --keys-dir "${PUB_KEY%/*}" mkndx --sign-key "$SIGN_KEY" \
-		--output "$WORK/repo/armv7/APKINDEX.tar.gz" --description "PocketGo S30 $PKG_DESC" \
+		--output "$WORK/repo/armv7/APKINDEX.tar.gz" --description "PocketGo S30 $REPO_DESC" \
 		"$WORK"/repo/armv7/*.apk > /dev/null
 }
 step_initramfs() {
@@ -534,16 +547,16 @@ step_initramfs() {
 			--repository "$ALPINE_REPO/main" --repository "$ALPINE_REPO/community" \
 			--repository "$WORK/repo" "$@"
 	}
-	PKG_REL="$(git -C "$PROJECT" rev-list --count HEAD)"
-	PKG_DESC="$(git -C "$PROJECT" describe --always --dirty)"
+	REPO_DESC="$(git -C "$PROJECT" describe --always --dirty)"
 	# Our Mesa (build.sh mesa) first: it provides Alpine's mesa-* names and
 	# the EGL/GBM/GLES libraries, so what needs them (kmscube) takes ours
 	# and apk never installs Alpine's Mesa (with LLVM)
 	if [ -d "$WORK/mesa-root" ]; then
 		mesa_ver="$(ls "$WORK"/mesa-root/usr/lib/libgallium-*.so | sed 's/.*libgallium-\(.*\)\.so/\1/')"
-		mkpkg s30-mesa "$mesa_ver-r0" "$WORK/mesa-root" \
-			--info "description:Mesa $mesa_ver for the Mali-400 (lima; EGL, GBM, GLES 2; no LLVM)" \
-			--info "provides:so:libEGL.so.1=1 so:libgbm.so.1=1 so:libGLESv2.so.2=2 mesa=$mesa_ver-r0 mesa-egl=$mesa_ver-r0 mesa-gbm=$mesa_ver-r0 mesa-gles=$mesa_ver-r0 mesa-dri-gallium=$mesa_ver-r0" \
+		changed patches/mesa
+		mkpkg s30-mesa "$mesa_ver-r$PKG_REL" "$WORK/mesa-root" \
+			--info "description:Mesa $mesa_ver for the Mali-400 (lima; EGL, GBM, GLES 2; no LLVM; $PKG_DESC)" \
+			--info "provides:so:libEGL.so.1=1 so:libgbm.so.1=1 so:libGLESv2.so.2=2 mesa=$mesa_ver-r$PKG_REL mesa-egl=$mesa_ver-r$PKG_REL mesa-gbm=$mesa_ver-r$PKG_REL mesa-gles=$mesa_ver-r$PKG_REL mesa-dri-gallium=$mesa_ver-r$PKG_REL" \
 			--info "provider-priority:100"
 		mkndx
 		apk add s30-mesa
@@ -569,10 +582,16 @@ step_initramfs() {
 			tar -C "$PROJECT/external/es-theme-carbon" -cf - --exclude=.git . | tar -C "$d" -xf -
 		fi
 	fi
-	for d in "$pkg"/*/; do
-		d="${d%/}"
-		mkpkg "$(basename "$d")" "0.$PKG_REL-r0" "$d"
-	done
+	changed launcher utils build/splash/logo.bmp
+	mkpkg s30-tools "0.$PKG_REL-r0" "$pkg/s30-tools"
+	if [ -d "$pkg/s30-retroarch" ]; then
+		changed external/retroarch patches/retroarch
+		mkpkg s30-retroarch "0.$PKG_REL-r0" "$pkg/s30-retroarch"
+	fi
+	if [ -d "$pkg/s30-emulationstation" ]; then
+		changed external/emulationstation patches/emulationstation external/es-theme-carbon
+		mkpkg s30-emulationstation "0.$PKG_REL-r0" "$pkg/s30-emulationstation"
+	fi
 	mkndx
 	# shellcheck disable=SC2046
 	apk add $(grep -v '^#' "$HERE/packages") s30-tools s30-retroarch s30-emulationstation
@@ -616,10 +635,15 @@ step_initramfs() {
 	d="$pkg/s30-linux/usr/share/s30/boot"
 	install -D -m 0644 -t "$d" "$WORK/boot/zImage" "$WORK/boot/sun8i-a33-pocketgo-s30.dtb" "$WORK/uInitrd"
 	install -m 0644 "$WORK/fel.scr" "$d/boot.scr"
+	# the loader: s30-loader, its screens and the utils binaries it carries
+	changed external/linux patches/linux linux build/kernel.config build/fel.cmd \
+		build/s30-loader build/splash/usb.bmp build/splash/nocard.bmp utils
 	mkpkg s30-linux "$(cat "$WORK/boot/linux.version")-r$PKG_REL" "$pkg/s30-linux"
 	install -D -m 0644 -t "$pkg/s30-uboot/usr/share/s30/boot" "$WORK/u-boot-sunxi-with-spl.bin"
+	changed external/u-boot patches/u-boot build/u-boot
 	mkpkg s30-uboot "$(tr - _ < "$WORK/u-boot.version")-r$PKG_REL" "$pkg/s30-uboot"
 	cp -r "$HERE/rootfs-overlay" "$pkg/s30-base"
+	changed build/rootfs-overlay
 	# replaces: /etc/inittab is alpine-baselayout-data's, /etc/udhcpd.conf
 	# busybox-extras'; ours stay through their upgrades (replaces-priority)
 	MKPKG_DEPS=" s30-tools s30-linux s30-uboot"
@@ -728,8 +752,8 @@ step_flash() {
 step_publish() {
 	local repo="$WORK/repo" gh="$WORK/gh-pages" desc slug
 	[ -f "$repo/armv7/APKINDEX.tar.gz" ] || { echo "no $repo/armv7/APKINDEX.tar.gz: run build.sh initramfs first" >&2; exit 1; }
-	# The versions come from the commit count: two builds of one commit
-	# would have the same version, and the devices would never see the second
+	# The versions come from commits: a dirty tree would publish changed
+	# files under a version the devices may already have
 	[ -z "$(git -C "$PROJECT" status --porcelain --untracked-files=no --ignore-submodules)" ] ||
 		{ echo "uncommitted changes: commit, build.sh initramfs, then publish" >&2; exit 1; }
 	desc="$(git -C "$PROJECT" describe --always)"
