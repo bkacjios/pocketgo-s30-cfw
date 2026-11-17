@@ -7,10 +7,18 @@
 # certificates need a sane date); the output is on the LCD (s30-console).
 . /etc/profile.d/s30.sh
 
-finish() {
+finish() { # STATUS [reboot]: START exits; with reboot, A (BTN_EAST 305) reboots first
 	echo
-	echo "Press START to go back."
-	until s30-keyheld 315; do sleep 0.2; done
+	if [ "${2:-}" = reboot ]; then
+		echo "Press A to reboot now, START to exit."
+		until s30-keyheld 315; do
+			s30-keyheld 305 && { echo "Rebooting..."; sync; reboot; sleep 10; }
+			sleep 0.2
+		done
+	else
+		echo "Press START to exit."
+		until s30-keyheld 315; do sleep 0.2; done
+	fi
 	exit "$1"
 }
 
@@ -50,11 +58,30 @@ if [ $rc != 0 ]; then
 	echo "The upgrade failed (apk exit $rc)."
 	finish 1
 fi
-n=$(echo "$out" | grep -c '^([0-9]*/[0-9]*) ')
+# What changed, from apk's "(n/m) Upgrading name (old -> new)" lines, and
+# when it takes effect: the kernel, loader and U-Boot (s30-linux, s30-uboot)
+# and the system itself (s30-base: init and scripts, s30-tools: launcher
+# and display, s30-mesa) at the next boot; apps and libraries when an app
+# starts next
+changed=$(echo "$out" | sed -n 's/^([0-9]*\/[0-9]*) [A-Za-z]* \([^ ]*\) .*/\1/p')
 echo
-if [ "$n" = 0 ]; then
+if [ -z "$changed" ]; then
 	echo "Everything is up to date."
-else
-	echo "$n packages changed. Reboot to run the new versions."
+	finish 0
 fi
+echo "Updated: $(echo "$changed" | tr '\n' ' ')"
+echo
+boot= system=
+for p in $changed; do
+	case $p in
+	s30-linux|s30-uboot) boot=1 ;;
+	s30-base|s30-tools|s30-mesa) system=1 ;;
+	esac
+done
+if [ -n "$boot$system" ]; then
+	[ -z "$boot" ] || echo "The new kernel and boot files run from the next boot."
+	[ -z "$system" ] || echo "The new system parts (launcher, display, init) run from the next boot."
+	finish 0 reboot
+fi
+echo "Apps and libraries: in use the next time an app starts."
 finish 0
