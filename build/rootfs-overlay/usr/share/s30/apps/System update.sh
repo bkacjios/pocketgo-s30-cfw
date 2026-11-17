@@ -36,11 +36,15 @@ if ! ip -4 route | grep -q '^default'; then
 fi
 
 echo "Setting the clock..."
-if timeout 20 ntpd -q -n -p pool.ntp.org >/dev/null 2>&1; then
+# Several servers: busybox ntpd resolves each -p to one address, takes the
+# first that answers, and gives up at 10 s when one server stays silent
+# (some pool members never answer; with one -p that failed every few runs)
+if timeout 20 ntpd -q -n -p 0.pool.ntp.org -p 1.pool.ntp.org -p 2.pool.ntp.org \
+		-p time.cloudflare.com >/dev/null 2>&1; then
 	hwclock -w 2>/dev/null
 	date
 else
-	echo "No answer from pool.ntp.org, keeping $(date)"
+	echo "No answer from the time servers, keeping $(date)"
 fi
 echo
 
